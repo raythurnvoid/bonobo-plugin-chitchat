@@ -390,17 +390,24 @@ body {
 	font-size: 12px;
 }
 
-/* Actions reveal on hover AND on focus-within, so keyboard users reach every action. */
+/* Actions reveal on hover AND on focus-within. The buttons hide with opacity, never
+   display:none or visibility:hidden, so they stay in the tab order: a plain text-only
+   row has no other focusable child, and tabbing into a hidden button is what triggers
+   the :focus-within reveal (WCAG 2.1.1). pointer-events keeps the invisible buttons
+   from catching stray clicks. */
 .message-actions {
-	display: none;
+	display: flex;
 	flex-wrap: wrap;
 	gap: 4px;
 	margin-top: 6px;
+	opacity: 0;
+	pointer-events: none;
 }
 
 .message:hover .message-actions,
 .message:focus-within .message-actions {
-	display: flex;
+	opacity: 1;
+	pointer-events: auto;
 }
 
 .message-action {

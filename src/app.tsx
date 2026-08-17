@@ -1,5 +1,5 @@
 import type { BonoboUiFrontendClient } from "bonobo-plugin-sdk/frontend";
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
 	chat_CHANNEL_NAME_MAX_LENGTH,
 	chat_create_channel_key,
@@ -16,13 +16,19 @@ import { Dialog } from "./dialog";
 
 /**
  * One cached member-name resolver for the whole page. Names live in a ref (async
- * resolutions read and write the latest map without stale-closure risk) and a version
- * counter re-renders consumers when a resolution lands.
+ * resolutions read and write the latest map without stale-closure risk). When a
+ * resolution lands, a state counter bumps purely to re-render consumers.
+ *
+ * The returned object must keep ONE identity for the page's lifetime: the messages watch
+ * effect lists it as a dependency, and a fresh object per render would tear down and
+ * rebuild the subscription and its accumulated store — collapsing "Load older" history
+ * back to the newest window on every remote arrival.
  */
 function use_member_names(client: BonoboUiFrontendClient): chat_MemberNamesApi {
 	const namesRef = useRef(new Map<string, string | null>());
 	const requestedRef = useRef(new Set<string>());
-	const [version, setVersion] = useState(0);
+	// The value is never read; setting it re-renders consumers after names land.
+	const [, setResolutionCount] = useState(0);
 
 	const get = useCallback((userId: string) => {
 		return namesRef.current.has(userId) ? namesRef.current.get(userId)! : undefined;
@@ -52,12 +58,12 @@ function use_member_names(client: BonoboUiFrontendClient): chat_MemberNamesApi {
 					}
 				}
 			}
-			setVersion((current) => current + 1);
+			setResolutionCount((current) => current + 1);
 		},
 		[client],
 	);
 
-	return { version, get, resolve };
+	return useMemo(() => ({ get, resolve }), [get, resolve]);
 }
 
 // #endregion member names

@@ -480,6 +480,22 @@ test("deleting an own message confirms in a dialog, puts a tombstone, and render
 	expect(screen.queryByText("to remove")).toBeNull();
 });
 
+test("a plain text-only message row keeps its action buttons focusable", async () => {
+	const h = make_harness();
+	await boot(h);
+	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([message_doc(1_000, { rand: "m1", text: "plain row" })]);
+
+	await screen.findByText("plain row");
+	const row = screen.getByText("plain row").closest("[data-key]") as HTMLElement;
+	// The actions must be real tab stops: tabbing into one is the only way focus can
+	// enter a plain row and trigger the :focus-within reveal.
+	const reply = within(row).getByRole("button", { name: "Reply in thread" });
+	expect(reply.getAttribute("tabindex")).toBeNull();
+	expect(reply.hasAttribute("disabled")).toBe(false);
+	reply.focus();
+	expect(document.activeElement).toBe(reply);
+});
+
 // #endregion own vs other affordances
 
 // #region reactions
@@ -643,6 +659,38 @@ test("Load older lists via HTTP with the channel prefix, merges, and Retry resum
 	await waitFor(() => expect(h.raw.fetchJson).toHaveBeenCalledTimes(3));
 	expect(h.raw.fetchJson.mock.calls[2][1]?.body?.cursor).toBe("c1");
 	await waitFor(() => expect(screen.queryByRole("button", { name: "Load older" })).toBeNull());
+});
+
+test("accumulated older pages survive a remote arrival: the messages watch never resubscribes", async () => {
+	const h = make_harness();
+	const olderDoc = message_doc(500, { rand: "old1", text: "the older one" });
+	h.raw.fetchJson.mockResolvedValueOnce({ documents: [olderDoc], cursor: "c1", isDone: false });
+	const { container } = await boot(h);
+	const messages = h.find_watch("messages", `${CH1_KEY}:`)!;
+	messages.onUpdate([message_doc(1_000, { rand: "m1", text: "live one" })]);
+
+	await screen.findByText("live one");
+	fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+	await screen.findByText("the older one");
+
+	// A remote arrival makes the announcer resolve the author, which re-renders the App.
+	// The watch subscription and its accumulated store must survive that render.
+	messages.onUpdate([
+		message_doc(2_000, { rand: "m2", text: "fresh arrival" }),
+		message_doc(1_000, { rand: "m1", text: "live one" }),
+	]);
+	await waitFor(() => expect(announcer_text(container)).toContain("Bob: fresh arrival"));
+
+	// Deliver the newest window again on the CURRENT subscription. A resubscribed watch
+	// would start from a fresh, empty store and collapse history back to this window.
+	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([
+		message_doc(2_000, { rand: "m2", text: "fresh arrival" }),
+		message_doc(1_000, { rand: "m1", text: "live one" }),
+	]);
+	await screen.findByText("fresh arrival");
+	expect(screen.getByText("the older one")).toBeTruthy();
+	const messageWatchCount = h.raw.data.watch.mock.calls.filter((call) => call[0].collection === "messages").length;
+	expect(messageWatchCount).toBe(1);
 });
 
 // #endregion load older

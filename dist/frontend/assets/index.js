@@ -8539,37 +8539,46 @@ function ChannelView(props) {
 //#region src/app.tsx
 /**
  * One cached member-name resolver for the whole page. Names live in a ref (async
- * resolutions read and write the latest map without stale-closure risk) and a version
- * counter re-renders consumers when a resolution lands.
+ * resolutions read and write the latest map without stale-closure risk). When a
+ * resolution lands, a state counter bumps purely to re-render consumers.
+ *
+ * The returned object must keep ONE identity for the page's lifetime: the messages watch
+ * effect lists it as a dependency, and a fresh object per render would tear down and
+ * rebuild the subscription and its accumulated store — collapsing "Load older" history
+ * back to the newest window on every remote arrival.
  */
 function use_member_names(client) {
 	const namesRef = useRef(/* @__PURE__ */ new Map());
 	const requestedRef = useRef(/* @__PURE__ */ new Set());
-	const [version, setVersion] = useState(0);
-	return {
-		version,
-		get: useCallback((userId) => {
-			return namesRef.current.has(userId) ? namesRef.current.get(userId) : void 0;
-		}, []),
-		resolve: useCallback(
-			async (userIds) => {
-				const missing = [...new Set(userIds)].filter((id) => !requestedRef.current.has(id));
-				if (missing.length === 0) return;
-				for (const id of missing) requestedRef.current.add(id);
-				for (let start = 0; start < missing.length; start += 50) {
-					const batch = missing.slice(start, start + 50);
-					try {
-						const members = await client.members.resolve(batch);
-						for (const id of batch) namesRef.current.set(id, members[id] ?? null);
-					} catch {
-						for (const id of batch) requestedRef.current.delete(id);
-					}
+	const [, setResolutionCount] = useState(0);
+	const get = useCallback((userId) => {
+		return namesRef.current.has(userId) ? namesRef.current.get(userId) : void 0;
+	}, []);
+	const resolve = useCallback(
+		async (userIds) => {
+			const missing = [...new Set(userIds)].filter((id) => !requestedRef.current.has(id));
+			if (missing.length === 0) return;
+			for (const id of missing) requestedRef.current.add(id);
+			for (let start = 0; start < missing.length; start += 50) {
+				const batch = missing.slice(start, start + 50);
+				try {
+					const members = await client.members.resolve(batch);
+					for (const id of batch) namesRef.current.set(id, members[id] ?? null);
+				} catch {
+					for (const id of batch) requestedRef.current.delete(id);
 				}
-				setVersion((current) => current + 1);
-			},
-			[client],
-		),
-	};
+			}
+			setResolutionCount((current) => current + 1);
+		},
+		[client],
+	);
+	return useMemo(
+		() => ({
+			get,
+			resolve,
+		}),
+		[get, resolve],
+	);
 }
 function ChannelNameDialog(props) {
 	const titleId = useId();

@@ -33,10 +33,12 @@ import {
 } from "./chat-store";
 import { Dialog } from "./dialog";
 
-/** Member display names resolved through the host bridge, cached in the App. */
+/**
+ * Member display names resolved through the host bridge, cached in the App. The object
+ * keeps one identity for the page's lifetime (the App re-renders consumers itself when a
+ * resolution lands), so watch effects may safely list it as a dependency.
+ */
 export type chat_MemberNamesApi = {
-	/** Bumped whenever a resolution lands, so consumers re-render. */
-	version: number;
 	/** undefined = not resolved yet; null = missing or deleted user ("Former member"). */
 	get: (userId: string) => string | null | undefined;
 	/** Resolves unknown ids through the bridge; already-known ids are skipped. */
