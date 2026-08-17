@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       bonobo-plugin-sdk:
-        specifier: github:raythurnvoid/bonobo-plugin-sdk#b37e39c71c2ba2a4096a6e3ef34c09be9cce44c4
-        version: https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/b37e39c71c2ba2a4096a6e3ef34c09be9cce44c4
+        specifier: github:raythurnvoid/bonobo-plugin-sdk#364304f80ea9c97f8424d2fd3609ff09ab74d748
+        version: https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/364304f80ea9c97f8424d2fd3609ff09ab74d748
       preact:
         specifier: ^10.24.3
         version: 10.29.8
@@ -420,9 +420,9 @@ packages:
     resolution: {integrity: sha512-wvUjBtSGN7+7SjNpq/9M2Tg350UZD3q62IFZLbRAR1bSMlCo1ZaeW+BJ+D090e4hIIZLBcTDWe4Mh4jvUDajzQ==}
     engines: {node: '>= 0.4'}
 
-  bonobo-plugin-sdk@https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/b37e39c71c2ba2a4096a6e3ef34c09be9cce44c4:
-    resolution: {tarball: https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/b37e39c71c2ba2a4096a6e3ef34c09be9cce44c4}
-    version: 0.7.0
+  bonobo-plugin-sdk@https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/364304f80ea9c97f8424d2fd3609ff09ab74d748:
+    resolution: {tarball: https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/364304f80ea9c97f8424d2fd3609ff09ab74d748}
+    version: 0.8.0
 
   call-bind-apply-helpers@1.0.2:
     resolution: {integrity: sha512-Sp1ablJ0ivDkSzjcaJdxEunN5/XvksFJ2sMBFfq6x0ryhQV/2b/KwFe21cMpmHtPOSij8K99/wSfoEuTObmuMQ==}
@@ -1259,7 +1259,7 @@ snapshots:
     dependencies:
       possible-typed-array-names: 1.1.0
 
-  bonobo-plugin-sdk@https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/b37e39c71c2ba2a4096a6e3ef34c09be9cce44c4:
+  bonobo-plugin-sdk@https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/364304f80ea9c97f8424d2fd3609ff09ab74d748:
     dependencies:
       '@cloudflare/workers-types': 4.20260702.1
 

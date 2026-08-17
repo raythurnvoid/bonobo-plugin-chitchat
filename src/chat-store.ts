@@ -15,13 +15,11 @@ function warn_dropped(raw: unknown) {
 
 export type chat_AccumulatingStore<V> = {
 	/**
-	 * Merges one watch window into the store and returns the window's validated docs
-	 * (callers use them for arrival detection). Never removes anything: messages and
-	 * replies accumulate by key, so a doc that fell out of the newest-100 window stays.
+	 * Merges one watch or window update into the store and returns the update's validated
+	 * docs (callers use them for arrival detection). Never removes anything: a doc that
+	 * fell out of a plain watch's newest-100 window stays.
 	 */
 	apply_window(docs: unknown[]): chat_Doc<V>[];
-	/** Merges one HTTP "load older" page. Overlap with the watch window is deduped by key. */
-	apply_page(docs: unknown[]): void;
 	/** Merges one locally synthesized doc (an acked own send, edit, or delete). */
 	apply_local(doc: chat_Doc<V>): void;
 	/** All docs sorted ascending by key — with inverted-ms keys that is newest first. */
@@ -31,10 +29,11 @@ export type chat_AccumulatingStore<V> = {
 };
 
 /**
- * The accumulate-by-key seam store for messages and replies. Watch updates and HTTP pages
- * merge into one map keyed by document key: keys are never reused, deletes are value
+ * The accumulate-by-key seam store for messages and thread replies. Every update merges
+ * into one map keyed by document key: keys are never reused, deletes are value
  * tombstones (`deletedAt`), and a doc only advances forward (a lower revision never
- * overwrites a higher one).
+ * overwrites a higher one). The revision-forward merge is also what lets an optimistic
+ * local echo coexist with the server's later delivery of the same key.
  */
 export function chat_create_accumulating_store<V>(
 	validate: (raw: unknown) => chat_Doc<V> | null,
@@ -66,9 +65,6 @@ export function chat_create_accumulating_store<V>(
 
 	return {
 		apply_window: merge_raw,
-		apply_page(docs) {
-			merge_raw(docs);
-		},
 		apply_local: merge_one,
 		get_sorted() {
 			return [...byKey.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
@@ -168,9 +164,10 @@ export function chat_count_replies(docs: chat_Doc<chat_MessageValue>[]): Map<str
 }
 
 /**
- * Reply counts come from a bounded watch window, so a large count is an approximation —
- * cap the display at "99+" instead of pretending precision.
+ * Reply counts are exact once the replies window has nothing more below it. While
+ * `hasMore` says replies may still be missing, cap a large count at "99+" instead of
+ * pretending precision.
  */
-export function chat_format_reply_count(count: number): string {
-	return count > 99 ? "99+" : String(count);
+export function chat_format_reply_count(count: number, hasMore: boolean): string {
+	return count > 99 && hasMore ? "99+" : String(count);
 }

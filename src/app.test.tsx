@@ -75,14 +75,29 @@ type WatchSub = {
 	unsubscribed: boolean;
 };
 
-type WriteResult = { _yay: { key: string } } | { _nay: { message: string } };
+type WindowUpdate = { docs: unknown[]; hasMore: boolean; atCapacity: boolean; incomplete: boolean };
+
+type WindowSub = {
+	opts: { collection: string; keyPrefix?: string; pageSize: number };
+	onUpdate: (update: WindowUpdate | null) => void;
+	unsubscribed: boolean;
+	loadOlderCalls: number;
+};
+
+/** Builds one watchWindow update payload; flags default to a fully covered window. */
+function window_update(docs: unknown[], overrides: Partial<Omit<WindowUpdate, "docs">> = {}): WindowUpdate {
+	return { docs, hasMore: false, atCapacity: false, incomplete: false, ...overrides };
+}
+
+type WriteResult = { _yay: { key: string } } | { _nay: { name?: string; message: string } };
 type AppendOpts = { collection: string; keyPrefix?: string; value: Record<string, unknown>; clientRequestId?: string };
-type PutOpts = { collection: string; key: string; value: Record<string, unknown> };
+type PutOpts = { collection: string; key: string; value: Record<string, unknown>; expectedRevision?: number };
 type KeyOpts = { collection: string; key: string };
 type FetchInit = { method?: string; headers?: Record<string, string>; body?: Record<string, unknown> };
 
 function make_harness() {
 	const watches: WatchSub[] = [];
+	const windows: WindowSub[] = [];
 	const names: Record<string, string | null> = { user_me: "Me", user_other: "Bob" };
 	const client = {
 		context: {
@@ -108,6 +123,18 @@ function make_harness() {
 					sub.unsubscribed = true;
 				};
 			}),
+			watchWindow: vi.fn((opts: WindowSub["opts"], onUpdate: WindowSub["onUpdate"]) => {
+				const sub: WindowSub = { opts, onUpdate, unsubscribed: false, loadOlderCalls: 0 };
+				windows.push(sub);
+				return {
+					loadOlder: () => {
+						sub.loadOlderCalls += 1;
+					},
+					unsubscribe: () => {
+						sub.unsubscribed = true;
+					},
+				};
+			}),
 			append: vi.fn<(opts: AppendOpts) => Promise<WriteResult>>(async () => ({
 				_yay: { key: `${CH1_KEY}:${inv(50_000)}:sent` },
 			})),
@@ -129,7 +156,16 @@ function make_harness() {
 		);
 		return matches[matches.length - 1];
 	};
-	return { client: client as unknown as BonoboUiFrontendClient, raw: client, watches, find_watch };
+	const find_window = (collection: string, keyPrefix?: string) => {
+		const matches = windows.filter(
+			(sub) =>
+				!sub.unsubscribed &&
+				sub.opts.collection === collection &&
+				(keyPrefix === undefined || sub.opts.keyPrefix === keyPrefix),
+		);
+		return matches[matches.length - 1];
+	};
+	return { client: client as unknown as BonoboUiFrontendClient, raw: client, watches, windows, find_watch, find_window };
 }
 
 function deferred<T>() {
@@ -142,12 +178,12 @@ function deferred<T>() {
 	return { promise, resolve, reject };
 }
 
-/** Renders the App, delivers one channel, and waits for the channel view's watches. */
+/** Renders the App, delivers one channel, and waits for the channel view's windows. */
 async function boot(h: ReturnType<typeof make_harness>, channels: unknown[] = [channel_doc(CH1_KEY, "general")]) {
 	const utils = render(<App client={h.client} />);
 	h.find_watch("channels")!.onUpdate(channels);
 	if (channels.length > 0) {
-		await waitFor(() => expect(h.find_watch("messages", `${CH1_KEY}:`)).toBeTruthy());
+		await waitFor(() => expect(h.find_window("messages", `${CH1_KEY}:`)).toBeTruthy());
 	}
 	return utils;
 }
@@ -195,7 +231,7 @@ test("permission-lost: a null channels window replaces the page with an alert", 
 test("a null messages window shows the channel-level alert", async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate(null);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(null);
 
 	const alert = await screen.findByRole("alert");
 	expect(alert.textContent).toContain("Access to messages in #general ended");
@@ -244,8 +280,35 @@ test("a non-creator can rename a channel: the shared put succeeds and the dialog
 		collection: "channels",
 		key: CH1_KEY,
 		value: { name: "renamed", archivedAt: null },
+		expectedRevision: 1,
 	});
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+test("rename is compare-and-set: a conflict keeps the dialog open with a clear error", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({
+		_nay: { name: "conflict", message: "This document changed since it was read" },
+	});
+	await boot(h, [{ ...channel_doc(CH1_KEY, "general"), revision: 4 }]);
+
+	fireEvent.click(screen.getByRole("button", { name: "Rename #general" }));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "renamed" } });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
+
+	// The put carries the revision the dialog captured, so a concurrent rename conflicts
+	// instead of being silently overwritten.
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
+	expect(h.raw.data.put.mock.calls[0][0]).toEqual({
+		collection: "channels",
+		key: CH1_KEY,
+		value: { name: "renamed", archivedAt: null },
+		expectedRevision: 4,
+	});
+	const alert = await within(dialog).findByRole("alert");
+	expect(alert.textContent).toContain("Someone else changed this channel");
+	expect(screen.getByRole("dialog")).toBeTruthy();
 });
 
 test("channel switch announces the channel name through the polite announcer", async () => {
@@ -263,7 +326,7 @@ test("channel switch announces the channel name through the polite announcer", a
 test("the log is role=log with aria-live=off and a label naming the channel", async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
 	const log = await screen.findByRole("log");
 	expect(log.getAttribute("aria-live")).toBe("off");
@@ -274,11 +337,13 @@ test("the log is role=log with aria-live=off and a label naming the channel", as
 test("messages render oldest at the top, newest at the bottom", async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([
-		message_doc(3_000, { rand: "m3", text: "newest" }),
-		message_doc(1_000, { rand: "m1", text: "oldest" }),
-		message_doc(2_000, { rand: "m2", text: "middle" }),
-	]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
+		window_update([
+			message_doc(3_000, { rand: "m3", text: "newest" }),
+			message_doc(1_000, { rand: "m1", text: "oldest" }),
+			message_doc(2_000, { rand: "m2", text: "middle" }),
+		]),
+	);
 
 	await screen.findByText("newest");
 	const log = screen.getByRole("log");
@@ -289,7 +354,7 @@ test("messages render oldest at the top, newest at the bottom", async () => {
 test("an author who resolves to null renders as Former member", async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([message_doc(1_000, { createdBy: "user_gone" })]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([message_doc(1_000, { createdBy: "user_gone" })]));
 
 	expect(await screen.findByText("Former member")).toBeTruthy();
 });
@@ -301,7 +366,7 @@ test("an author who resolves to null renders as Former member", async () => {
 test("Enter sends, Shift+Enter does not, and the send appends under the channel prefix", async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
 	const input = await screen.findByRole("textbox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "line one" } });
@@ -321,7 +386,7 @@ test("an in-flight send disables Send, shows the pending row, and the ack keeps 
 	const ack = deferred<{ _yay: { key: string } }>();
 	h.raw.data.append.mockReturnValueOnce(ack.promise);
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
 	const input = await screen.findByRole("textbox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "hello there" } });
@@ -346,7 +411,7 @@ test("a failed send surfaces the _nay message and Retry reuses the same clientRe
 		.mockResolvedValueOnce({ _yay: { key: `${CH1_KEY}:${inv(9_000)}:sent` } })
 		.mockResolvedValueOnce({ _yay: { key: `${CH1_KEY}:${inv(9_100)}:snd2` } });
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
 	const input = await screen.findByRole("textbox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "first try" } });
@@ -381,8 +446,8 @@ test("a remote arrival announces author and preview; the user's own send never a
 	const ack = deferred<{ _yay: { key: string } }>();
 	h.raw.data.append.mockReturnValueOnce(ack.promise);
 	const { container } = await boot(h);
-	const messages = h.find_watch("messages", `${CH1_KEY}:`)!;
-	messages.onUpdate([]);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	messages.onUpdate(window_update([]));
 
 	// Own send: the watch echo arrives BEFORE the ack (the common race). Only the
 	// createdBy check keeps it out of the announcer.
@@ -390,16 +455,22 @@ test("a remote arrival announces author and preview; the user's own send never a
 	fireEvent.input(input, { target: { value: "my own words" } });
 	fireEvent.click(screen.getByRole("button", { name: "Send" }));
 	const ownKey = `${CH1_KEY}:${inv(9_000)}:sent`;
-	messages.onUpdate([{ ...message_doc(9_000, { rand: "sent", text: "my own words" }), createdBy: "user_me", updatedBy: "user_me" }]);
+	messages.onUpdate(
+		window_update([
+			{ ...message_doc(9_000, { rand: "sent", text: "my own words" }), createdBy: "user_me", updatedBy: "user_me" },
+		]),
+	);
 	await screen.findAllByText("my own words");
 	expect(announcer_text(container)).not.toContain("my own words");
 	ack.resolve({ _yay: { key: ownKey } });
 
 	// Remote arrival: announced as "<author>: <preview>".
-	messages.onUpdate([
-		{ ...message_doc(9_000, { rand: "sent", text: "my own words" }), createdBy: "user_me", updatedBy: "user_me" },
-		message_doc(9_500, { rand: "rem1", text: "hello from Bob" }),
-	]);
+	messages.onUpdate(
+		window_update([
+			{ ...message_doc(9_000, { rand: "sent", text: "my own words" }), createdBy: "user_me", updatedBy: "user_me" },
+			message_doc(9_500, { rand: "rem1", text: "hello from Bob" }),
+		]),
+	);
 	await waitFor(() => expect(announcer_text(container)).toContain("Bob: hello from Bob"));
 	expect(announcer_text(container)).not.toContain("my own words");
 });
@@ -407,14 +478,16 @@ test("a remote arrival announces author and preview; the user's own send never a
 test("a burst of remote arrivals coalesces into one counted announcement", async () => {
 	const h = make_harness();
 	const { container } = await boot(h);
-	const messages = h.find_watch("messages", `${CH1_KEY}:`)!;
-	messages.onUpdate([]);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	messages.onUpdate(window_update([]));
 
-	messages.onUpdate([
-		message_doc(9_000, { rand: "rem1", text: "one" }),
-		message_doc(9_100, { rand: "rem2", text: "two" }),
-		message_doc(9_200, { rand: "rem3", text: "three" }),
-	]);
+	messages.onUpdate(
+		window_update([
+			message_doc(9_200, { rand: "rem3", text: "three" }),
+			message_doc(9_100, { rand: "rem2", text: "two" }),
+			message_doc(9_000, { rand: "rem1", text: "one" }),
+		]),
+	);
 	await waitFor(() => expect(announcer_text(container)).toContain("3 new messages in #general"));
 });
 
@@ -425,10 +498,12 @@ test("a burst of remote arrivals coalesces into one counted announcement", async
 test("edit and delete exist only on own messages", async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([
-		message_doc(1_000, { rand: "mine", text: "own message", createdBy: "user_me" }),
-		message_doc(2_000, { rand: "them", text: "other message", createdBy: "user_other" }),
-	]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
+		window_update([
+			message_doc(2_000, { rand: "them", text: "other message", createdBy: "user_other" }),
+			message_doc(1_000, { rand: "mine", text: "own message", createdBy: "user_me" }),
+		]),
+	);
 
 	await screen.findByText("own message");
 	const ownRow = screen.getByText("own message").closest("[data-key]") as HTMLElement;
@@ -443,7 +518,7 @@ test("editing an own message puts the new text and renders the (edited) marker",
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([doc]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 
 	await screen.findByText("before");
 	fireEvent.click(screen.getByRole("button", { name: "Edit" }));
@@ -465,7 +540,7 @@ test("deleting an own message confirms in a dialog, puts a tombstone, and render
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "mine", text: "to remove", createdBy: "user_me" });
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([doc]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 
 	await screen.findByText("to remove");
 	fireEvent.click(screen.getByRole("button", { name: "Delete" }));
@@ -483,7 +558,7 @@ test("deleting an own message confirms in a dialog, puts a tombstone, and render
 test("a plain text-only message row keeps its action buttons focusable", async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([message_doc(1_000, { rand: "m1", text: "plain row" })]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([message_doc(1_000, { rand: "m1", text: "plain row" })]));
 
 	await screen.findByText("plain row");
 	const row = screen.getByText("plain row").closest("[data-key]") as HTMLElement;
@@ -504,13 +579,15 @@ test("reaction chips group by createdBy, expose aria-pressed, and toggle putOwne
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "m1", text: "react to me" });
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([doc]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 	await screen.findByText("react to me");
-	h.find_watch("reactions", `${CH1_KEY}:`)!.onUpdate([
-		reaction_doc(doc.key, "heart", "user_me"),
-		reaction_doc(doc.key, "heart", "user_other"),
-		reaction_doc(doc.key, "party", "user_other"),
-	]);
+	h.find_window("reactions", `${CH1_KEY}:`)!.onUpdate(
+		window_update([
+			reaction_doc(doc.key, "heart", "user_me"),
+			reaction_doc(doc.key, "heart", "user_other"),
+			reaction_doc(doc.key, "party", "user_other"),
+		]),
+	);
 
 	const mineChip = await screen.findByRole("button", { name: "Heart, 2 reactions" });
 	expect(mineChip.getAttribute("aria-pressed")).toBe("true");
@@ -532,13 +609,15 @@ test("a forged reaction doc with a mismatched key tail counts under createdBy", 
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "m1", text: "target" });
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([doc]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 	await screen.findByText("target");
 	// user_other smuggled user_me's id into the caller key; createdBy is stamped user_other.
-	h.find_watch("reactions", `${CH1_KEY}:`)!.onUpdate([
-		reaction_doc(doc.key, "heart", "user_other", "user_me"),
-		reaction_doc(doc.key, "heart", "user_other"),
-	]);
+	h.find_window("reactions", `${CH1_KEY}:`)!.onUpdate(
+		window_update([
+			reaction_doc(doc.key, "heart", "user_other", "user_me"),
+			reaction_doc(doc.key, "heart", "user_other"),
+		]),
+	);
 
 	// One distinct reactor (user_other) — and it is NOT highlighted as mine.
 	const chip = await screen.findByRole("button", { name: "Heart, 1 reaction" });
@@ -549,7 +628,7 @@ test("the add-reaction palette opens, picks a token, and returns focus to the op
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "m1", text: "palette target" });
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([doc]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 
 	await screen.findByText("palette target");
 	const opener = screen.getByRole("button", { name: "Add reaction" });
@@ -567,39 +646,56 @@ test("the add-reaction palette opens, picks a token, and returns focus to the op
 
 // #region threads
 
-test("reply counts come from the bounded replies watch and cap at 99+", async () => {
+test("reply counts follow the replies window: covered roots get counts, the deepest partially-covered root does not, and 99+ follows hasMore", async () => {
 	const h = make_harness();
 	await boot(h);
-	const doc = message_doc(1_000, { rand: "root", text: "root message" });
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([doc]);
-	await screen.findByText("root message");
+	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
+	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([rootNew, rootOld]));
+	await screen.findByText("old root");
 
-	// Replies accumulate by key, so counts only grow: assert the small count first.
-	const replies = h.find_watch("replies", `${CH1_KEY}:`)!;
+	const replies = h.find_window("replies", `${CH1_KEY}:`)!;
 	replies.onUpdate(
-		Array.from({ length: 3 }, (_, index) => ({
-			...message_doc(1_000, {}),
-			collection: "replies",
-			key: `${doc.key}:${inv(2_000 + index)}:r${index}`,
-		})),
+		window_update(
+			Array.from({ length: 3 }, (_, index) => ({
+				...message_doc(1_000, {}),
+				collection: "replies",
+				key: `${rootNew.key}:${inv(2_000 + index)}:r${index}`,
+			})),
+		),
 	);
 	expect(await screen.findByRole("button", { name: "3 replies" })).toBeTruthy();
 
-	replies.onUpdate(
-		Array.from({ length: 100 }, (_, index) => ({
-			...message_doc(1_000, {}),
-			collection: "replies",
-			key: `${doc.key}:${inv(2_000 + index)}:r${index}`,
-		})),
-	);
+	// While more replies exist below the window, rootNew is fully covered (the window
+	// reaches the older rootOld), so its big count shows — capped at 99+. rootOld is the
+	// deepest partially-covered root: its count would be a lower bound, so no count is
+	// claimed for it.
+	const hundredOnNew = Array.from({ length: 100 }, (_, index) => ({
+		...message_doc(1_000, {}),
+		collection: "replies",
+		key: `${rootNew.key}:${inv(2_000 + index)}:r${index}`,
+	}));
+	const oneOnOld = {
+		...message_doc(1_000, {}),
+		collection: "replies",
+		key: `${rootOld.key}:${inv(2_000)}:ro00`,
+	};
+	replies.onUpdate(window_update([...hundredOnNew, oneOnOld], { hasMore: true }));
 	expect(await screen.findByRole("button", { name: "99+ replies" })).toBeTruthy();
+	expect(screen.getByRole("button", { name: "View thread" })).toBeTruthy();
+
+	// Once nothing more exists below, every count is exact and prints uncapped.
+	replies.onUpdate(window_update([...hundredOnNew, oneOnOld]));
+	expect(await screen.findByRole("button", { name: "100 replies" })).toBeTruthy();
+	expect(screen.getByRole("button", { name: "1 replies" })).toBeTruthy();
+	expect(screen.queryByRole("button", { name: "View thread" })).toBeNull();
 });
 
 test("the thread panel opens with focus inside, replies append under the root, close returns focus", async () => {
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "root", text: "thread root" });
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([doc]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 	await screen.findByText("thread root");
 
 	const trigger = screen.getByRole("button", { name: "Reply in thread" });
@@ -633,7 +729,7 @@ test("switching the open thread to another root resets replies, loading state, a
 	await boot(h);
 	const rootA = message_doc(1_000, { rand: "aaam", text: "root a" });
 	const rootB = message_doc(2_000, { rand: "bbbm", text: "root b" });
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([rootA, rootB]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([rootB, rootA]));
 	await screen.findByText("root a");
 
 	// Open thread A, accumulate a reply, and leave one send in flight.
@@ -665,70 +761,117 @@ test("switching the open thread to another root resets replies, loading state, a
 
 // #region load older
 
-test("Load older lists via HTTP with the channel prefix, merges, and Retry resumes the cursor", async () => {
+test("Load older extends the window over the bridge — the HTTP paging path is gone", async () => {
 	const h = make_harness();
-	const olderDoc = message_doc(500, { rand: "old1", text: "the older one" });
-	h.raw.fetchJson
-		.mockResolvedValueOnce({ documents: [olderDoc], cursor: "c1", isDone: false })
-		.mockRejectedValueOnce(Object.assign(new Error("service unavailable"), { status: 500 }))
-		.mockResolvedValueOnce({ documents: [], cursor: null, isDone: true });
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([message_doc(1_000, { rand: "m1", text: "live one" })]);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	messages.onUpdate(window_update([message_doc(1_000, { rand: "m1", text: "live one" })], { hasMore: true }));
 
 	await screen.findByText("live one");
 	fireEvent.click(screen.getByRole("button", { name: "Load older" }));
-	await screen.findByText("the older one");
-	expect(h.raw.fetchJson.mock.calls[0][0]).toBe("/api/v1/plugin-data/list");
-	expect(h.raw.fetchJson.mock.calls[0][1]?.body).toEqual({
-		collection: "messages",
-		keyPrefix: `${CH1_KEY}:`,
-		cursor: null,
-		limit: 50,
-	});
+	expect(messages.loadOlderCalls).toBe(1);
+	expect(h.raw.fetchJson).not.toHaveBeenCalled();
 
-	// The failure keeps the cursor; Retry resumes from the same place.
-	fireEvent.click(screen.getByRole("button", { name: "Load older" }));
-	const alert = await screen.findByRole("alert");
-	expect(alert.textContent).toContain("service unavailable");
-	fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-	await waitFor(() => expect(h.raw.fetchJson).toHaveBeenCalledTimes(3));
-	expect(h.raw.fetchJson.mock.calls[2][1]?.body?.cursor).toBe("c1");
+	// The extended window arrives as a normal update; nothing more below hides the button.
+	messages.onUpdate(
+		window_update([
+			message_doc(1_000, { rand: "m1", text: "live one" }),
+			message_doc(500, { rand: "old1", text: "the older one" }),
+		]),
+	);
+	await screen.findByText("the older one");
 	await waitFor(() => expect(screen.queryByRole("button", { name: "Load older" })).toBeNull());
 });
 
-test("accumulated older pages survive a remote arrival: the messages watch never resubscribes", async () => {
+test("at capacity the Load older button yields to an honest status line", async () => {
 	const h = make_harness();
-	const olderDoc = message_doc(500, { rand: "old1", text: "the older one" });
-	h.raw.fetchJson.mockResolvedValueOnce({ documents: [olderDoc], cursor: "c1", isDone: false });
-	const { container } = await boot(h);
-	const messages = h.find_watch("messages", `${CH1_KEY}:`)!;
-	messages.onUpdate([message_doc(1_000, { rand: "m1", text: "live one" })]);
+	await boot(h);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	messages.onUpdate(
+		window_update([message_doc(1_000, { rand: "m1", text: "live one" })], { hasMore: true, atCapacity: true }),
+	);
 
 	await screen.findByText("live one");
+	expect(screen.queryByRole("button", { name: "Load older" })).toBeNull();
+	expect(screen.getByText("Older messages can't be loaded right now.")).toBeTruthy();
+});
+
+test("retained history survives a remote arrival: the messages window never resubscribes", async () => {
+	const h = make_harness();
+	const { container } = await boot(h);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	messages.onUpdate(window_update([message_doc(1_000, { rand: "m1", text: "live one" })], { hasMore: true }));
+	await screen.findByText("live one");
 	fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+	messages.onUpdate(
+		window_update([
+			message_doc(1_000, { rand: "m1", text: "live one" }),
+			message_doc(500, { rand: "old1", text: "the older one" }),
+		]),
+	);
 	await screen.findByText("the older one");
 
 	// A remote arrival makes the announcer resolve the author, which re-renders the App.
-	// The watch subscription and its accumulated store must survive that render.
-	messages.onUpdate([
-		message_doc(2_000, { rand: "m2", text: "fresh arrival" }),
-		message_doc(1_000, { rand: "m1", text: "live one" }),
-	]);
+	// The window subscription and its retained history must survive that render.
+	messages.onUpdate(
+		window_update([
+			message_doc(2_000, { rand: "m2", text: "fresh arrival" }),
+			message_doc(1_000, { rand: "m1", text: "live one" }),
+			message_doc(500, { rand: "old1", text: "the older one" }),
+		]),
+	);
 	await waitFor(() => expect(announcer_text(container)).toContain("Bob: fresh arrival"));
-
-	// Deliver the newest window again on the CURRENT subscription. A resubscribed watch
-	// would start from a fresh, empty store and collapse history back to this window.
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([
-		message_doc(2_000, { rand: "m2", text: "fresh arrival" }),
-		message_doc(1_000, { rand: "m1", text: "live one" }),
-	]);
-	await screen.findByText("fresh arrival");
 	expect(screen.getByText("the older one")).toBeTruthy();
-	const messageWatchCount = h.raw.data.watch.mock.calls.filter((call) => call[0].collection === "messages").length;
-	expect(messageWatchCount).toBe(1);
+	const messageWindowCount = h.raw.data.watchWindow.mock.calls.filter(
+		(call) => call[0].collection === "messages",
+	).length;
+	expect(messageWindowCount).toBe(1);
 });
 
 // #endregion load older
+
+// #region companion catch-up
+
+test("the catch-up loop extends a lagging companion window after every delivery", async () => {
+	const h = make_harness();
+	await boot(h);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	const reactions = h.find_window("reactions", `${CH1_KEY}:`)!;
+	const replies = h.find_window("replies", `${CH1_KEY}:`)!;
+
+	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
+	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
+	messages.onUpdate(window_update([rootNew, rootOld]));
+	await screen.findByText("old root");
+
+	// Reactions cover only the newest root while more exist below: extend one page.
+	reactions.onUpdate(window_update([reaction_doc(rootNew.key, "heart", "user_other")], { hasMore: true }));
+	expect(reactions.loadOlderCalls).toBe(1);
+
+	// The extension reaches the oldest rendered root: caught up, no further command.
+	reactions.onUpdate(
+		window_update([reaction_doc(rootNew.key, "heart", "user_other"), reaction_doc(rootOld.key, "party", "user_other")], {
+			hasMore: true,
+		}),
+	);
+	expect(reactions.loadOlderCalls).toBe(1);
+
+	// hasMore false never triggers a command, and at capacity the loop stops honestly
+	// instead of spamming commands the host would refuse.
+	replies.onUpdate(window_update([]));
+	expect(replies.loadOlderCalls).toBe(0);
+	replies.onUpdate(window_update([], { hasMore: true, atCapacity: true }));
+	expect(replies.loadOlderCalls).toBe(0);
+
+	// A deeper messages delivery re-evaluates the companions: reactions lag again.
+	const rootOldest = message_doc(500, { rand: "olds", text: "oldest root" });
+	messages.onUpdate(window_update([rootNew, rootOld, rootOldest]));
+	await screen.findByText("oldest root");
+	expect(reactions.loadOlderCalls).toBe(2);
+	expect(replies.loadOlderCalls).toBe(0);
+});
+
+// #endregion companion catch-up
 
 // #region attachments
 
@@ -746,9 +889,11 @@ test("an attachment resolves its link on click; a permission error renders an in
 			truncated: false,
 		});
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([
-		message_doc(1_000, { rand: "m1", text: "with files", attachments: [{ fileNodeId: "n1", name: "spec.pdf" }, { fileNodeId: "n2", name: "secret.txt" }] }),
-	]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
+		window_update([
+			message_doc(1_000, { rand: "m1", text: "with files", attachments: [{ fileNodeId: "n1", name: "spec.pdf" }, { fileNodeId: "n2", name: "secret.txt" }] }),
+		]),
+	);
 
 	await screen.findByText("with files");
 	fireEvent.click(screen.getByRole("button", { name: "spec.pdf" }));
@@ -771,7 +916,7 @@ test("the picker lists workspace files and a picked file rides the next send", a
 		isDone: true,
 	});
 	await boot(h);
-	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
 	fireEvent.click(await screen.findByRole("button", { name: "Attach file" }));
 	const dialog = await screen.findByRole("dialog");

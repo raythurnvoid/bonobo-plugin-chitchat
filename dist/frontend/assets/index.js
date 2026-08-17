@@ -30,7 +30,7 @@
 	}
 })();
 //#endregion
-//#region node_modules/.pnpm/bonobo-plugin-sdk@https+++c_cd857158c340883bcfe1019fc9bff3bf/node_modules/bonobo-plugin-sdk/frontend.js
+//#region node_modules/.pnpm/bonobo-plugin-sdk@https+++c_4ce3c7153a2439b35f2a27f6e125c54e/node_modules/bonobo-plugin-sdk/frontend.js
 /**
  * Bonobo plugin frontend bridge — hand-written browser ESM, no dependencies, no build step.
  *
@@ -130,7 +130,7 @@ async function bonobo_ui_connect() {
 	const pending_refreshes = /* @__PURE__ */ new Map();
 	/** @type {Promise<string> | null} */
 	let refresh_in_flight = null;
-	/** @type {Map<string, (docs: import("bonobo-plugin-sdk").PublicDoc[] | null) => void>} */
+	/** @type {Map<string, { kind: "plain" | "window", deliver: (update: any, info?: import("bonobo-plugin-sdk/frontend").BonoboUiWatchDeathInfo) => void }>} */
 	const watch_registrations = /* @__PURE__ */ new Map();
 	/** @type {Map<string, { resolve: (result: import("bonobo-plugin-sdk/frontend").BonoboUiDataWriteResult) => void, timeout: ReturnType<typeof setTimeout> }>} */
 	const pending_data_writes = /* @__PURE__ */ new Map();
@@ -258,9 +258,11 @@ async function bonobo_ui_connect() {
 	}
 	/**
 	 * Posts one `bonobo:data-user-write` and resolves with the correlated
-	 * `bonobo:data-user-write-result` `result` as-is, `_yay` and `_nay` alike.
+	 * `bonobo:data-user-write-result` `result` as-is, `_yay` and `_nay` alike. The runtime passes
+	 * the result through without checking it, so each caller casts this shared promise to its
+	 * op's result type — that narrowing is the host-door contract, not a runtime guarantee.
 	 *
-	 * @param {{ op: "append" | "put" | "remove" | "putOwned" | "removeOwned", collection: string, keyPrefix?: string, key?: string, value?: object, clientRequestId?: string }} fields
+	 * @param {{ op: "append" | "put" | "remove" | "putOwned" | "removeOwned", collection: string, keyPrefix?: string, key?: string, value?: object, clientRequestId?: string, expectedRevision?: number }} fields
 	 */
 	function post_data_user_write(fields) {
 		const requestId = crypto.randomUUID();
@@ -280,7 +282,10 @@ async function bonobo_ui_connect() {
 	const data = {
 		watch(opts, onUpdate) {
 			const subscriptionId = crypto.randomUUID();
-			watch_registrations.set(subscriptionId, onUpdate);
+			watch_registrations.set(subscriptionId, {
+				kind: "plain",
+				deliver: onUpdate,
+			});
 			window.parent.postMessage(
 				{
 					type: "bonobo:data-watch",
@@ -304,6 +309,48 @@ async function bonobo_ui_connect() {
 				);
 			};
 		},
+		watchWindow(opts, onUpdate) {
+			const subscriptionId = crypto.randomUUID();
+			watch_registrations.set(subscriptionId, {
+				kind: "window",
+				deliver: onUpdate,
+			});
+			window.parent.postMessage(
+				{
+					type: "bonobo:data-watch-window",
+					bridgeNonce,
+					subscriptionId,
+					collection: opts.collection,
+					...(opts.keyPrefix === void 0 ? {} : { keyPrefix: opts.keyPrefix }),
+					pageSize: opts.pageSize,
+				},
+				parentOrigin,
+			);
+			return {
+				loadOlder() {
+					if (!watch_registrations.has(subscriptionId)) return;
+					window.parent.postMessage(
+						{
+							type: "bonobo:data-window-load-older",
+							bridgeNonce,
+							subscriptionId,
+						},
+						parentOrigin,
+					);
+				},
+				unsubscribe() {
+					if (!watch_registrations.delete(subscriptionId)) return;
+					window.parent.postMessage(
+						{
+							type: "bonobo:data-unwatch",
+							bridgeNonce,
+							subscriptionId,
+						},
+						parentOrigin,
+					);
+				},
+			};
+		},
 		append(opts) {
 			return post_data_user_write({
 				op: "append",
@@ -319,6 +366,7 @@ async function bonobo_ui_connect() {
 				collection: opts.collection,
 				key: opts.key,
 				value: opts.value,
+				...(opts.expectedRevision === void 0 ? {} : { expectedRevision: opts.expectedRevision }),
 			});
 		},
 		remove(opts) {
@@ -326,6 +374,7 @@ async function bonobo_ui_connect() {
 				op: "remove",
 				collection: opts.collection,
 				key: opts.key,
+				...(opts.expectedRevision === void 0 ? {} : { expectedRevision: opts.expectedRevision }),
 			});
 		},
 		putOwned(opts) {
@@ -334,6 +383,7 @@ async function bonobo_ui_connect() {
 				collection: opts.collection,
 				key: opts.key,
 				value: opts.value,
+				...(opts.expectedRevision === void 0 ? {} : { expectedRevision: opts.expectedRevision }),
 			});
 		},
 		removeOwned(opts) {
@@ -341,6 +391,7 @@ async function bonobo_ui_connect() {
 				op: "removeOwned",
 				collection: opts.collection,
 				key: opts.key,
+				...(opts.expectedRevision === void 0 ? {} : { expectedRevision: opts.expectedRevision }),
 			});
 		},
 	};
@@ -444,11 +495,24 @@ async function bonobo_ui_connect() {
 				typeof message.subscriptionId === "string" &&
 				(message.docs === null || Array.isArray(message.docs))
 			) {
-				const deliver = watch_registrations.get(message.subscriptionId);
-				if (deliver) {
-					if (message.docs === null) watch_registrations.delete(message.subscriptionId);
-					deliver(message.docs);
-				}
+				const registration = watch_registrations.get(message.subscriptionId);
+				if (registration)
+					if (message.docs === null) {
+						watch_registrations.delete(message.subscriptionId);
+						const info = {
+							...(typeof message.reason === "string" ? { reason: message.reason } : {}),
+							...(typeof message.message === "string" ? { message: message.message } : {}),
+						};
+						if (Object.keys(info).length > 0) registration.deliver(null, info);
+						else registration.deliver(null);
+					} else if (registration.kind === "window")
+						registration.deliver({
+							docs: message.docs,
+							hasMore: message.hasMore === true,
+							atCapacity: message.atCapacity === true,
+							incomplete: message.incomplete === true,
+						});
+					else registration.deliver(message.docs);
 			} else if (
 				initialized &&
 				message.bridgeNonce === bridgeNonce &&
@@ -6908,8 +6972,8 @@ var chat_message_value_schema = object({
 	deletedAt: number().nullable(),
 });
 /**
- * The PublicDoc envelope every read surface returns (watch updates and the HTTP list
- * route alike). The store is a generic multi-writer surface, so every doc is runtime
+ * The BonoboPublicDoc envelope every read surface returns (plain watch and window
+ * updates alike). The store is a generic multi-writer surface, so every doc is runtime
  * validated before the page uses it; a doc that fails is dropped and counted.
  */
 var public_doc_schema = object({
@@ -6973,12 +7037,6 @@ function chat_validate_reaction_doc(raw) {
 		revision: envelope.data.revision,
 	};
 }
-/** Response of `POST /api/v1/plugin-data/list`. Documents are validated one by one later. */
-var chat_plugin_data_list_response_schema = object({
-	documents: array(unknown()),
-	cursor: string().nullable(),
-	isDone: boolean(),
-});
 /** Response of `POST /api/v1/files/list`. */
 var chat_files_list_response_schema = object({
 	items: array(
@@ -7017,10 +7075,11 @@ function chat_get_error_message(error) {
 //#endregion
 //#region src/chat-store.ts
 /**
- * The accumulate-by-key seam store for messages and replies. Watch updates and HTTP pages
- * merge into one map keyed by document key: keys are never reused, deletes are value
+ * The accumulate-by-key seam store for messages and thread replies. Every update merges
+ * into one map keyed by document key: keys are never reused, deletes are value
  * tombstones (`deletedAt`), and a doc only advances forward (a lower revision never
- * overwrites a higher one).
+ * overwrites a higher one). The revision-forward merge is also what lets an optimistic
+ * local echo coexist with the server's later delivery of the same key.
  */
 function chat_create_accumulating_store(validate) {
 	const byKey = /* @__PURE__ */ new Map();
@@ -7044,9 +7103,6 @@ function chat_create_accumulating_store(validate) {
 	};
 	return {
 		apply_window: merge_raw,
-		apply_page(docs) {
-			merge_raw(docs);
-		},
 		apply_local: merge_one,
 		get_sorted() {
 			return [...byKey.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
@@ -7127,11 +7183,12 @@ function chat_count_replies(docs) {
 	return counts;
 }
 /**
- * Reply counts come from a bounded watch window, so a large count is an approximation —
- * cap the display at "99+" instead of pretending precision.
+ * Reply counts are exact once the replies window has nothing more below it. While
+ * `hasMore` says replies may still be missing, cap a large count at "99+" instead of
+ * pretending precision.
  */
-function chat_format_reply_count(count) {
-	return count > 99 ? "99+" : String(count);
+function chat_format_reply_count(count, hasMore) {
+	return count > 99 && hasMore ? "99+" : String(count);
 }
 //#endregion
 //#region node_modules/.pnpm/preact@10.29.8/node_modules/preact/jsx-runtime/src/index.js
@@ -7949,9 +8006,11 @@ function MessageRow(props) {
 										className: "button message-action",
 										onClick: () => props.onOpenThread?.(doc),
 										children:
-											props.replyCount === 0
-												? "Reply in thread"
-												: `${chat_format_reply_count(props.replyCount)} replies`,
+											props.replyCount === "unknown"
+												? "View thread"
+												: props.replyCount === 0
+													? "Reply in thread"
+													: `${chat_format_reply_count(props.replyCount, props.repliesHasMore)} replies`,
 									})
 								: null,
 							/* @__PURE__ */ createVNode(AddReactionButton, {
@@ -8151,6 +8210,7 @@ function ThreadPanel(props) {
 					authorName: memberNames.get(root.createdBy),
 					reactionGroups: props.reactionGroupsByTarget.get(root.key) ?? [],
 					replyCount: null,
+					repliesHasMore: false,
 					onOpenThread: null,
 					replyTriggerRef: null,
 					onApplyLocal: props.onApplyLocalRoot,
@@ -8181,6 +8241,7 @@ function ThreadPanel(props) {
 											authorName: memberNames.get(doc.createdBy),
 											reactionGroups: props.reactionGroupsByTarget.get(doc.key) ?? [],
 											replyCount: null,
+											repliesHasMore: false,
 											onOpenThread: null,
 											replyTriggerRef: null,
 											onApplyLocal: (updated) => {
@@ -8213,7 +8274,13 @@ function ThreadPanel(props) {
 	});
 }
 /**
- * One open channel: message log, load-older pagination, composer, and thread panel.
+ * Message and reply keys are `<channel uuid (36)>:<inverted ms (13)>:<rand (4)>...`, so the
+ * first 55 characters of any chitchat-minted key name its root message. Companion keys
+ * (reactions, replies) extend a root key, so the same slice normalizes them all.
+ */
+var ROOT_KEY_LENGTH = 55;
+/**
+ * One open channel: message log, reactive document windows, composer, and thread panel.
  * The parent keys this component by channel key, so every mount owns exactly one channel.
  */
 function ChannelView(props) {
@@ -8221,38 +8288,77 @@ function ChannelView(props) {
 	const [messages, setMessages] = useState([]);
 	const [messagesLoaded, setMessagesLoaded] = useState(false);
 	const [messagesDead, setMessagesDead] = useState(false);
+	const [messagesWindow, setMessagesWindow] = useState({
+		hasMore: false,
+		atCapacity: false,
+		incomplete: false,
+	});
 	const [reactionDocs, setReactionDocs] = useState([]);
 	const [channelReplies, setChannelReplies] = useState([]);
-	const [older, setOlder] = useState({
-		cursor: null,
-		isDone: false,
-		loading: false,
-		error: null,
+	const [replyCoverage, setReplyCoverage] = useState({
+		hasMore: false,
+		deepestRoot: null,
 	});
 	const [threadRootKey, setThreadRootKey] = useState(null);
 	const messagesStoreRef = useRef(null);
+	const messagesWindowRef = useRef(null);
+	const reactionsWindowRef = useRef(null);
+	const repliesWindowRef = useRef(null);
+	const reactionsCoverageRef = useRef(null);
+	const repliesCoverageRef = useRef(null);
+	const oldestRootRef = useRef(null);
+	const channelNameRef = useRef(channel.value.name);
 	const seenKeysRef = useRef(null);
 	const replyTriggersRef = useRef(/* @__PURE__ */ new Map());
 	const logRef = useRef(null);
 	const newestKeyRef = useRef(null);
 	const pendingCountRef = useRef(0);
 	useEffect(() => {
+		channelNameRef.current = channel.value.name;
+	}, [channel.value.name]);
+	const evaluate_companion_catch_up = () => {
+		const oldestRoot = oldestRootRef.current;
+		if (oldestRoot === null) return;
+		for (const companion of [
+			{
+				coverage: reactionsCoverageRef.current,
+				windowHandle: reactionsWindowRef.current,
+			},
+			{
+				coverage: repliesCoverageRef.current,
+				windowHandle: repliesWindowRef.current,
+			},
+		]) {
+			if (companion.coverage === null || !companion.coverage.hasMore || companion.coverage.atCapacity) continue;
+			if (companion.coverage.deepestRoot === null || companion.coverage.deepestRoot < oldestRoot)
+				companion.windowHandle?.loadOlder();
+		}
+	};
+	useEffect(() => {
 		const store = chat_create_accumulating_store(chat_validate_message_doc);
 		messagesStoreRef.current = store;
-		return client.data.watch(
+		const watchWindow = client.data.watchWindow(
 			{
 				collection: "messages",
 				keyPrefix: chat_message_key_prefix(channel.key),
-				limit: 100,
+				pageSize: 100,
 			},
-			(docs) => {
-				if (docs === null) {
+			(update) => {
+				if (update === null) {
 					setMessagesDead(true);
 					return;
 				}
-				const windowDocs = store.apply_window(docs);
-				setMessages(store.get_sorted());
+				const windowDocs = store.apply_window(update.docs);
+				const sorted = store.get_sorted();
+				setMessages(sorted);
 				setMessagesLoaded(true);
+				setMessagesWindow({
+					hasMore: update.hasMore,
+					atCapacity: update.atCapacity,
+					incomplete: update.incomplete,
+				});
+				oldestRootRef.current = sorted.length > 0 ? sorted[sorted.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null;
+				evaluate_companion_catch_up();
 				const seen = seenKeysRef.current;
 				if (seen === null) {
 					seenKeysRef.current = new Set(windowDocs.map((doc) => doc.key));
@@ -8273,40 +8379,81 @@ function ChannelView(props) {
 							announce(`${name ?? "Former member"}: ${preview}`);
 						})
 						.catch(() => {
-							announce(`New message in #${channel.value.name}`);
+							announce(`New message in #${channelNameRef.current}`);
 						});
-				} else if (arrivals.length > 1) announce(`${arrivals.length} new messages in #${channel.value.name}`);
+				} else if (arrivals.length > 1) announce(`${arrivals.length} new messages in #${channelNameRef.current}`);
 			},
 		);
-	}, [client, channel.key, channel.value.name, userId, memberNames, announce]);
+		messagesWindowRef.current = watchWindow;
+		return () => {
+			messagesWindowRef.current = null;
+			watchWindow.unsubscribe();
+		};
+	}, [client, channel.key, userId, memberNames, announce]);
 	useEffect(() => {
 		const store = chat_create_window_store(chat_validate_reaction_doc);
-		return client.data.watch(
+		const watchWindow = client.data.watchWindow(
 			{
 				collection: "reactions",
 				keyPrefix: chat_message_key_prefix(channel.key),
-				limit: 100,
+				pageSize: 100,
 			},
-			(docs) => {
-				if (docs === null) return;
-				setReactionDocs(store.apply_window(docs));
+			(update) => {
+				if (update === null) {
+					reactionsCoverageRef.current = null;
+					return;
+				}
+				const validated = store.apply_window(update.docs);
+				setReactionDocs(validated);
+				reactionsCoverageRef.current = {
+					hasMore: update.hasMore,
+					atCapacity: update.atCapacity,
+					deepestRoot: validated.length > 0 ? validated[validated.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null,
+				};
+				evaluate_companion_catch_up();
 			},
 		);
+		reactionsWindowRef.current = watchWindow;
+		return () => {
+			reactionsWindowRef.current = null;
+			reactionsCoverageRef.current = null;
+			watchWindow.unsubscribe();
+		};
 	}, [client, channel.key]);
 	useEffect(() => {
-		const store = chat_create_accumulating_store(chat_validate_message_doc);
-		return client.data.watch(
+		const store = chat_create_window_store(chat_validate_message_doc);
+		const watchWindow = client.data.watchWindow(
 			{
 				collection: "replies",
 				keyPrefix: chat_message_key_prefix(channel.key),
-				limit: 100,
+				pageSize: 100,
 			},
-			(docs) => {
-				if (docs === null) return;
-				store.apply_window(docs);
-				setChannelReplies(store.get_sorted());
+			(update) => {
+				if (update === null) {
+					repliesCoverageRef.current = null;
+					return;
+				}
+				const validated = store.apply_window(update.docs);
+				setChannelReplies(validated);
+				const deepestRoot = validated.length > 0 ? validated[validated.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null;
+				repliesCoverageRef.current = {
+					hasMore: update.hasMore,
+					atCapacity: update.atCapacity,
+					deepestRoot,
+				};
+				setReplyCoverage({
+					hasMore: update.hasMore,
+					deepestRoot,
+				});
+				evaluate_companion_catch_up();
 			},
 		);
+		repliesWindowRef.current = watchWindow;
+		return () => {
+			repliesWindowRef.current = null;
+			repliesCoverageRef.current = null;
+			watchWindow.unsubscribe();
+		};
 	}, [client, channel.key]);
 	const queue = use_send_queue({
 		client,
@@ -8334,57 +8481,9 @@ function ChannelView(props) {
 		if ((newestChanged || pendingGrew) && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
 	}, [messages, queue.pending.length]);
 	const handle_load_older = () => {
-		if (older.loading || older.isDone) return;
-		setOlder((prev) => ({
-			...prev,
-			loading: true,
-			error: null,
-		}));
-		client
-			.fetchJson("/api/v1/plugin-data/list", {
-				body: {
-					collection: "messages",
-					keyPrefix: chat_message_key_prefix(channel.key),
-					cursor: older.cursor,
-					limit: 50,
-				},
-			})
-			.then((raw) => {
-				const parsed = chat_plugin_data_list_response_schema.safeParse(raw);
-				if (!parsed.success) {
-					setOlder((prev) => ({
-						...prev,
-						loading: false,
-						error: "Unexpected response while loading older messages",
-					}));
-					return;
-				}
-				const store = messagesStoreRef.current;
-				if (store !== null) {
-					store.apply_page(parsed.data.documents);
-					setMessages(store.get_sorted());
-				}
-				setOlder({
-					cursor: parsed.data.cursor,
-					isDone: parsed.data.isDone,
-					loading: false,
-					error: null,
-				});
-			})
-			.catch((error) => {
-				setOlder((prev) => ({
-					...prev,
-					loading: false,
-					error: chat_get_error_message(error),
-				}));
-			});
+		messagesWindowRef.current?.loadOlder();
 	};
-	const reactionGroupsByTarget = useMemo(() => {
-		return chat_group_reactions(
-			reactionDocs.filter((doc) => doc !== null),
-			userId,
-		);
-	}, [reactionDocs, userId]);
+	const reactionGroupsByTarget = useMemo(() => chat_group_reactions(reactionDocs, userId), [reactionDocs, userId]);
 	const replyCounts = useMemo(() => chat_count_replies(channelReplies), [channelReplies]);
 	const apply_local_message = (doc) => {
 		messagesStoreRef.current?.apply_local(doc);
@@ -8437,31 +8536,28 @@ function ChannelView(props) {
 						"aria-live": "off",
 						"aria-label": `Messages in #${channel.value.name}`,
 						children: [
-							messagesLoaded && messages.length > 0 && !older.isDone && older.error === null
+							messagesLoaded && messagesWindow.hasMore && !messagesWindow.atCapacity
 								? /* @__PURE__ */ createVNode("div", {
 										className: "log-older",
 										children: /* @__PURE__ */ createVNode("button", {
 											type: "button",
 											className: "button",
-											disabled: older.loading,
 											onClick: handle_load_older,
-											children: older.loading ? "Loading…" : "Load older",
+											children: "Load older",
 										}),
 									})
 								: null,
-							older.error !== null
+							messagesLoaded && messagesWindow.hasMore && messagesWindow.atCapacity
 								? /* @__PURE__ */ createVNode("div", {
-										className: "channel-status is-error",
+										className: "channel-status",
+										children: "Older messages can't be loaded right now.",
+									})
+								: null,
+							messagesWindow.incomplete
+								? /* @__PURE__ */ createVNode("div", {
+										className: "channel-status",
 										role: "alert",
-										children: [
-											/* @__PURE__ */ createVNode("span", { children: older.error }),
-											/* @__PURE__ */ createVNode("button", {
-												type: "button",
-												className: "button",
-												onClick: handle_load_older,
-												children: "Retry",
-											}),
-										],
+										children: "Some messages in this range could not be loaded.",
 									})
 								: null,
 							!messagesLoaded
@@ -8488,7 +8584,13 @@ function ChannelView(props) {
 															isOwn: doc.createdBy === userId,
 															authorName: memberNames.get(doc.createdBy),
 															reactionGroups: reactionGroupsByTarget.get(doc.key) ?? [],
-															replyCount: replyCounts.get(doc.key) ?? 0,
+															replyCount:
+																!replyCoverage.hasMore ||
+																(replyCoverage.deepestRoot !== null &&
+																	doc.key.slice(0, ROOT_KEY_LENGTH) < replyCoverage.deepestRoot)
+																	? (replyCounts.get(doc.key) ?? 0)
+																	: "unknown",
+															repliesHasMore: replyCoverage.hasMore,
 															onOpenThread: (root) => setThreadRootKey(root.key),
 															replyTriggerRef: (el) => {
 																if (el === null) replyTriggersRef.current.delete(doc.key);
@@ -8790,7 +8892,7 @@ function App(props) {
 					setDialogError(result._nay.message);
 					return;
 				}
-				setSelectedKey(result._yay.key);
+				setSelectedKey(key);
 				close_dialog();
 			})
 			.catch((error) => {
@@ -8806,11 +8908,16 @@ function App(props) {
 				collection: "channels",
 				key: channel.key,
 				value,
+				expectedRevision: channel.revision,
 			})
 			.then((result) => {
 				if ("_nay" in result) {
 					setDialogBusy(false);
-					setDialogError(result._nay.message);
+					setDialogError(
+						result._nay.name === "conflict"
+							? "Someone else changed this channel while the dialog was open. Close it and try again."
+							: result._nay.message,
+					);
 					return;
 				}
 				close_dialog();
@@ -8829,6 +8936,7 @@ function App(props) {
 					...channel.value,
 					archivedAt: null,
 				},
+				expectedRevision: channel.revision,
 			})
 			.then((result) => {
 				if ("_nay" in result) announce(result._nay.message);

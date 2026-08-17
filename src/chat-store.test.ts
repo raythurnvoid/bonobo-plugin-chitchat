@@ -71,10 +71,10 @@ describe("chat_create_accumulating_store", () => {
 		expect(keys).toHaveLength(3);
 	});
 
-	test("merges an overlapping HTTP page with the watch window, each key exactly once", () => {
+	test("merges overlapping updates, each key exactly once", () => {
 		const store = chat_create_accumulating_store(chat_validate_message_doc);
 		store.apply_window([message_doc(3_000, { rand: "m3" }), message_doc(2_000, { rand: "m2" })]);
-		store.apply_page([message_doc(2_000, { rand: "m2" }), message_doc(1_000, { rand: "m1" })]);
+		store.apply_window([message_doc(2_000, { rand: "m2" }), message_doc(1_000, { rand: "m1" })]);
 
 		const keys = store.get_sorted().map((doc) => doc.key);
 		expect(keys).toEqual([message_key(3_000, "m3"), message_key(2_000, "m2"), message_key(1_000, "m1")]);
@@ -105,7 +105,7 @@ describe("chat_create_accumulating_store", () => {
 		store.apply_window([message_doc(2_000, { rand: "m2", text: "edited", revision: 3 })]);
 		expect(store.get_sorted()[0].value.text).toBe("edited");
 
-		store.apply_page([message_doc(2_000, { rand: "m2", text: "stale", revision: 2 })]);
+		store.apply_window([message_doc(2_000, { rand: "m2", text: "stale", revision: 2 })]);
 		expect(store.get_sorted()).toHaveLength(1);
 		expect(store.get_sorted()[0].value.text).toBe("edited");
 	});
@@ -200,9 +200,10 @@ describe("chat_count_replies", () => {
 });
 
 describe("chat_format_reply_count", () => {
-	test("caps the display at 99+", () => {
-		expect(chat_format_reply_count(3)).toBe("3");
-		expect(chat_format_reply_count(99)).toBe("99");
-		expect(chat_format_reply_count(100)).toBe("99+");
+	test("caps a big count at 99+ only while the window says more replies exist below", () => {
+		expect(chat_format_reply_count(3, true)).toBe("3");
+		expect(chat_format_reply_count(99, true)).toBe("99");
+		expect(chat_format_reply_count(100, true)).toBe("99+");
+		expect(chat_format_reply_count(100, false)).toBe("100");
 	});
 });

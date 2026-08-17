@@ -268,7 +268,8 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 					return;
 				}
 				// The sidebar shows the channel when the watch delivers it; select it now.
-				setSelectedKey(result._yay.key);
+				// (0.8.0 put results carry only revision and byteSize, so use the local key.)
+				setSelectedKey(key);
 				close_dialog();
 			})
 			.catch((error: unknown) => {
@@ -281,11 +282,17 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 		setDialogBusy(true);
 		setDialogError(null);
 		client.data
-			.put({ collection: "channels", key: channel.key, value })
+			// expectedRevision makes the write compare-and-set: a concurrent rename or archive
+			// from another member answers a conflict instead of being silently overwritten.
+			.put({ collection: "channels", key: channel.key, value, expectedRevision: channel.revision })
 			.then((result) => {
 				if ("_nay" in result) {
 					setDialogBusy(false);
-					setDialogError(result._nay.message);
+					setDialogError(
+						result._nay.name === "conflict"
+							? "Someone else changed this channel while the dialog was open. Close it and try again."
+							: result._nay.message,
+					);
 					return;
 				}
 				close_dialog();
@@ -298,7 +305,12 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 
 	const handle_unarchive = (channel: chat_Doc<chat_ChannelValue>) => {
 		client.data
-			.put({ collection: "channels", key: channel.key, value: { ...channel.value, archivedAt: null } })
+			.put({
+				collection: "channels",
+				key: channel.key,
+				value: { ...channel.value, archivedAt: null },
+				expectedRevision: channel.revision,
+			})
 			.then((result) => {
 				if ("_nay" in result) {
 					announce(result._nay.message);

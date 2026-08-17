@@ -151,8 +151,8 @@ export type chat_MessageValue = z.infer<typeof chat_message_value_schema>;
 // #region document validation
 
 /**
- * The PublicDoc envelope every read surface returns (watch updates and the HTTP list
- * route alike). The store is a generic multi-writer surface, so every doc is runtime
+ * The BonoboPublicDoc envelope every read surface returns (plain watch and window
+ * updates alike). The store is a generic multi-writer surface, so every doc is runtime
  * validated before the page uses it; a doc that fails is dropped and counted.
  */
 const public_doc_schema = z.object({
@@ -261,13 +261,6 @@ export function chat_validate_reaction_doc(raw: unknown): chat_ReactionDoc | nul
 // #endregion document validation
 
 // #region HTTP response schemas
-
-/** Response of `POST /api/v1/plugin-data/list`. Documents are validated one by one later. */
-export const chat_plugin_data_list_response_schema = z.object({
-	documents: z.array(z.unknown()),
-	cursor: z.string().nullable(),
-	isDone: z.boolean(),
-});
 
 export const chat_files_list_item_schema = z.object({
 	path: z.string(),

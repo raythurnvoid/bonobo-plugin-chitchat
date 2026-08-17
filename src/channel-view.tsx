@@ -7,7 +7,6 @@ import {
 	chat_get_error_message,
 	chat_key_timestamp,
 	chat_message_key_prefix,
-	chat_plugin_data_list_response_schema,
 	chat_reaction_caller_key,
 	chat_REACTION_EMOJI,
 	chat_REACTION_LABELS,
@@ -20,6 +19,7 @@ import {
 	type chat_Doc,
 	type chat_FilesListItem,
 	type chat_MessageValue,
+	type chat_ReactionDoc,
 	type chat_ReactionToken,
 } from "./chat-data";
 import {
@@ -494,8 +494,13 @@ type MessageRow_Props = {
 	isOwn: boolean;
 	authorName: string | null | undefined;
 	reactionGroups: chat_ReactionGroup[];
-	/** null = this row offers no thread affordance (rows inside a thread panel). */
-	replyCount: number | null;
+	/**
+	 * null = this row offers no thread affordance (rows inside a thread panel).
+	 * "unknown" = the replies window does not reach this root yet, so no count is claimed.
+	 */
+	replyCount: number | "unknown" | null;
+	/** True while the replies window says more replies exist below it — gates the "99+" cap. */
+	repliesHasMore: boolean;
 	onOpenThread: ((doc: chat_Doc<chat_MessageValue>) => void) | null;
 	replyTriggerRef: ((el: HTMLButtonElement | null) => void) | null;
 	onApplyLocal: (doc: chat_Doc<chat_MessageValue>) => void;
@@ -662,7 +667,11 @@ export function MessageRow(props: MessageRow_Props) {
 							className="button message-action"
 							onClick={() => props.onOpenThread?.(doc)}
 						>
-							{props.replyCount === 0 ? "Reply in thread" : `${chat_format_reply_count(props.replyCount)} replies`}
+							{props.replyCount === "unknown"
+								? "View thread"
+								: props.replyCount === 0
+									? "Reply in thread"
+									: `${chat_format_reply_count(props.replyCount, props.repliesHasMore)} replies`}
 						</button>
 					) : null}
 					<AddReactionButton groups={props.reactionGroups} onPick={handle_toggle_reaction} />
@@ -832,6 +841,7 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 					authorName={memberNames.get(root.createdBy)}
 					reactionGroups={props.reactionGroupsByTarget.get(root.key) ?? []}
 					replyCount={null}
+					repliesHasMore={false}
 					onOpenThread={null}
 					replyTriggerRef={null}
 					onApplyLocal={props.onApplyLocalRoot}
@@ -855,6 +865,7 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 							authorName={memberNames.get(doc.createdBy)}
 							reactionGroups={props.reactionGroupsByTarget.get(doc.key) ?? []}
 							replyCount={null}
+							repliesHasMore={false}
 							onOpenThread={null}
 							replyTriggerRef={null}
 							onApplyLocal={(updated) => {
@@ -885,8 +896,26 @@ type ChannelView_Props = {
 	announce: (text: string) => void;
 };
 
+/** The loadOlder/unsubscribe handle `client.data.watchWindow` returns. */
+type WindowHandle = ReturnType<BonoboUiFrontendClient["data"]["watchWindow"]>;
+
+/** What the catch-up loop needs to know about a companion window's coverage. */
+type CompanionCoverage = {
+	hasMore: boolean;
+	atCapacity: boolean;
+	/** Root message key (first 55 chars) of the deepest validated doc, or null when empty. */
+	deepestRoot: string | null;
+};
+
 /**
- * One open channel: message log, load-older pagination, composer, and thread panel.
+ * Message and reply keys are `<channel uuid (36)>:<inverted ms (13)>:<rand (4)>...`, so the
+ * first 55 characters of any chitchat-minted key name its root message. Companion keys
+ * (reactions, replies) extend a root key, so the same slice normalizes them all.
+ */
+const ROOT_KEY_LENGTH = 55;
+
+/**
+ * One open channel: message log, reactive document windows, composer, and thread panel.
  * The parent keys this component by channel key, so every mount owns exactly one channel.
  */
 export function ChannelView(props: ChannelView_Props) {
@@ -894,33 +923,80 @@ export function ChannelView(props: ChannelView_Props) {
 	const [messages, setMessages] = useState<chat_Doc<chat_MessageValue>[]>([]);
 	const [messagesLoaded, setMessagesLoaded] = useState(false);
 	const [messagesDead, setMessagesDead] = useState(false);
-	const [reactionDocs, setReactionDocs] = useState<ReturnType<typeof chat_validate_reaction_doc>[]>([]);
+	const [messagesWindow, setMessagesWindow] = useState({ hasMore: false, atCapacity: false, incomplete: false });
+	const [reactionDocs, setReactionDocs] = useState<chat_ReactionDoc[]>([]);
 	const [channelReplies, setChannelReplies] = useState<chat_Doc<chat_MessageValue>[]>([]);
-	const [older, setOlder] = useState<{ cursor: string | null; isDone: boolean; loading: boolean; error: string | null }>(
-		{ cursor: null, isDone: false, loading: false, error: null },
-	);
+	const [replyCoverage, setReplyCoverage] = useState<{ hasMore: boolean; deepestRoot: string | null }>({
+		hasMore: false,
+		deepestRoot: null,
+	});
 	const [threadRootKey, setThreadRootKey] = useState<string | null>(null);
 	const messagesStoreRef = useRef<chat_AccumulatingStore<chat_MessageValue> | null>(null);
+	const messagesWindowRef = useRef<WindowHandle | null>(null);
+	const reactionsWindowRef = useRef<WindowHandle | null>(null);
+	const repliesWindowRef = useRef<WindowHandle | null>(null);
+	const reactionsCoverageRef = useRef<CompanionCoverage | null>(null);
+	const repliesCoverageRef = useRef<CompanionCoverage | null>(null);
+	const oldestRootRef = useRef<string | null>(null);
+	const channelNameRef = useRef(channel.value.name);
 	const seenKeysRef = useRef<Set<string> | null>(null);
 	const replyTriggersRef = useRef(new Map<string, HTMLButtonElement>());
 	const logRef = useRef<HTMLDivElement | null>(null);
 	const newestKeyRef = useRef<string | null>(null);
 	const pendingCountRef = useRef(0);
 
-	// Messages watch: accumulate-by-key, plus remote-arrival detection for the announcer.
+	// The announcer reads the channel name through this ref so a rename does not sit in the
+	// messages effect's dependencies: any member renaming the channel in a loop would
+	// otherwise tear down and rebuild every viewer's subscription (and its retained window)
+	// at the rename rate.
+	useEffect(() => {
+		channelNameRef.current = channel.value.name;
+	}, [channel.value.name]);
+
+	// Companion catch-up: reactions and replies key by TARGET, not by time, so their windows
+	// can lag behind the rendered message range. After every window delivery, extend a
+	// companion one page while it still has older docs and its deepest covered root is newer
+	// than the oldest rendered message. Every compared key survived chat_validate_*, so the
+	// keys are ASCII and plain JS comparison is byte order.
+	const evaluate_companion_catch_up = () => {
+		const oldestRoot = oldestRootRef.current;
+		if (oldestRoot === null) {
+			return;
+		}
+		for (const companion of [
+			{ coverage: reactionsCoverageRef.current, windowHandle: reactionsWindowRef.current },
+			{ coverage: repliesCoverageRef.current, windowHandle: repliesWindowRef.current },
+		]) {
+			if (companion.coverage === null || !companion.coverage.hasMore || companion.coverage.atCapacity) {
+				continue;
+			}
+			if (companion.coverage.deepestRoot === null || companion.coverage.deepestRoot < oldestRoot) {
+				companion.windowHandle?.loadOlder();
+			}
+		}
+	};
+
+	// Messages window: the host retains loaded history, so each update is the whole window.
+	// The accumulating store stays as the merge seam for optimistic local echoes (its
+	// revision-forward rule), plus remote-arrival detection for the announcer.
 	useEffect(() => {
 		const store = chat_create_accumulating_store(chat_validate_message_doc);
 		messagesStoreRef.current = store;
-		const unsubscribe = client.data.watch(
-			{ collection: "messages", keyPrefix: chat_message_key_prefix(channel.key), limit: 100 },
-			(docs) => {
-				if (docs === null) {
+		const watchWindow = client.data.watchWindow(
+			{ collection: "messages", keyPrefix: chat_message_key_prefix(channel.key), pageSize: 100 },
+			(update) => {
+				if (update === null) {
 					setMessagesDead(true);
 					return;
 				}
-				const windowDocs = store.apply_window(docs);
-				setMessages(store.get_sorted());
+				const windowDocs = store.apply_window(update.docs);
+				const sorted = store.get_sorted();
+				setMessages(sorted);
 				setMessagesLoaded(true);
+				setMessagesWindow({ hasMore: update.hasMore, atCapacity: update.atCapacity, incomplete: update.incomplete });
+				oldestRootRef.current =
+					sorted.length > 0 ? sorted[sorted.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null;
+				evaluate_companion_catch_up();
 
 				const seen = seenKeysRef.current;
 				// The first window is existing history, never announced.
@@ -947,47 +1023,78 @@ export function ChannelView(props: ChannelView_Props) {
 							announce(`${name ?? "Former member"}: ${preview}`);
 						})
 						.catch(() => {
-							announce(`New message in #${channel.value.name}`);
+							announce(`New message in #${channelNameRef.current}`);
 						});
 				} else if (arrivals.length > 1) {
 					// Coalesce a burst into one announcement.
-					announce(`${arrivals.length} new messages in #${channel.value.name}`);
+					announce(`${arrivals.length} new messages in #${channelNameRef.current}`);
 				}
 			},
 		);
-		return unsubscribe;
-	}, [client, channel.key, channel.value.name, userId, memberNames, announce]);
+		messagesWindowRef.current = watchWindow;
+		return () => {
+			messagesWindowRef.current = null;
+			watchWindow.unsubscribe();
+		};
+	}, [client, channel.key, userId, memberNames, announce]);
 
-	// Reactions watch: replace-from-window. The channel prefix also covers reply reactions,
-	// because reply keys extend their root message key.
+	// Reactions window: replace-from-window (a reaction removed by removeOwned must
+	// disappear). The channel prefix also covers reply reactions, because reply keys extend
+	// their root message key.
 	useEffect(() => {
 		const store = chat_create_window_store(chat_validate_reaction_doc);
-		const unsubscribe = client.data.watch(
-			{ collection: "reactions", keyPrefix: chat_message_key_prefix(channel.key), limit: 100 },
-			(docs) => {
-				if (docs === null) {
+		const watchWindow = client.data.watchWindow(
+			{ collection: "reactions", keyPrefix: chat_message_key_prefix(channel.key), pageSize: 100 },
+			(update) => {
+				if (update === null) {
+					reactionsCoverageRef.current = null;
 					return;
 				}
-				setReactionDocs(store.apply_window(docs));
+				const validated = store.apply_window(update.docs);
+				setReactionDocs(validated);
+				reactionsCoverageRef.current = {
+					hasMore: update.hasMore,
+					atCapacity: update.atCapacity,
+					deepestRoot:
+						validated.length > 0 ? validated[validated.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null,
+				};
+				evaluate_companion_catch_up();
 			},
 		);
-		return unsubscribe;
+		reactionsWindowRef.current = watchWindow;
+		return () => {
+			reactionsWindowRef.current = null;
+			reactionsCoverageRef.current = null;
+			watchWindow.unsubscribe();
+		};
 	}, [client, channel.key]);
 
-	// Channel-wide replies watch: feeds the per-root reply counts (approximate beyond the window).
+	// Channel-wide replies window: feeds the per-root reply counts. Counts are exact for
+	// covered roots; the catch-up loop drives coverage down to the oldest rendered message.
 	useEffect(() => {
-		const store = chat_create_accumulating_store(chat_validate_message_doc);
-		const unsubscribe = client.data.watch(
-			{ collection: "replies", keyPrefix: chat_message_key_prefix(channel.key), limit: 100 },
-			(docs) => {
-				if (docs === null) {
+		const store = chat_create_window_store(chat_validate_message_doc);
+		const watchWindow = client.data.watchWindow(
+			{ collection: "replies", keyPrefix: chat_message_key_prefix(channel.key), pageSize: 100 },
+			(update) => {
+				if (update === null) {
+					repliesCoverageRef.current = null;
 					return;
 				}
-				store.apply_window(docs);
-				setChannelReplies(store.get_sorted());
+				const validated = store.apply_window(update.docs);
+				setChannelReplies(validated);
+				const deepestRoot =
+					validated.length > 0 ? validated[validated.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null;
+				repliesCoverageRef.current = { hasMore: update.hasMore, atCapacity: update.atCapacity, deepestRoot };
+				setReplyCoverage({ hasMore: update.hasMore, deepestRoot });
+				evaluate_companion_catch_up();
 			},
 		);
-		return unsubscribe;
+		repliesWindowRef.current = watchWindow;
+		return () => {
+			repliesWindowRef.current = null;
+			repliesCoverageRef.current = null;
+			watchWindow.unsubscribe();
+		};
 	}, [client, channel.key]);
 
 	const queue = use_send_queue({
@@ -1029,43 +1136,13 @@ export function ChannelView(props: ChannelView_Props) {
 		}
 	}, [messages, queue.pending.length]);
 
+	// The host window retains everything it loaded, so "load older" is one bridge command;
+	// the extended window arrives as a normal update.
 	const handle_load_older = () => {
-		if (older.loading || older.isDone) {
-			return;
-		}
-		setOlder((prev) => ({ ...prev, loading: true, error: null }));
-		client
-			.fetchJson("/api/v1/plugin-data/list", {
-				body: {
-					collection: "messages",
-					keyPrefix: chat_message_key_prefix(channel.key),
-					cursor: older.cursor,
-					limit: 50,
-				},
-			})
-			.then((raw: unknown) => {
-				const parsed = chat_plugin_data_list_response_schema.safeParse(raw);
-				if (!parsed.success) {
-					setOlder((prev) => ({ ...prev, loading: false, error: "Unexpected response while loading older messages" }));
-					return;
-				}
-				const store = messagesStoreRef.current;
-				if (store !== null) {
-					store.apply_page(parsed.data.documents);
-					setMessages(store.get_sorted());
-				}
-				setOlder({ cursor: parsed.data.cursor, isDone: parsed.data.isDone, loading: false, error: null });
-			})
-			.catch((error: unknown) => {
-				// Keep the cursor: Retry resumes from the same place.
-				setOlder((prev) => ({ ...prev, loading: false, error: chat_get_error_message(error) }));
-			});
+		messagesWindowRef.current?.loadOlder();
 	};
 
-	const reactionGroupsByTarget = useMemo(() => {
-		const valid = reactionDocs.filter((doc): doc is NonNullable<typeof doc> => doc !== null);
-		return chat_group_reactions(valid, userId);
-	}, [reactionDocs, userId]);
+	const reactionGroupsByTarget = useMemo(() => chat_group_reactions(reactionDocs, userId), [reactionDocs, userId]);
 
 	const replyCounts = useMemo(() => chat_count_replies(channelReplies), [channelReplies]);
 
@@ -1109,19 +1186,19 @@ export function ChannelView(props: ChannelView_Props) {
 					aria-live="off"
 					aria-label={`Messages in #${channel.value.name}`}
 				>
-					{messagesLoaded && messages.length > 0 && !older.isDone && older.error === null ? (
+					{messagesLoaded && messagesWindow.hasMore && !messagesWindow.atCapacity ? (
 						<div className="log-older">
-							<button type="button" className="button" disabled={older.loading} onClick={handle_load_older}>
-								{older.loading ? "Loading…" : "Load older"}
+							<button type="button" className="button" onClick={handle_load_older}>
+								Load older
 							</button>
 						</div>
 					) : null}
-					{older.error !== null ? (
-						<div className="channel-status is-error" role="alert">
-							<span>{older.error}</span>
-							<button type="button" className="button" onClick={handle_load_older}>
-								Retry
-							</button>
+					{messagesLoaded && messagesWindow.hasMore && messagesWindow.atCapacity ? (
+						<div className="channel-status">Older messages can't be loaded right now.</div>
+					) : null}
+					{messagesWindow.incomplete ? (
+						<div className="channel-status" role="alert">
+							Some messages in this range could not be loaded.
 						</div>
 					) : null}
 					{!messagesLoaded ? (
@@ -1141,7 +1218,18 @@ export function ChannelView(props: ChannelView_Props) {
 									isOwn={doc.createdBy === userId}
 									authorName={memberNames.get(doc.createdBy)}
 									reactionGroups={reactionGroupsByTarget.get(doc.key) ?? []}
-									replyCount={replyCounts.get(doc.key) ?? 0}
+									// A count is claimed only for roots the replies window covers: every
+									// root while nothing more exists below, else only roots strictly newer
+									// than the deepest covered root (that one may still have replies below
+									// the window).
+									replyCount={
+										!replyCoverage.hasMore ||
+										(replyCoverage.deepestRoot !== null &&
+											doc.key.slice(0, ROOT_KEY_LENGTH) < replyCoverage.deepestRoot)
+											? (replyCounts.get(doc.key) ?? 0)
+											: "unknown"
+									}
+									repliesHasMore={replyCoverage.hasMore}
 									onOpenThread={(root) => setThreadRootKey(root.key)}
 									replyTriggerRef={(el) => {
 										if (el === null) {
