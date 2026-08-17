@@ -1,0 +1,43 @@
+{
+	"schemaVersion": 1,
+	"name": "chitchat",
+	"displayName": "Chitchat",
+	"version": "0.1.0",
+	"description": "Team chat for the workspace: channels, one-level threads, reactions, and workspace-file attachments, all stored in the plugin's own document store.",
+	"compatibility": {
+		"bonoboPluginRuntime": "1"
+	},
+	"events": [],
+	"pages": [
+		{
+			"id": "chat",
+			"title": "Chitchat",
+			"entry": "dist/frontend/index.html",
+			"navItem": {
+				"label": "Chitchat"
+			}
+		}
+	],
+	"capabilities": ["plugin.data.read", "plugin.data.user-write", "workspace.files.read"],
+	"outboundOrigins": [],
+	"files": [
+		{
+			"path": "dist/frontend/index.html",
+			"sha256": "sha256:1653fab1e267481bb020915f2939771a17633d4febbfa0b619605bb96c5e5e07",
+			"bytes": 361,
+			"contentType": "text/html"
+		},
+		{
+			"path": "dist/frontend/assets/index.js",
+			"sha256": "sha256:6f2cd59135449f6a636bade7a827b900745d489f898c4a54f57b509270f989a4",
+			"bytes": 282664,
+			"contentType": "application/javascript"
+		},
+		{
+			"path": "dist/frontend/assets/index.css",
+			"sha256": "sha256:5bfad1452bf9f940d302f6eebcdfb6a67515bec44ed56e6d80a1d434dc7e3d94",
+			"bytes": 12338,
+			"contentType": "text/css"
+		}
+	]
+}
