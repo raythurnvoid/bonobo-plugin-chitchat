@@ -1161,6 +1161,11 @@ export function ChannelView(props: ChannelView_Props) {
 				</div>
 				{threadRoot !== null ? (
 					<ThreadPanel
+						// Key by the root so switching threads remounts the panel: replies,
+						// loading state, and the send queue must not leak from the previous
+						// root (a surviving pending retry would append under the new root's
+						// keyPrefix — a wrong-thread write).
+						key={threadRoot.key}
 						client={client}
 						userId={userId}
 						root={threadRoot}

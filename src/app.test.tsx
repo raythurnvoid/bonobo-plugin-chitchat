@@ -626,6 +626,41 @@ test("the thread panel opens with focus inside, replies append under the root, c
 	expect(document.activeElement?.textContent).toContain("Reply in thread");
 });
 
+test("switching the open thread to another root resets replies, loading state, and pending sends", async () => {
+	const h = make_harness();
+	const ack = deferred<{ _yay: { key: string } }>();
+	h.raw.data.append.mockReturnValueOnce(ack.promise);
+	await boot(h);
+	const rootA = message_doc(1_000, { rand: "aaam", text: "root a" });
+	const rootB = message_doc(2_000, { rand: "bbbm", text: "root b" });
+	h.find_watch("messages", `${CH1_KEY}:`)!.onUpdate([rootA, rootB]);
+	await screen.findByText("root a");
+
+	// Open thread A, accumulate a reply, and leave one send in flight.
+	const rowA = screen.getByText("root a").closest("[data-key]") as HTMLElement;
+	fireEvent.click(within(rowA).getByRole("button", { name: "Reply in thread" }));
+	const panel = await screen.findByRole("region", { name: "Thread" });
+	await waitFor(() => expect(h.find_watch("replies", `${rootA.key}:`)).toBeTruthy());
+	h.find_watch("replies", `${rootA.key}:`)!.onUpdate([
+		{ ...message_doc(3_000, { text: "reply on a" }), collection: "replies", key: `${rootA.key}:${inv(3_000)}:ra01` },
+	]);
+	await screen.findByText("reply on a");
+	const replyBox = within(panel).getByRole("textbox", { name: "Reply in thread" });
+	fireEvent.input(replyBox, { target: { value: "late reply" } });
+	fireEvent.keyDown(replyBox, { key: "Enter" });
+	await screen.findAllByText("Sending…");
+
+	// Switch the panel to thread B: the panel must remount with fresh state — no A
+	// replies, no surviving pending send whose retry would write under B's prefix.
+	const rowB = screen.getByText("root b").closest("[data-key]") as HTMLElement;
+	fireEvent.click(within(rowB).getByRole("button", { name: "Reply in thread" }));
+	await waitFor(() => expect(h.find_watch("replies", `${rootB.key}:`)).toBeTruthy());
+	const freshPanel = await screen.findByRole("region", { name: "Thread" });
+	expect(await within(freshPanel).findByText("Loading replies…")).toBeTruthy();
+	expect(screen.queryByText("reply on a")).toBeNull();
+	expect(screen.queryByText("Sending…")).toBeNull();
+});
+
 // #endregion threads
 
 // #region load older

@@ -8514,15 +8514,19 @@ function ChannelView(props) {
 						],
 					}),
 					threadRoot !== null
-						? /* @__PURE__ */ createVNode(ThreadPanel, {
-								client,
-								userId,
-								root: threadRoot,
-								reactionGroupsByTarget,
-								memberNames,
-								onApplyLocalRoot: apply_local_message,
-								onClose: handle_close_thread,
-							})
+						? /* @__PURE__ */ createVNode(
+								ThreadPanel,
+								{
+									client,
+									userId,
+									root: threadRoot,
+									reactionGroupsByTarget,
+									memberNames,
+									onApplyLocalRoot: apply_local_message,
+									onClose: handle_close_thread,
+								},
+								threadRoot.key,
+							)
 						: null,
 				],
 			}),

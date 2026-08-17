@@ -23,7 +23,7 @@ Server-appended message and reply keys end with `<invertedPaddedMs>:<rand4>`, so
 
 - The document store caps an installation at **10,000 document slots** total. Chat history counts against it; archiving a channel does not delete its messages — uninstalling the plugin is the cleanup path.
 - **Reply counts are approximate** beyond the bounded channel-wide replies watch (newest 100 replies per channel); the display caps at "99+". Counts are exact inside an open thread up to its own window.
-- **Reaction counts are approximate** beyond the newest-100 reactions window per channel.
+- **Reaction counts are approximate** beyond the newest-100 reactions window per channel. Reactions render from the newest-100 reaction docs per channel (the replace-from-window seam), so reactions on older paged-in messages beyond that window do not display.
 - Channel documents are shared: any member with content write access can rename or archive a channel, and concurrent edits are last-write-wins.
 - Attachment links are resolved through `/api/v1/files/download-urls` at click time and never stored, so file permissions are rechecked per member and per click.
 
