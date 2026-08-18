@@ -671,7 +671,9 @@ export function MessageRow(props: MessageRow_Props) {
 								? "View thread"
 								: props.replyCount === 0
 									? "Reply in thread"
-									: `${chat_format_reply_count(props.replyCount, props.repliesHasMore)} replies`}
+									: `${chat_format_reply_count(props.replyCount, props.repliesHasMore)} ${
+											props.replyCount === 1 ? "reply" : "replies"
+										}`}
 						</button>
 					) : null}
 					<AddReactionButton groups={props.reactionGroups} onPick={handle_toggle_reaction} />
@@ -956,8 +958,10 @@ export function ChannelView(props: ChannelView_Props) {
 	// Companion catch-up: reactions and replies key by TARGET, not by time, so their windows
 	// can lag behind the rendered message range. After every window delivery, extend a
 	// companion one page while it still has older docs and its deepest covered root is newer
-	// than the oldest rendered message. Every compared key survived chat_validate_*, so the
-	// keys are ASCII and plain JS comparison is byte order.
+	// than the oldest rendered message. Plain JS `<` works here because every key chitchat
+	// itself mints is ASCII by construction (client UUID prefix, server digit-and-hex tail) —
+	// validation does NOT enforce ASCII, so a foreign writer's non-ASCII key could skew this
+	// catch-up coverage for that key. Accepted: it never affects message delivery.
 	const evaluate_companion_catch_up = () => {
 		const oldestRoot = oldestRootRef.current;
 		if (oldestRoot === null) {

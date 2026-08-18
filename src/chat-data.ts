@@ -1,8 +1,10 @@
 import { z } from "zod";
 
 /**
- * The fixed reaction palette. Tokens (not raw emoji) live in document keys because the
- * store refuses non-ASCII key characters; the emoji are only how the page renders them.
+ * The fixed reaction palette. Tokens (not raw emoji) live in document keys because emoji
+ * keys are unreliable, not uniformly refused: the store's key rule rejects only control
+ * and format characters, so simple emoji pass while ZWJ-joined ones fail. A fixed ASCII
+ * token set keeps reaction keys predictable; the emoji are only how the page renders them.
  */
 export const chat_REACTION_TOKENS = ["thumbs_up", "heart", "laugh", "wow", "sad", "party", "rocket", "eyes"] as const;
 

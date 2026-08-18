@@ -687,7 +687,7 @@ test("reply counts follow the replies window: covered roots get counts, the deep
 	// Once nothing more exists below, every count is exact and prints uncapped.
 	replies.onUpdate(window_update([...hundredOnNew, oneOnOld]));
 	expect(await screen.findByRole("button", { name: "100 replies" })).toBeTruthy();
-	expect(screen.getByRole("button", { name: "1 replies" })).toBeTruthy();
+	expect(screen.getByRole("button", { name: "1 reply" })).toBeTruthy();
 	expect(screen.queryByRole("button", { name: "View thread" })).toBeNull();
 });
 
