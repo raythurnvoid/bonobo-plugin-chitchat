@@ -34,14 +34,14 @@ import {
 import { Dialog } from "./dialog";
 
 /**
- * Member display names resolved through the host bridge, cached in the App. The object
+ * Member display names resolved through the SDK's members API, cached in the App. The object
  * keeps one identity for the page's lifetime (the App re-renders consumers itself when a
  * resolution lands), so watch effects may safely list it as a dependency.
  */
 export type chat_MemberNamesApi = {
 	/** undefined = not resolved yet; null = missing or deleted user ("Former member"). */
 	get: (userId: string) => string | null | undefined;
-	/** Resolves unknown ids through the bridge; already-known ids are skipped. */
+	/** Resolves unknown ids through the SDK's members API; already-known ids are skipped. */
 	resolve: (userIds: string[]) => Promise<void>;
 };
 
@@ -1140,8 +1140,8 @@ export function ChannelView(props: ChannelView_Props) {
 		}
 	}, [messages, queue.pending.length]);
 
-	// The host window retains everything it loaded, so "load older" is one bridge command;
-	// the extended window arrives as a normal update.
+	// The SDK window retains everything it loaded, so "load older" is one call on the window
+	// handle; the extended window arrives as a normal update.
 	const handle_load_older = () => {
 		messagesWindowRef.current?.loadOlder();
 	};

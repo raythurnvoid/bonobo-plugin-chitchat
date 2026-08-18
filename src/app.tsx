@@ -43,7 +43,7 @@ function use_member_names(client: BonoboUiFrontendClient): chat_MemberNamesApi {
 			for (const id of missing) {
 				requestedRef.current.add(id);
 			}
-			// The bridge accepts at most 50 ids per request.
+			// The server resolves at most 50 ids per request.
 			for (let start = 0; start < missing.length; start += 50) {
 				const batch = missing.slice(start, start + 50);
 				try {

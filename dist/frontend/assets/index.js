@@ -3684,7 +3684,7 @@ var ConvexClient = class {
 	}
 };
 //#endregion
-//#region node_modules/.pnpm/bonobo-plugin-sdk@https+++c_f8305e0ddeba007231fb0fd668a00ec8/node_modules/bonobo-plugin-sdk/frontend.js
+//#region node_modules/.pnpm/bonobo-plugin-sdk@https+++c_9eaf7a55c71f96a250b6835a9212063b/node_modules/bonobo-plugin-sdk/frontend.js
 /**
  * Bonobo plugin frontend SDK — hand-written browser ESM, no build step.
  *
@@ -4574,18 +4574,25 @@ async function bonobo_ui_connect() {
 	 * subscriptions die; the host frame's Retry or a reload mints a fresh session).
 	 */
 	async function fetch_convex_jwt() {
-		try {
-			let response = await exchange_session_jwt(await getToken());
-			if (response.status === 401) response = await exchange_session_jwt(await refreshToken());
-			if (!response.ok) return null;
-			const body = await response.json();
-			const jwt = body?._yay?.jwt;
-			const sessionExpiresAt = body?._yay?.sessionExpiresAt;
-			if (typeof jwt !== "string" || typeof sessionExpiresAt !== "number") return null;
-			tokenExpiresAt = sessionExpiresAt;
-			return jwt;
-		} catch {
-			return null;
+		for (let attempt = 0; ; attempt += 1) {
+			/** @type {Response | null} */
+			let response = null;
+			try {
+				response = await exchange_session_jwt(await getToken());
+				if (response.status === 401) response = await exchange_session_jwt(await refreshToken());
+			} catch {
+				response = null;
+			}
+			if (response?.ok) {
+				const body = await response.json().catch(() => null);
+				const jwt = body?._yay?.jwt;
+				const sessionExpiresAt = body?._yay?.sessionExpiresAt;
+				if (typeof jwt !== "string" || typeof sessionExpiresAt !== "number") return null;
+				tokenExpiresAt = sessionExpiresAt;
+				return jwt;
+			}
+			if (!(response === null || response.status === 429 || response.status >= 500) || attempt >= 2) return null;
+			await new Promise((resolveWait) => setTimeout(resolveWait, 1e3 * (attempt + 1)));
 		}
 	}
 	return new Promise((resolve) => {

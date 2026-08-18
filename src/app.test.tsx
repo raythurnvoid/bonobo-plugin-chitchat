@@ -761,7 +761,7 @@ test("switching the open thread to another root resets replies, loading state, a
 
 // #region load older
 
-test("Load older extends the window over the bridge — the HTTP paging path is gone", async () => {
+test("Load older extends the window through the SDK window manager — the HTTP paging path is gone", async () => {
 	const h = make_harness();
 	await boot(h);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
