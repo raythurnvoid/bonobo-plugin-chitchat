@@ -15,16 +15,19 @@ Server-appended message and reply keys end with `<invertedPaddedMs>:<rand4>`, so
 
 ### Seam contract (how the page stitches reads)
 
-- Messages and replies **accumulate by key** forever: watch windows and HTTP "load older" pages merge into one map keyed by document key. A message that fell out of the newest-100 watch window stays visible.
-- Reactions **replace from window** only: every watch update replaces the whole reaction set, because removed reactions are physically deleted.
+- Messages and replies **accumulate by key** forever: every window delivery merges into one map keyed by document key, so a message pushed out of the newest page stays visible. Chitchat grows its history with the window's own `loadOlder()` while the window can still grow. Once the window reports `atCapacity` the same button switches to the HTTP `list` door, paging with `keyStartExclusive` set to the oldest key already held and no cursor, and merges those pages into the same map. `isDone` is what ends it; a short page is not the end.
+- Accumulating forever has a cost worth knowing: a row keeps whatever value it last arrived with, and it only changes again while some window interval still covers it. Rows the window no longer covers — ones pushed out of an overflowing range, and every row that came in over HTTP — are frozen. So an edit or a delete of one of those never reaches that reader, and a message somebody deleted can stay on their screen until they reload.
+- Reactions **replace from window** only: every update replaces the whole reaction set, because removed reactions are physically deleted.
+- A window says whether it still covers a row. A row the reactions or replies window cannot speak for renders as unknown rather than as "nobody reacted" or a wrong count. On such a row the member can still **add** a reaction — `putOwned` writes their own key with the same empty value whether or not the chip is on screen — but **removing** one is refused with a reason, because the page cannot tell whether the reaction it would delete is there.
 - Every document read from a watch or an HTTP page is runtime-validated (Zod) before use; invalid or foreign documents are dropped and counted.
 
 ## Known limits (accepted for the MVP)
 
 - The document store caps an installation at **10,000 document slots** total. Chat history counts against it; archiving a channel does not delete its messages — uninstalling the plugin is the cleanup path.
-- **Reply counts are approximate** beyond the bounded channel-wide replies watch (newest 100 replies per channel); the display caps at "99+". Counts are exact inside an open thread up to its own window.
-- **Reaction counts are approximate** beyond the newest-100 reactions window per channel. Reactions render from the newest-100 reaction docs per channel (the replace-from-window seam), so reactions on older paged-in messages beyond that window do not display.
-- Channel documents are shared: any member with content write access can rename or archive a channel, and concurrent edits are last-write-wins.
+- Each member also has their own share of that installation (1.6 MiB, 3,000 slots, 8 collections), counted only for writes made through the frame. Hitting either ceiling refuses with the same `storage_full` name, so Chitchat reads the message rather than the name: it announces one channel-level state and stops the composer instead of marking single messages failed. A member who has spent their **slot** share can no longer patch any shared document either, which means channel rename and archive stop working for them too.
+- **Reply counts are claimed only for covered roots**: the channel-wide replies window catches up towards the oldest rendered message, and a root it has not reached shows no count. Counts that are claimed cap the display at "99+". An open thread reads its newest 100 replies and cannot reach past that; when it is cut, the panel says so.
+- **Reactions are shown only for covered rows.** The reactions window catches up towards the oldest rendered message, but it holds at most six pages: on a busy channel the oldest rendered rows stay outside it. Those rows say reactions are unavailable instead of showing none.
+- Channel documents are shared: any member with content write access can rename or archive a channel. Channel and message writes are compare-and-set on the stored revision, so a concurrent edit answers a conflict instead of overwriting silently.
 - Attachment links are resolved through `/api/v1/files/download-urls` at click time and never stored, so file permissions are rechecked per member and per click.
 
 ## Development

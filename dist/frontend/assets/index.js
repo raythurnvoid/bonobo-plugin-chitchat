@@ -3684,11 +3684,16 @@ var ConvexClient = class {
 	}
 };
 //#endregion
-//#region node_modules/.pnpm/bonobo-plugin-sdk@https+++c_9eaf7a55c71f96a250b6835a9212063b/node_modules/bonobo-plugin-sdk/frontend.js
+//#region node_modules/.pnpm/bonobo-plugin-sdk@https+++c_6a0e42178b5af02f7de5b9ec081a0de0/node_modules/bonobo-plugin-sdk/frontend.js
 /**
  * Bonobo plugin frontend SDK — hand-written browser ESM, no build step.
  *
  * Runs inside the host app's sandboxed plugin iframe for plugin pages and plugin file views alike.
+ * The comments below say "page" for both kinds, the way the host app's own notes do. Any text a
+ * MEMBER can end up reading must not: it has to say "plugin frame", because a member sitting in a
+ * file view is not on a page and never read these notes. That covers every `new Error(...)` the SDK
+ * rejects with, and the `message` it puts in a watch death — plugin code renders those verbatim.
+ *
  * The host handshake is a strict postMessage contract: the page announces `bonobo:ready`, the host
  * answers `bonobo:init` with a short-lived scoped session token (`plu_...`), the page context, and
  * the Convex deployment URL. From then on the page acts on its own:
@@ -3709,9 +3714,54 @@ var DATA_MAX_NAME_LENGTH = 128;
 var DATA_MAX_KEY_PREFIX_LENGTH = 109;
 var DATA_MAX_LIST_PAGE_SIZE = 100;
 var DATA_KEY_PREFIX_REGEX = /^[\x21-\x7e]+$/;
-var MAX_WATCH_SUBSCRIPTIONS = 8;
+var MEMBERS_MAX_LIST_PAGE_SIZE = 100;
+var MAX_WATCH_SUBSCRIPTIONS = 16;
 var MAX_WINDOW_INTERVALS = 6;
 var MAX_PAGE_SERVER_SUBSCRIPTIONS = 24;
+/**
+ * Reads a host theme off a bridge message.
+ *
+ * The host resolves its colours and sends the values, because a plugin page is a cross-origin
+ * document and inherits none of the host's custom properties. This comes over postMessage, so every
+ * field is checked before the page can see it.
+ *
+ * @param {unknown} value
+ * @returns {import("bonobo-plugin-sdk/frontend").BonoboUiTheme | null}
+ */
+function read_theme(value) {
+	if (typeof value !== "object" || value === null) return null;
+	const candidate = value;
+	if (candidate.mode !== "light" && candidate.mode !== "dark") return null;
+	if (typeof candidate.tokens !== "object" || candidate.tokens === null) return null;
+	/** @type {Record<string, string>} */
+	const tokens = {};
+	for (const [name, tokenValue] of Object.entries(candidate.tokens)) {
+		if (typeof tokenValue !== "string") return null;
+		tokens[name] = tokenValue;
+	}
+	return {
+		mode: candidate.mode,
+		tokens,
+	};
+}
+/**
+ * The deaths the SDK can explain. The server answers the same opaque null for every denial, so
+ * these are what the SDK knows on its own: the store said no, the session it holds has run out, or
+ * the connection is not working. A page shows a different thing for each — sign in again is useless
+ * advice when the plugin was uninstalled.
+ */
+var DEATH_DENIED = {
+	reason: "denied",
+	message: "This plugin no longer has access to its data",
+};
+var DEATH_SESSION_EXPIRED = {
+	reason: "session_expired",
+	message: "This plugin session expired",
+};
+var DEATH_UNAVAILABLE = {
+	reason: "unavailable",
+	message: "The plugin data connection is unavailable",
+};
 /**
  * Validates the `bonobo:init` context union: `kind: "page"` or `kind: "file_view"`.
  *
@@ -3747,7 +3797,8 @@ function is_ui_context(value) {
  */
 function read_bridge_bootstrap() {
 	const fragment = window.location.hash.slice(1);
-	if (!fragment) throw new Error("Missing host bridge fragment — the page must be embedded by the Bonobo host app");
+	if (!fragment)
+		throw new Error("Missing host bridge fragment — this plugin frame must be embedded by the Bonobo host app");
 	const params = new URLSearchParams(fragment);
 	const parentOrigins = params.getAll("parentOrigin");
 	const bridgeNonces = params.getAll("bridgeNonce");
@@ -3802,6 +3853,10 @@ function validate_watch_inputs(args) {
  * @property {import("bonobo-plugin-sdk").BonoboPublicDoc[] | null} docs
  * @property {boolean} truncated
  * @property {string | undefined} previousFirstKey
+ * @property {import("bonobo-plugin-sdk").BonoboPublicDoc[] | null} previousDocs The array this
+ *   interval held before its latest delivery. `handle_result` overwrites `docs` in place, so the
+ *   outgoing array has to be kept here or it is gone by the time a swap is decided. Read in exactly
+ *   one place — `snapshot_suppressed_docs`, when a pending swap starts.
  * @property {() => void} stop Dispose the watcher and release its server slot, exactly once.
  */
 /**
@@ -3841,16 +3896,24 @@ function validate_watch_inputs(args) {
  *   start_watch: DataStartWatch,
  *   acquire_server_slot: () => boolean,
  *   release_server_slot: () => void,
- *   page_at_ceiling: () => boolean,
+ *   page_at_ceiling: (requiredSlots?: number) => boolean,
  *   post_update: (payload: { docs: import("bonobo-plugin-sdk").BonoboPublicDoc[], hasMore: boolean, atCapacity: boolean, incomplete: boolean }) => void,
- *   on_dead: () => void,
+ *   on_dead: (info: { reason: string, message: string }) => void,
+ *   session_expired: () => boolean,
  * }} deps
  */
 function create_documents_window(deps) {
 	const state = {
 		/** @type {DocumentsWindowInterval[]} */
 		intervals: [],
-		/** @type {{ from: number, removeCount: number, replacements: DocumentsWindowInterval[] } | null} */
+		/**
+		 * `suppressedDocs` holds one flatten source per interval the swap suppresses, taken by value
+		 * when the swap starts and never updated afterwards. The suppressed intervals stay subscribed
+		 * until the commit, so without it a second delivery overwrites their `docs` and the flatten
+		 * grows a hole that `incomplete` is suppressed for.
+		 *
+		 * @type {{ from: number, removeCount: number, replacements: DocumentsWindowInterval[], suppressedDocs: (import("bonobo-plugin-sdk").BonoboPublicDoc[] | null)[] } | null}
+		 */
 		pending: null,
 		queuedLoadOlder: false,
 		/** Sticky: set on the first re-seat, when older docs are first known to exist. */
@@ -3871,10 +3934,11 @@ function create_documents_window(deps) {
 		for (const interval of state.pending?.replacements ?? []) interval.stop();
 		state.pending = null;
 	};
-	const kill = () => {
+	/** @param {{ reason: string, message: string }} info */
+	const kill = (info) => {
 		if (state.dead) return;
 		stop_all();
-		deps.on_dead();
+		deps.on_dead(info);
 	};
 	/** @param {DocumentsWindowInterval} interval */
 	const start_interval = (interval) => {
@@ -3921,8 +3985,47 @@ function create_documents_window(deps) {
 		return fencepost;
 	};
 	const window_interval_count = () => state.intervals.length + (state.pending?.replacements.length ?? 0);
+	/**
+	 * The count the window will hold once the pending swap commits. `window_interval_count` is the
+	 * gross count — it counts the replacements while their parents are still committed — which is
+	 * what `reconcile` and the load-older reservation need, because those are asking whether another
+	 * subscription fits right now. `incomplete` asks a different question: whether a repair is still
+	 * possible after this swap lands, so it needs the net count. A split is +1 and a merge is -1.
+	 */
+	const settled_interval_count = () =>
+		state.intervals.length + (state.pending ? state.pending.replacements.length - state.pending.removeCount : 0);
+	/**
+	 * The flatten source for an interval a pending swap suppresses, taken once by value when the swap
+	 * starts. `interval.truncated` is the discriminator, and the two cases need opposite answers. A
+	 * split parent is truncated by construction, so its live array is the short one that would show a
+	 * hole — serve the array it held before that delivery. A merge member is never truncated: it
+	 * shrank because documents were physically deleted, so its live array is correct and serving the
+	 * retained one would put deleted documents back on screen for a round trip.
+	 *
+	 * The fallback covers an interval whose FIRST delivery truncated, which has no previous array.
+	 * Serving `[]` there would make every document in its range vanish for a round trip, which is the
+	 * failure this whole mechanism exists to prevent, so it declines to improve that case instead.
+	 *
+	 * @param {DocumentsWindowInterval} interval
+	 */
+	const snapshot_suppressed_docs = (interval) =>
+		interval.truncated ? (interval.previousDocs ?? interval.docs) : interval.docs;
+	/**
+	 * @param {number} index
+	 * @returns {import("bonobo-plugin-sdk").BonoboPublicDoc[] | null | undefined} The snapshot when a
+	 *   pending swap suppresses this index, `undefined` when it does not.
+	 */
+	const suppressed_docs_at = (index) => {
+		if (!state.pending) return;
+		const offset = index - state.pending.from;
+		if (offset < 0 || offset >= state.pending.removeCount) return;
+		return state.pending.suppressedDocs[offset];
+	};
 	const compute_payload = () => {
-		const docs = state.intervals.flatMap((interval) => interval.docs ?? []);
+		const docs = state.intervals.flatMap((interval, index) => {
+			const suppressed = suppressed_docs_at(index);
+			return (suppressed === void 0 ? interval.docs : suppressed) ?? [];
+		});
 		const last = state.intervals[state.intervals.length - 1];
 		return {
 			docs,
@@ -3934,8 +4037,8 @@ function create_documents_window(deps) {
 					return false;
 				return (
 					split_fencepost(interval) === null ||
-					window_interval_count() + 1 > MAX_WINDOW_INTERVALS ||
-					deps.page_at_ceiling()
+					settled_interval_count() + 1 > MAX_WINDOW_INTERVALS ||
+					deps.page_at_ceiling(2)
 				);
 			}),
 		};
@@ -3975,7 +4078,7 @@ function create_documents_window(deps) {
 		interval.end = fencepost;
 		interval.truncated = false;
 		state.bottomOpen = true;
-		if (!start_interval(interval)) kill();
+		if (!start_interval(interval)) kill(DEATH_UNAVAILABLE);
 	};
 	const execute_load_older = () => {
 		if (state.dead || state.loadingOlder || state.pending || !compute_payload().hasMore) return;
@@ -3992,6 +4095,7 @@ function create_documents_window(deps) {
 			docs: null,
 			truncated: false,
 			previousFirstKey: void 0,
+			previousDocs: null,
 			stop: () => {},
 		};
 		if (!start_interval(tail)) {
@@ -4032,6 +4136,7 @@ function create_documents_window(deps) {
 				docs: null,
 				truncated: false,
 				previousFirstKey: void 0,
+				previousDocs: null,
 				stop: () => {},
 			};
 			/** @type {DocumentsWindowInterval} */
@@ -4041,6 +4146,7 @@ function create_documents_window(deps) {
 				docs: null,
 				truncated: false,
 				previousFirstKey: void 0,
+				previousDocs: null,
 				stop: () => {},
 			};
 			if (!start_interval(left)) break;
@@ -4052,6 +4158,7 @@ function create_documents_window(deps) {
 				from: index,
 				removeCount: 1,
 				replacements: [left, right],
+				suppressedDocs: [snapshot_suppressed_docs(interval)],
 			};
 			return;
 		}
@@ -4067,6 +4174,7 @@ function create_documents_window(deps) {
 				docs: null,
 				truncated: false,
 				previousFirstKey: void 0,
+				previousDocs: null,
 				stop: () => {},
 			};
 			if (!start_interval(merged)) break;
@@ -4074,6 +4182,7 @@ function create_documents_window(deps) {
 				from: index,
 				removeCount: 2,
 				replacements: [merged],
+				suppressedDocs: [snapshot_suppressed_docs(first), snapshot_suppressed_docs(second)],
 			};
 			return;
 		}
@@ -4093,15 +4202,18 @@ function create_documents_window(deps) {
 	const handle_result = (interval, outcome) => {
 		if (state.dead) return;
 		if ("queryError" in outcome) {
-			console.error("[bonobo-plugin-sdk] Plugin data window interval failed:", outcome.queryError);
-			kill();
+			const info = deps.session_expired() ? DEATH_SESSION_EXPIRED : DEATH_UNAVAILABLE;
+			if (info === DEATH_UNAVAILABLE)
+				console.error("[bonobo-plugin-sdk] Plugin data window interval failed:", outcome.queryError);
+			kill(info);
 			return;
 		}
 		if (outcome.value === null) {
-			kill();
+			kill(DEATH_DENIED);
 			return;
 		}
 		interval.previousFirstKey = interval.docs?.[0]?.key;
+		interval.previousDocs = interval.docs;
 		interval.docs = outcome.value.docs;
 		interval.truncated = outcome.value.truncated;
 		if (state.awaitingTail === interval) {
@@ -4122,6 +4234,7 @@ function create_documents_window(deps) {
 		docs: null,
 		truncated: false,
 		previousFirstKey: void 0,
+		previousDocs: null,
 		stop: () => {},
 	};
 	if (!start_interval(head)) return null;
@@ -4142,10 +4255,13 @@ function create_documents_window(deps) {
 	};
 }
 /**
- * Builds the client's `data` and `members` APIs over an injectable reactive-read primitive.
- * `bonobo_ui_connect` wires it to the page's own Convex client; the SDK test suite injects a
- * fake `start_watch` instead, so the watch and window semantics run without a server. Plugin
- * code should use the client from `bonobo_ui_connect`, never call this directly.
+ * Builds the client's `data`, `members` and `scopes` APIs over an injectable reactive-read primitive.
+ * `bonobo_ui_connect` wires it to the page's own Convex client. Plugin code should use the client
+ * from `bonobo_ui_connect`, never call this directly — which is why this is NOT exported. The
+ * package publishes `frontend.js` next to a hand-written `frontend.d.ts`, and nothing compares
+ * the two (`typecheck` runs `tsc --skipLibCheck` over `frontend.js` alone), so an `export` here
+ * would ship a runtime symbol the type surface does not declare. The SDK test suite reaches this
+ * through `bonobo_ui_connect` and drives the seam from the fake Convex client instead.
  *
  * The `start_watch` dep starts one reactive read of the plugin's document store. `onResult`
  * receives `{ value }` (the query answer — `null` is the store's denial) or `{ queryError }`,
@@ -4154,10 +4270,16 @@ function create_documents_window(deps) {
  *
  * @param {{
  *   start_watch: DataStartWatch,
+ *   start_recent_watch: (queryArgs: Record<string, unknown>, onResult: (outcome: { value: { docs: import("bonobo-plugin-sdk").BonoboPublicDoc[], truncated: boolean } | null } | { queryError: unknown }) => void) => { dispose: () => void } | null,
  *   run_user_write: (op: "append" | "put" | "remove" | "putOwned" | "removeOwned", fields: Record<string, unknown>) => Promise<unknown>,
  *   resolve_member_display: (userIds: string[]) => Promise<{ members: Record<string, string | null> } | null>,
+ *   list_members: (limit: number, cursor: string | null) => Promise<{ members: import("bonobo-plugin-sdk/frontend").BonoboUiMember[], cursor: string | null } | { refusal: string } | null>,
+ *   run_manage_scope: (action: Record<string, unknown>) => Promise<unknown>,
+ *   list_scope_principals: (scopeId: string) => Promise<import("bonobo-plugin-sdk/frontend").BonoboUiScopePrincipal[] | null>,
+ *   start_my_scopes_watch: (onResult: (outcome: { value: import("bonobo-plugin-sdk/frontend").BonoboUiScope[] | null } | { queryError: unknown }) => void) => { dispose: () => void } | null,
+ *   session_expired: () => boolean,
  * }} deps
- * @returns {{ data: import("bonobo-plugin-sdk/frontend").BonoboUiFrontendClient["data"], members: import("bonobo-plugin-sdk/frontend").BonoboUiFrontendClient["members"] }}
+ * @returns {{ data: import("bonobo-plugin-sdk/frontend").BonoboUiFrontendClient["data"], members: import("bonobo-plugin-sdk/frontend").BonoboUiFrontendClient["members"], scopes: import("bonobo-plugin-sdk/frontend").BonoboUiFrontendClient["scopes"] }}
  */
 function bonobo_ui_create_data_api(deps) {
 	/** @type {Set<object>} */
@@ -4171,7 +4293,9 @@ function bonobo_ui_create_data_api(deps) {
 	const release_server_slot = () => {
 		serverSubscriptionCount -= 1;
 	};
-	const page_at_ceiling = () => serverSubscriptionCount >= MAX_PAGE_SERVER_SUBSCRIPTIONS;
+	/** @param {number} [requiredSlots] */
+	const page_at_ceiling = (requiredSlots = 1) =>
+		serverSubscriptionCount + requiredSlots > MAX_PAGE_SERVER_SUBSCRIPTIONS;
 	/**
 	 * @param {(docs: null, info?: { reason: string, message: string }) => void} onUpdate
 	 * @param {{ reason: string, message: string }} [info]
@@ -4187,8 +4311,70 @@ function bonobo_ui_create_data_api(deps) {
 		console.warn("[bonobo-plugin-sdk] Data watch refused, subscription cap reached");
 		deliver_death_async(onUpdate, {
 			reason: "capacity",
-			message: "Subscription limit reached for this page",
+			message: "Subscription limit reached for this plugin frame",
 		});
+	};
+	/**
+	 * Hold one page-visible subscription and turn every way it can end into the page's death
+	 * callback.
+	 *
+	 * Two doors need this and they must not drift: a missed `release_server_slot` leaks a slot the
+	 * page never gets back, and the frame then refuses later watches for no visible reason. `start`
+	 * owns what is being read; everything here is the bookkeeping around it.
+	 *
+	 * @template TValue, TPayload
+	 * @param {{
+	 *   start: (onOutcome: (outcome: { value: TValue | null } | { queryError: unknown }) => void) => { dispose: () => void } | null,
+	 *   onUpdate: (payload: TPayload | null, info?: { reason: string, message: string }) => void,
+	 *   deliver: (value: TValue) => TPayload,
+	 *   failureLabel: string,
+	 * }} args
+	 * @returns {() => void}
+	 */
+	const start_registered_watch = (args) => {
+		if (registrations.size >= MAX_WATCH_SUBSCRIPTIONS || page_at_ceiling()) {
+			refuse_capacity(args.onUpdate);
+			return () => {};
+		}
+		if (!acquire_server_slot()) {
+			refuse_capacity(args.onUpdate);
+			return () => {};
+		}
+		const entry = {};
+		registrations.add(entry);
+		/** @type {{ dispose: () => void } | null} */
+		let subscription = null;
+		const stop = () => {
+			if (!registrations.delete(entry)) return;
+			subscription?.dispose();
+			release_server_slot();
+		};
+		subscription = args.start((outcome) => {
+			if (!registrations.has(entry)) return;
+			if ("queryError" in outcome) {
+				const info = deps.session_expired() ? DEATH_SESSION_EXPIRED : DEATH_UNAVAILABLE;
+				if (info === DEATH_UNAVAILABLE)
+					console.error(`[bonobo-plugin-sdk] Plugin ${args.failureLabel} failed:`, outcome.queryError);
+				stop();
+				args.onUpdate(null, info);
+				return;
+			}
+			if (outcome.value === null) {
+				stop();
+				args.onUpdate(null, DEATH_DENIED);
+				return;
+			}
+			args.onUpdate(args.deliver(outcome.value));
+		});
+		if (!subscription) {
+			stop();
+			console.error(`[bonobo-plugin-sdk] Plugin ${args.failureLabel} could not start`);
+			deliver_death_async(args.onUpdate);
+			return () => {};
+		}
+		return function unsubscribe() {
+			stop();
+		};
 	};
 	/** @type {import("bonobo-plugin-sdk/frontend").BonoboUiFrontendClient["data"]} */
 	const data = {
@@ -4205,55 +4391,57 @@ function bonobo_ui_create_data_api(deps) {
 				});
 				return () => {};
 			}
-			if (registrations.size >= MAX_WATCH_SUBSCRIPTIONS || page_at_ceiling()) {
-				refuse_capacity(onUpdate);
+			return start_registered_watch({
+				start: (onOutcome) =>
+					deps.start_watch(
+						{
+							collection: opts.collection,
+							...(opts.keyPrefix === void 0 ? {} : { keyPrefix: opts.keyPrefix }),
+							limit: opts.limit,
+						},
+						null,
+						onOutcome,
+					),
+				onUpdate,
+				deliver: (value) => ({
+					docs: value.docs,
+					truncated: value.truncated,
+				}),
+				failureLabel: "data watch",
+			});
+		},
+		watchRecent(opts, onUpdate) {
+			const invalid = validate_watch_inputs({
+				collection: opts.collection,
+				limit: opts.limit,
+			});
+			if (invalid) {
+				deliver_death_async(onUpdate, {
+					reason: "invalid",
+					message: invalid,
+				});
 				return () => {};
 			}
-			if (!acquire_server_slot()) {
-				refuse_capacity(onUpdate);
-				return () => {};
-			}
-			const entry = {};
-			registrations.add(entry);
-			/** @type {{ dispose: () => void } | null} */
-			let subscription = null;
-			const stop = () => {
-				if (!registrations.delete(entry)) return;
-				subscription?.dispose();
-				release_server_slot();
-			};
-			subscription = deps.start_watch(
-				{
-					collection: opts.collection,
-					...(opts.keyPrefix === void 0 ? {} : { keyPrefix: opts.keyPrefix }),
-					limit: opts.limit,
-				},
-				null,
-				(outcome) => {
-					if (!registrations.has(entry)) return;
-					if ("queryError" in outcome) {
-						console.error("[bonobo-plugin-sdk] Plugin data watch failed:", outcome.queryError);
-						stop();
-						onUpdate(null);
-						return;
-					}
-					if (outcome.value === null) {
-						stop();
-						onUpdate(null);
-						return;
-					}
-					onUpdate(outcome.value.docs);
-				},
-			);
-			if (!subscription) {
-				stop();
-				console.error("[bonobo-plugin-sdk] Plugin data watch could not start");
-				deliver_death_async(onUpdate);
-				return () => {};
-			}
-			return function unsubscribe() {
-				stop();
-			};
+			return start_registered_watch({
+				start: (onOutcome) =>
+					deps.start_recent_watch(
+						{
+							collection: opts.collection,
+							limit: opts.limit,
+							...(opts.order === void 0 ? {} : { order: opts.order }),
+							...(opts.since === void 0 ? {} : { since: opts.since }),
+							...(opts.before === void 0 ? {} : { before: opts.before }),
+							...(opts.scopeId === void 0 ? {} : { scopeId: opts.scopeId }),
+						},
+						onOutcome,
+					),
+				onUpdate,
+				deliver: (value) => ({
+					docs: value.docs,
+					truncated: value.truncated,
+				}),
+				failureLabel: "recent watch",
+			});
 		},
 		watchWindow(opts, onUpdate) {
 			const inertHandle = {
@@ -4289,10 +4477,11 @@ function bonobo_ui_create_data_api(deps) {
 				release_server_slot,
 				page_at_ceiling,
 				post_update: (payload) => onUpdate(payload),
-				on_dead: () => {
+				on_dead: (info) => {
 					registrations.delete(entry);
-					onUpdate(null);
+					onUpdate(null, info);
 				},
+				session_expired: deps.session_expired,
 			});
 			if (!documentsWindow) {
 				registrations.delete(entry);
@@ -4364,19 +4553,128 @@ function bonobo_ui_create_data_api(deps) {
 				return { _nay: { message: "Failed to write plugin data" } };
 			});
 	}
+	/** @type {import("bonobo-plugin-sdk/frontend").BonoboUiFrontendClient["members"]} */
+	const members = {
+		resolve(userIds) {
+			return Promise.resolve()
+				.then(() => deps.resolve_member_display(userIds))
+				.then((result) => {
+					return result === null ? {} : result.members;
+				})
+				.catch((error) => {
+					console.error("[bonobo-plugin-sdk] Failed to resolve plugin member names:", error);
+					return {};
+				});
+		},
+		list(opts) {
+			if (!Number.isInteger(opts.limit) || opts.limit < 1 || opts.limit > MEMBERS_MAX_LIST_PAGE_SIZE)
+				return Promise.resolve({
+					_nay: {
+						name: "invalid",
+						message: `Member list limits must be integers from 1 to ${MEMBERS_MAX_LIST_PAGE_SIZE}`,
+					},
+				});
+			return Promise.resolve()
+				.then(() => deps.list_members(opts.limit, opts.cursor ?? null))
+				.then((result) => {
+					if (result === null)
+						return {
+							_nay: {
+								name: DEATH_DENIED.reason,
+								message: "This plugin no longer has access to this workspace",
+							},
+						};
+					if ("refusal" in result)
+						return {
+							_nay: {
+								name: "not_consented",
+								message: "This workspace has not granted this plugin the member list",
+							},
+						};
+					return {
+						_yay: {
+							members: result.members,
+							cursor: result.cursor,
+						},
+					};
+				})
+				.catch((error) => {
+					const info = deps.session_expired() ? DEATH_SESSION_EXPIRED : DEATH_UNAVAILABLE;
+					if (info === DEATH_UNAVAILABLE)
+						console.error("[bonobo-plugin-sdk] Failed to list plugin workspace members:", error);
+					return {
+						_nay: {
+							name: info.reason,
+							message: info.message,
+						},
+					};
+				});
+		},
+	};
+	/**
+	 * Runs one scope change. Same resolve-never-reject contract as a data write, and the same
+	 * stable fallback message, because the page shows both in the same dialogs.
+	 *
+	 * @param {Record<string, unknown>} action
+	 * @returns {Promise<import("bonobo-plugin-sdk/frontend").BonoboUiScopeResult>}
+	 */
+	function run_scope(action) {
+		return Promise.resolve()
+			.then(() => deps.run_manage_scope(action))
+			.then((result) => result)
+			.catch((error) => {
+				console.error("[bonobo-plugin-sdk] Plugin scope change failed:", error);
+				return { _nay: { message: "Failed to change who can read this" } };
+			});
+	}
 	return {
 		data,
-		members: {
-			resolve(userIds) {
+		members,
+		scopes: {
+			create(opts) {
+				return run_scope({
+					kind: "create",
+					scopeId: opts.scopeId,
+					collections: opts.collections,
+					keyPrefix: opts.keyPrefix,
+				});
+			},
+			setPrincipal(opts) {
+				return run_scope({
+					kind: "set_principal",
+					scopeId: opts.scopeId,
+					userId: opts.userId,
+					level: opts.level,
+				});
+			},
+			removePrincipal(opts) {
+				return run_scope({
+					kind: "remove_principal",
+					scopeId: opts.scopeId,
+					userId: opts.userId,
+				});
+			},
+			delete(opts) {
+				return run_scope({
+					kind: "delete",
+					scopeId: opts.scopeId,
+				});
+			},
+			listPrincipals(opts) {
 				return Promise.resolve()
-					.then(() => deps.resolve_member_display(userIds))
-					.then((result) => {
-						return result === null ? {} : result.members;
-					})
+					.then(() => deps.list_scope_principals(opts.scopeId))
 					.catch((error) => {
-						console.error("[bonobo-plugin-sdk] Failed to resolve plugin member names:", error);
-						return {};
+						console.error("[bonobo-plugin-sdk] Failed to read plugin scope principals:", error);
+						return null;
 					});
+			},
+			watchMine(onUpdate) {
+				return start_registered_watch({
+					start: (onOutcome) => deps.start_my_scopes_watch(onOutcome),
+					onUpdate,
+					deliver: (value) => value,
+					failureLabel: "scope watch",
+				});
 			},
 		},
 	};
@@ -4416,6 +4714,23 @@ function create_convex_data_deps(convexClient) {
 	return {
 		start_watch,
 		/**
+		 * @param {Record<string, unknown>} queryArgs
+		 * @param {(outcome: { value: any } | { queryError: unknown }) => void} onResult
+		 */
+		start_recent_watch: (queryArgs, onResult) => {
+			try {
+				const unsubscribe = convexClient.onUpdate(
+					anyApi.plugins_data.watch_recent,
+					queryArgs,
+					(value) => onResult({ value }),
+					(queryError) => onResult({ queryError }),
+				);
+				return { dispose: () => void unsubscribe() };
+			} catch {
+				return null;
+			}
+		},
+		/**
 		 * @param {"append" | "put" | "remove" | "putOwned" | "removeOwned"} op
 		 * @param {Record<string, unknown>} fields
 		 */
@@ -4435,6 +4750,33 @@ function create_convex_data_deps(convexClient) {
 		},
 		/** @param {string[]} userIds */
 		resolve_member_display: (userIds) => convexClient.query(anyApi.plugins_data.resolve_member_display, { userIds }),
+		/**
+		 * @param {number} limit
+		 * @param {string | null} cursor
+		 */
+		list_members: (limit, cursor) =>
+			convexClient.query(anyApi.plugins_data.list_members, {
+				limit,
+				cursor,
+			}),
+		/** @param {Record<string, unknown>} action */
+		run_manage_scope: (action) => convexClient.mutation(anyApi.plugins_data.user_manage_scope, { action }),
+		/** @param {string} scopeId */
+		list_scope_principals: (scopeId) => convexClient.query(anyApi.plugins_data.watch_scope_principals, { scopeId }),
+		/** @param {(outcome: { value: any } | { queryError: unknown }) => void} onResult */
+		start_my_scopes_watch: (onResult) => {
+			try {
+				const unsubscribe = convexClient.onUpdate(
+					anyApi.plugins_data.watch_my_scopes,
+					{},
+					(value) => onResult({ value }),
+					(queryError) => onResult({ queryError }),
+				);
+				return { dispose: () => void unsubscribe() };
+			} catch {
+				return null;
+			}
+		},
 	};
 }
 /**
@@ -4460,6 +4802,10 @@ async function bonobo_ui_connect() {
 	let apiOrigin = "";
 	let token = "";
 	let tokenExpiresAt = 0;
+	/** @type {import("bonobo-plugin-sdk/frontend").BonoboUiTheme | null} */
+	let theme = null;
+	/** @type {Set<(theme: import("bonobo-plugin-sdk/frontend").BonoboUiTheme) => void>} */
+	const themeSubscribers = /* @__PURE__ */ new Set();
 	/** @type {Map<string, { resolve: (token: string) => void, reject: (error: Error) => void, timeout: ReturnType<typeof setTimeout> }>} */
 	const pending_refreshes = /* @__PURE__ */ new Map();
 	/** @type {Promise<string> | null} */
@@ -4487,7 +4833,7 @@ async function bonobo_ui_connect() {
 		refresh_in_flight = new Promise((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				pending_refreshes.delete(requestId);
-				reject(/* @__PURE__ */ new Error("Plugin page token refresh timed out"));
+				reject(/* @__PURE__ */ new Error("Plugin frame token refresh timed out"));
 			}, REFRESH_DEADLINE_MS);
 			pending_refreshes.set(requestId, {
 				resolve,
@@ -4522,7 +4868,7 @@ async function bonobo_ui_connect() {
 	 *
 	 * @param {string} path - Public API path starting with `/`, e.g. `"/api/v1/files/list"`.
 	 * @param {{ method?: string, headers?: Record<string, string>, body?: unknown }} [init]
-	 * @returns {Promise<any>}
+	 * @returns {Promise<unknown>}
 	 */
 	async function fetchJson(path, init) {
 		const has_body = init?.body !== void 0;
@@ -4639,7 +4985,11 @@ async function bonobo_ui_connect() {
 				});
 				convexClient.setAuth(fetch_convex_jwt);
 				window.addEventListener("pagehide", () => void convexClient.close(), { once: true });
-				const { data, members } = bonobo_ui_create_data_api(create_convex_data_deps(convexClient));
+				theme = read_theme(message.theme);
+				const { data, members, scopes } = bonobo_ui_create_data_api({
+					...create_convex_data_deps(convexClient),
+					session_expired: () => Date.now() >= tokenExpiresAt,
+				});
 				resolve({
 					context: message.context,
 					apiOrigin,
@@ -4648,6 +4998,16 @@ async function bonobo_ui_connect() {
 					fetchJson,
 					data,
 					members,
+					scopes,
+					theme: {
+						current: () => theme,
+						subscribe(onChange) {
+							themeSubscribers.add(onChange);
+							return () => {
+								themeSubscribers.delete(onChange);
+							};
+						},
+					},
 				});
 			} else if (
 				initialized &&
@@ -4665,6 +5025,12 @@ async function bonobo_ui_connect() {
 					token = message.token;
 					tokenExpiresAt = message.tokenExpiresAt;
 					pending.resolve(message.token);
+				}
+			} else if (initialized && message.bridgeNonce === bridgeNonce && message.type === "bonobo:theme") {
+				const next = read_theme(message.theme);
+				if (next) {
+					theme = next;
+					for (const onChange of themeSubscribers) onChange(next);
 				}
 			} else if (
 				initialized &&
@@ -11046,16 +11412,59 @@ function chat_key_timestamp(key) {
 	return INVERTED_MS_COMPLEMENT - Number(match[1]);
 }
 /**
+ * What a private channel's key starts with, and what its scope covers.
+ *
+ * A private channel is not a different kind of channel. It is an ordinary channel whose key sits
+ * under this prefix, so the scope created over that key hides the channel, its messages, its replies
+ * and its reactions in one go — they all key off the channel key. A direct message is a private
+ * channel with two people in it and nothing else.
+ *
+ * `/` and not `:`, because every key parser here splits on `:` and counts the parts.
+ */
+var PRIVATE_CHANNEL_KEY_PREFIX = "p/";
+/**
+ * The collections a private channel's scope must cover.
+ *
+ * All four, in one `scopes.create` call. A scope covering three of them would leave the fourth
+ * readable by the whole workspace, and the channel doc alone carries the channel's name.
+ */
+var chat_PRIVATE_CHANNEL_COLLECTIONS = ["channels", "messages", "replies", "reactions"];
+/**
+ * What "private" really means here, in the same words everywhere the word appears.
+ *
+ * The organization owner passes every permission check before any grant is read, so the owner reads
+ * every private channel and every direct message. Copy that says "private" and stops there is a
+ * disclosure, so this sentence travels with it.
+ */
+var chat_PRIVATE_CHANNEL_DISCLOSURE =
+	"Only the people added here can read it — and the organization owner, who can read everything in this workspace.";
+/**
  * Channel keys are client-generated so channels are created through `put`, which makes the
  * doc SHARED — any member can rename or archive it. A UUID is printable ASCII and short
  * enough (36 chars) to leave room for the message and reply segments under the 128 budget.
  */
-function chat_create_channel_key() {
-	return crypto.randomUUID();
+function chat_create_channel_key(visibility) {
+	const id = crypto.randomUUID();
+	return visibility === "private" ? `${PRIVATE_CHANNEL_KEY_PREFIX}${id}` : id;
+}
+/**
+ * Whether a channel is private, read from its own key.
+ *
+ * The key is the only source. Storing a flag in the channel value would let the two disagree, and
+ * the value is writable by everybody who can see the channel while the key never changes.
+ */
+function chat_channel_is_private(channelKey) {
+	return channelKey.startsWith(PRIVATE_CHANNEL_KEY_PREFIX);
 }
 /** Message keys are `<channelKey>:<invertedPaddedMs>:<rand4>` — appended under this prefix. */
 function chat_message_key_prefix(channelKey) {
 	return `${channelKey}:`;
+}
+/** The channel key of a message key, or null when the key is not message-shaped. */
+function chat_message_channel_key(messageKey) {
+	const parts = messageKey.split(":");
+	if (parts.length < 3 || chat_key_timestamp(messageKey) === null) return null;
+	return parts.slice(0, -2).join(":");
 }
 /** Reply keys are `<rootMessageKey>:<invertedPaddedMs>:<rand4>` — appended under this prefix. */
 function chat_reply_key_prefix(rootMessageKey) {
@@ -11097,9 +11506,54 @@ function chat_reply_root_key(replyKey) {
 	if (chat_key_timestamp(rootKey) === null || chat_key_timestamp(replyKey) === null) return null;
 	return rootKey;
 }
+/** The stored key of one member's public cursor doc — what the cursors watch narrows to. */
+function chat_cursor_stored_key(userId) {
+	return `me:${userId}`;
+}
+/**
+ * The caller key of this member's read cursor for one private channel. The doc lives in the
+ * `channels` collection INSIDE the channel's scope range, because a `p/` key in the public cursor
+ * map would tell every member the channel exists. The server appends `:<userId>` on `putOwned`,
+ * so the stored key is `<channelKey>:read:<userId>` and the per-scope channels watch already
+ * delivers it at no extra subscription. `chat_validate_channel_doc` drops it from channel lists
+ * because its value has no `name`.
+ */
+function chat_private_cursor_caller_key(channelKey) {
+	return `${channelKey}:read`;
+}
+/**
+ * Splits a stored private-cursor key into its channel key and the server-appended user id tail.
+ * Returns null for every other key shape in the channels collection — real channel docs and
+ * foreign keys alike. Match the owner by the doc's `createdBy`, not the tail: the server stamps
+ * `createdBy`, while the tail is only parsed here for completeness.
+ */
+function chat_parse_private_cursor_key(storedKey) {
+	const parts = storedKey.split(":");
+	if (parts.length !== 3 || parts[1] !== "read") return null;
+	if (!chat_channel_is_private(parts[0])) return null;
+	return {
+		channelKey: parts[0],
+		keyTailUserId: parts[2],
+	};
+}
 var chat_channel_value_schema = object({
 	name: string().min(1).max(64),
 	archivedAt: number().nullable(),
+	/**
+	 * Optional, and it must stay optional. Every channel written before the topic existed carries no
+	 * `topic`, `chat_validate_channel_doc` drops a value that fails to parse, and the store drops
+	 * every null — so a required field would empty the channel list of an existing workspace.
+	 */
+	topic: string().max(250).optional(),
+	/**
+	 * When the newest message in this channel was sent, epoch ms. Only private channels carry it:
+	 * a rangeless read never sees a private scope, so this stamp is how a CLOSED private channel
+	 * can say "unread". The sender stamps it after a successful append, debounced to one write
+	 * per 15 s so a burst does not double its rate-limit cost. Public channels get the same
+	 * answer from the recent-messages feed instead. Optional: channels written before the stamp
+	 * existed carry none.
+	 */
+	lastMessageAt: number().optional(),
 });
 var chat_attachment_schema = object({
 	fileNodeId: string().min(1),
@@ -11110,7 +11564,22 @@ var chat_message_value_schema = object({
 	attachments: array(chat_attachment_schema),
 	editedAt: number().nullable(),
 	deletedAt: number().nullable(),
+	/**
+	 * User ids the author mentioned with `@Name` in `text`. Only ids whose name is still present
+	 * in the text at send time are stored. Optional: messages written before mentions existed
+	 * carry none, and a required field would drop them all at validation.
+	 */
+	mentions: array(string()).optional(),
 });
+/**
+ * The member's public read cursor map: newest read time per public channel key, epoch ms. One doc
+ * per member (`me:<userId>` in `cursors`). Private channel keys must never appear here — a `p/`
+ * key in a workspace-readable value discloses the channel's existence. Private read state lives
+ * in each scope's own range instead (see `chat_private_cursor_caller_key`).
+ */
+var chat_cursor_map_value_schema = object({ channels: record(string(), number()) });
+/** A private channel's per-member read cursor: the newest read time, epoch ms. */
+var chat_private_cursor_value_schema = object({ at: number() });
 /**
  * The BonoboPublicDoc envelope every read surface returns (plain watch and window
  * updates alike). The store is a generic multi-writer surface, so every doc is runtime
@@ -11177,6 +11646,102 @@ function chat_validate_reaction_doc(raw) {
 		revision: envelope.data.revision,
 	};
 }
+/** The member's public cursor doc, or null when the doc fails validation. */
+function chat_validate_cursor_map_doc(raw) {
+	const envelope = public_doc_schema.safeParse(raw);
+	if (!envelope.success) return null;
+	const value = chat_cursor_map_value_schema.safeParse(envelope.data.value);
+	if (!value.success) return null;
+	return {
+		key: envelope.data.key,
+		value: value.data,
+		revision: envelope.data.revision,
+		createdBy: envelope.data.createdBy,
+		updatedBy: envelope.data.updatedBy,
+		createdAt: envelope.data.createdAt,
+		updatedAt: envelope.data.updatedAt,
+		timestamp: envelope.data.createdAt,
+	};
+}
+function chat_validate_private_cursor_doc(raw) {
+	const envelope = public_doc_schema.safeParse(raw);
+	if (!envelope.success) return null;
+	const parsed = chat_parse_private_cursor_key(envelope.data.key);
+	if (parsed === null) return null;
+	const value = chat_private_cursor_value_schema.safeParse(envelope.data.value);
+	if (!value.success) return null;
+	return {
+		key: envelope.data.key,
+		channelKey: parsed.channelKey,
+		createdBy: envelope.data.createdBy,
+		at: value.data.at,
+		revision: envelope.data.revision,
+	};
+}
+/**
+ * Merges two cursor maps by per-channel maximum. The conflict retry uses it: the winner the
+ * watch delivered and the write that lost both carry real read times, and a plain overwrite in
+ * either direction would move some channel's cursor backwards.
+ */
+function chat_merge_cursor_maps(a, b) {
+	const channels = { ...a.channels };
+	for (const [channelKey, at] of Object.entries(b.channels)) {
+		const existing = channels[channelKey];
+		channels[channelKey] = existing === void 0 ? at : Math.max(existing, at);
+	}
+	return { channels };
+}
+/**
+ * Folds the public recent feed into per-channel unread state. A message counts when it is newer
+ * than the channel's cursor, not deleted, and not the member's own. The feed holds only the
+ * newest 100 public messages, so a channel whose news has fallen out of it shows as read — the
+ * accepted horizon of the zero-write unread design.
+ */
+function chat_fold_public_unreads(opts) {
+	const result = /* @__PURE__ */ new Map();
+	for (const doc of opts.docs) {
+		const channelKey = chat_message_channel_key(doc.key);
+		if (channelKey === null || chat_channel_is_private(channelKey)) continue;
+		if (doc.value.deletedAt !== null || doc.createdBy === opts.selfUserId) continue;
+		const lastReadMs = opts.cursorChannels[channelKey];
+		if (lastReadMs !== void 0 && doc.timestamp <= lastReadMs) continue;
+		const mention = doc.value.mentions?.includes(opts.selfUserId) ? 1 : 0;
+		const existing = result.get(channelKey);
+		if (existing === void 0)
+			result.set(channelKey, {
+				unreadCount: 1,
+				mentionCount: mention,
+				latest: doc,
+			});
+		else {
+			existing.unreadCount += 1;
+			existing.mentionCount += mention;
+			if (doc.timestamp > existing.latest.timestamp) existing.latest = doc;
+		}
+	}
+	return result;
+}
+/**
+ * Design decision 5's one time ladder for thread summaries and channel recency: relative under
+ * 24 hours, clock time within the last 7 days, the absolute date beyond. Message rows do NOT use
+ * this — they show clock time and carry the absolute date in their accessible name.
+ */
+function chat_format_recency(timestamp, now) {
+	const age = now - timestamp;
+	if (age < 6e4) return "just now";
+	if (age < 60 * 6e4) return `${Math.floor(age / 6e4)}m ago`;
+	if (age < 1440 * 6e4) return `${Math.floor(age / (60 * 6e4))}h ago`;
+	if (age < 10080 * 6e4)
+		return new Date(timestamp).toLocaleTimeString(void 0, {
+			hour: "numeric",
+			minute: "2-digit",
+		});
+	return new Date(timestamp).toLocaleDateString(void 0, {
+		year: "numeric",
+		month: "short",
+		day: "numeric",
+	});
+}
 /** Response of `POST /api/v1/files/list`. */
 var chat_files_list_response_schema = object({
 	items: array(
@@ -11189,6 +11754,17 @@ var chat_files_list_response_schema = object({
 			updatedAt: number(),
 		}),
 	),
+	cursor: string().nullable(),
+	isDone: boolean(),
+});
+/**
+ * Response of `POST /api/v1/plugin-data/list`, the deep-history fallback's envelope.
+ *
+ * `fetchJson` resolves `unknown`, and the accumulating store validates each **document** and never
+ * the envelope around them. Without this schema the page would read `documents` off an `unknown`.
+ */
+var chat_plugin_data_list_response_schema = object({
+	documents: array(unknown()),
 	cursor: string().nullable(),
 	isDone: boolean(),
 });
@@ -11408,6 +11984,17 @@ function Dialog(props) {
 			opener?.focus();
 		};
 	}, []);
+	useEffect(() => {
+		const panel = panelRef.current;
+		if (!panel) return;
+		const restore_lost_focus = () => {
+			if (!panel.isConnected || document.activeElement !== document.body) return;
+			(panel.querySelector("[data-dialog-initial]") ?? panel.querySelector(FOCUSABLE_SELECTOR))?.focus();
+		};
+		const handle_focus_out = () => queueMicrotask(restore_lost_focus);
+		panel.addEventListener("focusout", handle_focus_out);
+		return () => panel.removeEventListener("focusout", handle_focus_out);
+	}, []);
 	const handle_key_down = (event) => {
 		if (event.key === "Escape") {
 			event.stopPropagation();
@@ -11457,6 +12044,7 @@ function use_send_queue(opts) {
 			attachments: entry.attachments,
 			editedAt: null,
 			deletedAt: null,
+			...(entry.mentions.length > 0 ? { mentions: entry.mentions } : {}),
 		};
 		opts.client.data
 			.append({
@@ -11467,13 +12055,15 @@ function use_send_queue(opts) {
 			})
 			.then((result) => {
 				if ("_nay" in result) {
+					const storageFull = result._nay.name === "storage_full";
+					if (storageFull) opts.onStorageFull(result._nay.message);
 					setPending((prev) =>
 						prev.map((p) =>
 							p.clientRequestId === entry.clientRequestId
 								? {
 										...p,
 										status: "failed",
-										errorMessage: result._nay.message,
+										errorMessage: storageFull ? null : result._nay.message,
 									}
 								: p,
 						),
@@ -11508,7 +12098,7 @@ function use_send_queue(opts) {
 				);
 			});
 	};
-	const send = (text, attachments) => {
+	const send = (text, attachments, mentions) => {
 		const clientRequestId = crypto.randomUUID();
 		setPending((prev) => [
 			...prev,
@@ -11516,6 +12106,7 @@ function use_send_queue(opts) {
 				clientRequestId,
 				text,
 				attachments,
+				mentions,
 				status: "sending",
 				errorMessage: null,
 			},
@@ -11524,6 +12115,7 @@ function use_send_queue(opts) {
 			clientRequestId,
 			text,
 			attachments,
+			mentions,
 		});
 	};
 	const retry = (entry) => {
@@ -11549,74 +12141,130 @@ function use_send_queue(opts) {
 }
 /** Content-type families the attachment picker lists: images, media, and documents. */
 var ATTACHABLE_CONTENT_TYPE_PREFIXES = ["image/", "video/", "audio/", "application/", "text/"];
-function AttachmentLink(props) {
-	const [state, setState] = useState({ kind: "idle" });
-	const handle_resolve = () => {
-		setState({ kind: "loading" });
-		props.client
-			.fetchJson("/api/v1/files/download-urls", { body: { fileNodeIds: [props.attachment.fileNodeId] } })
-			.then((raw) => {
+/**
+ * How many file ids one download-urls request may carry. The route itself clips the list at 20 and
+ * charges one rate-limit unit per id, so a bigger request would spend the whole burst and silently
+ * drop the tail.
+ */
+var DOWNLOAD_URL_BATCH_SIZE = 20;
+/**
+ * One message's attachments. Nothing is requested until a member opens one; that click then
+ * resolves the whole message at once, because a batch costs the same rate-limit budget as the same
+ * number of single calls and saves the round trips.
+ *
+ * URLs are never stored in the message doc: every resolve asks the server again, so it rechecks
+ * this member's permission on each file.
+ */
+function MessageAttachments(props) {
+	const [resolved, setResolved] = useState(/* @__PURE__ */ new Map());
+	const [loading, setLoading] = useState(false);
+	const [error, setError] = useState(null);
+	const linkRefs = useRef(/* @__PURE__ */ new Map());
+	const focusFileNodeIdRef = useRef(null);
+	useEffect(() => {
+		const fileNodeId = focusFileNodeIdRef.current;
+		if (fileNodeId === null) return;
+		const link = linkRefs.current.get(fileNodeId);
+		if (link) {
+			focusFileNodeIdRef.current = null;
+			link.focus();
+		}
+	}, [resolved]);
+	const handle_resolve = (fileNodeId) => {
+		focusFileNodeIdRef.current = fileNodeId;
+		setLoading(true);
+		setError(null);
+		(async () => {
+			const next = new Map(resolved);
+			for (let index = 0; index < props.attachments.length; index += DOWNLOAD_URL_BATCH_SIZE) {
+				const batch = props.attachments.slice(index, index + DOWNLOAD_URL_BATCH_SIZE);
+				const raw = await props.client.fetchJson("/api/v1/files/download-urls", {
+					body: { fileNodeIds: batch.map((attachment) => attachment.fileNodeId) },
+				});
 				const parsed = chat_download_urls_response_schema.safeParse(raw);
-				if (!parsed.success) {
-					setState({
-						kind: "error",
-						message: "Unexpected response for the download link",
-					});
-					return;
-				}
-				const item = parsed.data.items.find((candidate) => candidate.fileNodeId === props.attachment.fileNodeId);
-				if (item !== void 0) {
-					setState({
+				if (!parsed.success) throw new Error("Unexpected response for the download links");
+				for (const item of parsed.data.items)
+					next.set(item.fileNodeId, {
 						kind: "ready",
 						url: item.url,
 					});
-					return;
-				}
-				const failure = parsed.data.errors.find((candidate) => candidate.fileNodeId === props.attachment.fileNodeId);
-				setState({
-					kind: "error",
-					message: failure?.message ?? "Failed to get a download link",
-				});
+				for (const failure of parsed.data.errors)
+					next.set(failure.fileNodeId, {
+						kind: "error",
+						message: failure.message,
+					});
+			}
+			return next;
+		})()
+			.then((next) => {
+				setLoading(false);
+				setResolved(next);
 			})
-			.catch((error) => {
-				setState({
-					kind: "error",
-					message: chat_get_error_message(error),
-				});
+			.catch((resolveError) => {
+				setLoading(false);
+				focusFileNodeIdRef.current = null;
+				setError(chat_get_error_message(resolveError));
 			});
 	};
-	if (state.kind === "ready")
-		return /* @__PURE__ */ createVNode("span", {
-			className: "attachment",
-			children: [
-				/* @__PURE__ */ createVNode("a", {
-					className: "attachment-link",
-					href: state.url,
-					target: "_blank",
-					rel: "noopener noreferrer",
-					children: props.attachment.name,
-				}),
-				/* @__PURE__ */ createVNode("span", {
-					className: "attachment-hint",
-					children: "Link ready — it expires after a few minutes.",
-				}),
-			],
-		});
-	return /* @__PURE__ */ createVNode("span", {
-		className: "attachment",
+	return /* @__PURE__ */ createVNode("div", {
+		className: "message-attachments",
 		children: [
-			/* @__PURE__ */ createVNode("button", {
-				type: "button",
-				className: "attachment-button",
-				disabled: state.kind === "loading",
-				onClick: handle_resolve,
-				children: state.kind === "loading" ? `Getting link for ${props.attachment.name}…` : props.attachment.name,
+			props.attachments.map((attachment) => {
+				const state = resolved.get(attachment.fileNodeId);
+				if (state?.kind === "ready")
+					return /* @__PURE__ */ createVNode(
+						"span",
+						{
+							className: "attachment",
+							children: [
+								/* @__PURE__ */ createVNode("a", {
+									ref: (element) => {
+										if (element === null) linkRefs.current.delete(attachment.fileNodeId);
+										else linkRefs.current.set(attachment.fileNodeId, element);
+									},
+									className: "attachment-link",
+									href: state.url,
+									target: "_blank",
+									rel: "noopener noreferrer",
+									children: attachment.name,
+								}),
+								/* @__PURE__ */ createVNode("span", {
+									className: "attachment-hint",
+									children: "Link ready — it expires after a few minutes.",
+								}),
+							],
+						},
+						attachment.fileNodeId,
+					);
+				return /* @__PURE__ */ createVNode(
+					"span",
+					{
+						className: "attachment",
+						children: [
+							/* @__PURE__ */ createVNode("button", {
+								type: "button",
+								className: "attachment-button",
+								disabled: loading,
+								onClick: () => handle_resolve(attachment.fileNodeId),
+								children: loading ? `Getting link for ${attachment.name}…` : attachment.name,
+							}),
+							state?.kind === "error"
+								? /* @__PURE__ */ createVNode("span", {
+										className: "attachment-error",
+										role: "alert",
+										children: state.message,
+									})
+								: null,
+						],
+					},
+					attachment.fileNodeId,
+				);
 			}),
-			state.kind === "error"
+			error !== null
 				? /* @__PURE__ */ createVNode("span", {
 						className: "attachment-error",
 						role: "alert",
-						children: state.message,
+						children: error,
 					})
 				: null,
 		],
@@ -11756,20 +12404,106 @@ function AttachmentPickerDialog(props) {
 		],
 	});
 }
+/** How many people the @-menu offers at once — a menu a person scans, not a roster. */
+var MENTION_MENU_SIZE = 8;
 function Composer(props) {
 	const hintId = useId();
 	const [text, setText] = useState("");
 	const [attachments, setAttachments] = useState([]);
 	const [pickerOpen, setPickerOpen] = useState(false);
+	/** null = never asked; "failed" = the roster was refused, so @ degrades to plain text. */
+	const [mentionRoster, setMentionRoster] = useState(null);
+	/** The `@word` under the caret: where the `@` sits and what follows it. */
+	const [mentionQuery, setMentionQuery] = useState(null);
+	const [mentionIndex, setMentionIndex] = useState(0);
+	/** userId → the display name that was inserted for it. Send keeps only names still in the text. */
+	const chosenMentionsRef = useRef(/* @__PURE__ */ new Map());
+	const textareaRef = useRef(null);
+	const rosterRequestedRef = useRef(false);
+	const update_mention_query = (value, caret) => {
+		const match = /(?:^|\s)@([^\s@]*)$/.exec(value.slice(0, caret));
+		if (match === null) {
+			setMentionQuery(null);
+			return;
+		}
+		setMentionQuery({
+			start: caret - match[1].length - 1,
+			query: match[1],
+		});
+		setMentionIndex(0);
+		if (!rosterRequestedRef.current) {
+			rosterRequestedRef.current = true;
+			props.client.members.list({ limit: 100 }).then((result) => {
+				setMentionRoster("_nay" in result ? "failed" : result._yay.members);
+			});
+		}
+	};
+	const selfUserId = props.client.context.userId;
+	const mentionCandidates =
+		mentionQuery !== null && Array.isArray(mentionRoster)
+			? mentionRoster
+					.filter(
+						(member) =>
+							typeof member.displayName === "string" &&
+							member.displayName !== "" &&
+							member.userId !== selfUserId &&
+							member.displayName.toLowerCase().startsWith(mentionQuery.query.toLowerCase()),
+					)
+					.slice(0, MENTION_MENU_SIZE)
+			: [];
+	const pick_mention = (member) => {
+		if (mentionQuery === null) return;
+		const caret = textareaRef.current?.selectionStart ?? text.length;
+		const next = `${text.slice(0, mentionQuery.start)}@${member.displayName} ${text.slice(caret)}`;
+		chosenMentionsRef.current.set(member.userId, member.displayName);
+		setText(next);
+		setMentionQuery(null);
+		const newCaret = mentionQuery.start + member.displayName.length + 2;
+		queueMicrotask(() => {
+			const element = textareaRef.current;
+			if (element !== null) {
+				element.focus();
+				element.setSelectionRange(newCaret, newCaret);
+			}
+		});
+	};
 	const handle_send = () => {
-		if (props.busy) return;
+		if (props.busy || props.disabled) return;
 		const trimmed = text.trim();
 		if (trimmed === "" && attachments.length === 0) return;
-		props.onSend(trimmed, attachments);
+		const mentions = [...chosenMentionsRef.current.entries()]
+			.filter(([, name]) => trimmed.includes(`@${name}`))
+			.map(([id]) => id);
+		props.onSend(trimmed, attachments, mentions);
 		setText("");
 		setAttachments([]);
+		setMentionQuery(null);
+		chosenMentionsRef.current.clear();
 	};
 	const handle_key_down = (event) => {
+		if (mentionQuery !== null && mentionCandidates.length > 0) {
+			if (event.key === "ArrowDown") {
+				event.preventDefault();
+				setMentionIndex((index) => (index + 1) % mentionCandidates.length);
+				return;
+			}
+			if (event.key === "ArrowUp") {
+				event.preventDefault();
+				setMentionIndex((index) => (index - 1 + mentionCandidates.length) % mentionCandidates.length);
+				return;
+			}
+			if (event.key === "Enter" || event.key === "Tab") {
+				event.preventDefault();
+				pick_mention(mentionCandidates[mentionIndex]);
+				return;
+			}
+			if (event.key === "Escape") {
+				event.preventDefault();
+				event.stopPropagation();
+				setMentionQuery(null);
+				return;
+			}
+		}
 		if (event.key === "Enter" && !event.shiftKey) {
 			event.preventDefault();
 			handle_send();
@@ -11804,14 +12538,51 @@ function Composer(props) {
 					})
 				: null,
 			/* @__PURE__ */ createVNode("textarea", {
+				ref: textareaRef,
 				className: "composer-input",
 				"aria-label": props.label,
 				"aria-describedby": hintId,
 				rows: 2,
 				value: text,
-				onInput: (event) => setText(event.currentTarget.value),
+				onInput: (event) => {
+					const value = event.currentTarget.value;
+					setText(value);
+					update_mention_query(value, event.currentTarget.selectionStart ?? value.length);
+				},
 				onKeyDown: handle_key_down,
 			}),
+			mentionQuery !== null && mentionCandidates.length > 0
+				? /* @__PURE__ */ createVNode(Fragment, {
+						children: [
+							/* @__PURE__ */ createVNode("ul", {
+								className: "mention-menu",
+								role: "listbox",
+								"aria-label": "Mention somebody",
+								children: mentionCandidates.map((member, index) =>
+									/* @__PURE__ */ createVNode(
+										"li",
+										{
+											role: "option",
+											"aria-selected": index === mentionIndex,
+											className: index === mentionIndex ? "mention-option is-active" : "mention-option",
+											onMouseDown: (event) => {
+												event.preventDefault();
+												pick_mention(member);
+											},
+											children: member.displayName,
+										},
+										member.userId,
+									),
+								),
+							}),
+							/* @__PURE__ */ createVNode("span", {
+								className: "visually-hidden",
+								role: "status",
+								children: `${mentionCandidates[mentionIndex]?.displayName ?? ""}, ${mentionIndex + 1} of ${mentionCandidates.length}`,
+							}),
+						],
+					})
+				: null,
 			/* @__PURE__ */ createVNode("div", {
 				className: "composer-row",
 				children: [
@@ -11823,13 +12594,14 @@ function Composer(props) {
 					/* @__PURE__ */ createVNode("button", {
 						type: "button",
 						className: "button",
+						disabled: props.disabled,
 						onClick: () => setPickerOpen(true),
 						children: "Attach file",
 					}),
 					/* @__PURE__ */ createVNode("button", {
 						type: "button",
 						className: "button button-primary",
-						disabled: props.busy,
+						disabled: props.busy || props.disabled,
 						onClick: handle_send,
 						children: props.busy ? "Sending…" : "Send",
 					}),
@@ -11919,6 +12691,130 @@ function AddReactionButton(props) {
 		],
 	});
 }
+var DAY_MS = 1440 * 60 * 1e3;
+/** How long after the previous message the next one by the same author still joins its group. */
+var GROUP_MAX_GAP_MS = 300 * 1e3;
+/** The clock time a row shows. Within 7 days this is the whole visible timestamp. */
+function format_clock_time(timestamp) {
+	return new Date(timestamp).toLocaleTimeString(void 0, {
+		hour: "numeric",
+		minute: "2-digit",
+	});
+}
+/** The full written date. The day divider shows it, and every recent row carries it for screen readers. */
+function format_absolute_date(timestamp) {
+	return new Date(timestamp).toLocaleDateString(void 0, {
+		weekday: "long",
+		year: "numeric",
+		month: "long",
+		day: "numeric",
+	});
+}
+/** The date a day divider announces. "Today" and "Yesterday" are read relative to `now`. */
+function format_day_label(timestamp, now) {
+	const day = new Date(timestamp).toDateString();
+	if (day === new Date(now).toDateString()) return "Today";
+	if (day === /* @__PURE__ */ new Date(now - DAY_MS).toDateString()) return "Yesterday";
+	return format_absolute_date(timestamp);
+}
+/**
+ * Two letters for the avatar. The two states that are not a name — a member who left, and a name
+ * still resolving — get a neutral glyph instead, because "FM" would read as somebody's initials.
+ */
+function author_initials(authorName) {
+	if (authorName === null || authorName === void 0) return "•";
+	const words = authorName.split(/\s+/u).filter((word) => word !== "");
+	if (words.length === 0) return "•";
+	const last = words.length > 1 ? words[words.length - 1][0] : "";
+	return `${words[0][0]}${last}`.toUpperCase();
+}
+/**
+ * Turns messages in display order (oldest first) into rows and day dividers.
+ *
+ * A divider renders strictly between two days and never above the first message, so a log inside
+ * one day has none at all. A row continues the previous author's group when the same member wrote
+ * it, on the same day, soon enough after the row above. Grouping is visual only: a continuation
+ * still renders its author and time, hidden from sight but not from assistive technology.
+ */
+function build_message_entries(docs, now) {
+	const entries = [];
+	let previous = null;
+	for (const doc of docs) {
+		const startsNewDay =
+			previous !== null && new Date(previous.timestamp).toDateString() !== new Date(doc.timestamp).toDateString();
+		if (startsNewDay)
+			entries.push({
+				kind: "divider",
+				key: `divider:${doc.key}`,
+				label: format_day_label(doc.timestamp, now),
+			});
+		const isContinuation =
+			previous !== null &&
+			!startsNewDay &&
+			previous.createdBy === doc.createdBy &&
+			doc.timestamp - previous.timestamp <= GROUP_MAX_GAP_MS;
+		entries.push({
+			kind: "message",
+			doc,
+			isContinuation,
+		});
+		previous = doc;
+	}
+	return entries;
+}
+/**
+ * Renders a message's text with its mentions wrapped for styling. Only ids stored in
+ * `mentions` are candidates, and only where `@Name` still matches the member's CURRENT display
+ * name — after a rename the old text degrades to plain words rather than guessing at spans.
+ */
+function render_message_text(value, memberNames, selfUserId) {
+	const mentions = value.mentions ?? [];
+	if (mentions.length === 0) return value.text;
+	const named = mentions
+		.map((id) => ({
+			id,
+			name: memberNames.get(id),
+		}))
+		.filter((entry) => typeof entry.name === "string" && entry.name !== "")
+		.sort((a, b) => b.name.length - a.name.length);
+	if (named.length === 0) return value.text;
+	const parts = [];
+	let rest = value.text;
+	while (rest !== "") {
+		let earliest = null;
+		for (const entry of named) {
+			const index = rest.indexOf(`@${entry.name}`);
+			if (index !== -1 && (earliest === null || index < earliest.index))
+				earliest = {
+					index,
+					id: entry.id,
+					name: entry.name,
+				};
+		}
+		if (earliest === null) {
+			parts.push(rest);
+			break;
+		}
+		if (earliest.index > 0) parts.push(rest.slice(0, earliest.index));
+		parts.push({
+			id: earliest.id,
+			name: earliest.name,
+		});
+		rest = rest.slice(earliest.index + earliest.name.length + 1);
+	}
+	return parts.map((part, index) =>
+		typeof part === "string"
+			? part
+			: /* @__PURE__ */ createVNode(
+					"span",
+					{
+						className: part.id === selfUserId ? "mention mention-self" : "mention",
+						children: ["@", part.name],
+					},
+					index,
+				),
+	);
+}
 function MessageRow(props) {
 	const { client, collection, doc, isOwn } = props;
 	const confirmTitleId = useId();
@@ -11940,17 +12836,22 @@ function MessageRow(props) {
 				collection,
 				key: doc.key,
 				value,
+				expectedRevision: doc.revision,
 			})
 			.then((result) => {
 				setBusy(false);
 				if ("_nay" in result) {
+					if (result._nay.name === "storage_full") {
+						props.onStorageFull(result._nay.message);
+						return;
+					}
 					setRowError(result._nay.message);
 					return;
 				}
 				props.onApplyLocal({
 					...doc,
 					value,
-					revision: doc.revision + 1,
+					revision: result._yay.revision,
 					updatedAt: Date.now(),
 				});
 				onDone();
@@ -11993,6 +12894,10 @@ function MessageRow(props) {
 	};
 	const handle_toggle_reaction = (token, currentlyPressed) => {
 		setRowError(null);
+		if (props.reactionGroups === "unknown" && currentlyPressed) {
+			setRowError("Reactions on this message could not be loaded, so they can't be removed right now.");
+			return;
+		}
 		(currentlyPressed
 			? client.data.removeOwned({
 					collection: "reactions",
@@ -12005,27 +12910,53 @@ function MessageRow(props) {
 				})
 		)
 			.then((result) => {
-				if ("_nay" in result) setRowError(result._nay.message);
+				if ("_nay" in result) {
+					if (result._nay.name === "storage_full") {
+						props.onStorageFull(result._nay.message);
+						return;
+					}
+					setRowError(result._nay.message);
+				}
 			})
 			.catch((error) => {
 				setRowError(chat_get_error_message(error));
 			});
 	};
 	const isDeleted = doc.value.deletedAt !== null;
+	const authorLabel = props.authorName === null ? "Former member" : (props.authorName ?? "…");
+	const isRecent = Date.now() - doc.timestamp < 7 * DAY_MS;
+	const hasThreadSummary = props.onOpenThread !== null && typeof props.replyCount === "number" && props.replyCount > 0;
 	return /* @__PURE__ */ createVNode("li", {
-		className: "message",
+		className: props.isContinuation ? "message is-continuation" : "message is-leader",
 		"data-key": doc.key,
 		children: [
+			/* @__PURE__ */ createVNode("span", {
+				className: "message-avatar",
+				"aria-hidden": "true",
+				children: author_initials(props.authorName),
+			}),
 			/* @__PURE__ */ createVNode("div", {
-				className: "message-head",
+				className: props.isContinuation ? "message-head visually-hidden" : "message-head",
 				children: [
 					/* @__PURE__ */ createVNode("span", {
 						className: "message-author",
-						children: props.authorName === null ? "Former member" : (props.authorName ?? "…"),
+						children: authorLabel,
 					}),
 					/* @__PURE__ */ createVNode("time", {
 						className: "message-time",
-						children: new Date(doc.timestamp).toLocaleString(),
+						dateTime: new Date(doc.timestamp).toISOString(),
+						children: [
+							isRecent
+								? /* @__PURE__ */ createVNode("span", {
+										className: "visually-hidden",
+										children: [format_absolute_date(doc.timestamp), " "],
+									})
+								: null,
+							/* @__PURE__ */ createVNode("span", {
+								className: "message-clock",
+								children: isRecent ? format_clock_time(doc.timestamp) : format_absolute_date(doc.timestamp),
+							}),
+						],
 					}),
 				],
 			}),
@@ -12081,7 +13012,7 @@ function MessageRow(props) {
 								/* @__PURE__ */ createVNode("p", {
 									className: "message-text",
 									children: [
-										doc.value.text,
+										render_message_text(doc.value, props.memberNames, props.selfUserId),
 										doc.value.editedAt !== null
 											? /* @__PURE__ */ createVNode("span", {
 													className: "message-edited",
@@ -12091,46 +13022,51 @@ function MessageRow(props) {
 									],
 								}),
 								doc.value.attachments.length > 0
-									? /* @__PURE__ */ createVNode("div", {
-											className: "message-attachments",
-											children: doc.value.attachments.map((attachment) =>
-												/* @__PURE__ */ createVNode(
-													AttachmentLink,
-													{
-														client,
-														attachment,
-													},
-													attachment.fileNodeId,
-												),
-											),
+									? /* @__PURE__ */ createVNode(MessageAttachments, {
+											client,
+											attachments: doc.value.attachments,
 										})
 									: null,
-								props.reactionGroups.length > 0
+								props.reactionGroups === "unknown"
 									? /* @__PURE__ */ createVNode("div", {
-											className: "message-reactions",
-											children: props.reactionGroups.map((group) =>
-												/* @__PURE__ */ createVNode(
-													"button",
-													{
-														type: "button",
-														className: group.reactedByMe ? "reaction-chip is-mine" : "reaction-chip",
-														"aria-pressed": group.reactedByMe,
-														"aria-label": `${chat_REACTION_LABELS[group.token]}, ${group.count} ${group.count === 1 ? "reaction" : "reactions"}`,
-														onClick: () => handle_toggle_reaction(group.token, group.reactedByMe),
-														children: [
-															/* @__PURE__ */ createVNode("span", {
-																"aria-hidden": "true",
-																children: chat_REACTION_EMOJI[group.token],
-															}),
-															/* @__PURE__ */ createVNode("span", {
-																className: "reaction-chip-count",
-																children: group.count,
-															}),
-														],
-													},
-													group.token,
+											className: "message-reactions-unknown",
+											children: "Reactions unavailable",
+										})
+									: props.reactionGroups.length > 0
+										? /* @__PURE__ */ createVNode("div", {
+												className: "message-reactions",
+												children: props.reactionGroups.map((group) =>
+													/* @__PURE__ */ createVNode(
+														"button",
+														{
+															type: "button",
+															className: group.reactedByMe ? "reaction-chip is-mine" : "reaction-chip",
+															"aria-pressed": group.reactedByMe,
+															"aria-label": `${chat_REACTION_LABELS[group.token]}, ${group.count} ${group.count === 1 ? "reaction" : "reactions"}`,
+															onClick: () => handle_toggle_reaction(group.token, group.reactedByMe),
+															children: [
+																/* @__PURE__ */ createVNode("span", {
+																	"aria-hidden": "true",
+																	children: chat_REACTION_EMOJI[group.token],
+																}),
+																/* @__PURE__ */ createVNode("span", {
+																	className: "reaction-chip-count",
+																	children: group.count,
+																}),
+															],
+														},
+														group.token,
+													),
 												),
-											),
+											})
+										: null,
+								hasThreadSummary && typeof props.replyCount === "number"
+									? /* @__PURE__ */ createVNode("button", {
+											ref: props.replyTriggerRef ?? void 0,
+											type: "button",
+											className: "message-thread-summary",
+											onClick: () => props.onOpenThread?.(doc),
+											children: `${chat_format_reply_count(props.replyCount, props.repliesHasMore)} ${props.replyCount === 1 ? "reply" : "replies"}`,
 										})
 									: null,
 							],
@@ -12139,22 +13075,17 @@ function MessageRow(props) {
 				? /* @__PURE__ */ createVNode("div", {
 						className: "message-actions",
 						children: [
-							props.onOpenThread !== null && props.replyCount !== null
+							props.onOpenThread !== null && props.replyCount !== null && !hasThreadSummary
 								? /* @__PURE__ */ createVNode("button", {
 										ref: props.replyTriggerRef ?? void 0,
 										type: "button",
 										className: "button message-action",
 										onClick: () => props.onOpenThread?.(doc),
-										children:
-											props.replyCount === "unknown"
-												? "View thread"
-												: props.replyCount === 0
-													? "Reply in thread"
-													: `${chat_format_reply_count(props.replyCount, props.repliesHasMore)} ${props.replyCount === 1 ? "reply" : "replies"}`,
+										children: props.replyCount === "unknown" ? "View thread" : "Reply in thread",
 									})
 								: null,
 							/* @__PURE__ */ createVNode(AddReactionButton, {
-								groups: props.reactionGroups,
+								groups: props.reactionGroups === "unknown" ? [] : props.reactionGroups,
 								onPick: handle_toggle_reaction,
 							}),
 							isOwn
@@ -12230,8 +13161,14 @@ function MessageRow(props) {
 }
 function PendingRow(props) {
 	return /* @__PURE__ */ createVNode("li", {
-		className: props.pending.status === "failed" ? "message is-pending is-failed" : "message is-pending",
+		className:
+			props.pending.status === "failed" ? "message is-leader is-pending is-failed" : "message is-leader is-pending",
 		children: [
+			/* @__PURE__ */ createVNode("span", {
+				className: "message-avatar",
+				"aria-hidden": "true",
+				children: "•",
+			}),
 			/* @__PURE__ */ createVNode("div", {
 				className: "message-head",
 				children: [
@@ -12273,10 +13210,26 @@ function PendingRow(props) {
 		],
 	});
 }
+/**
+ * What a dead subscription means for one part of the channel. `subject` names that part, so each
+ * dead view says what stopped updating instead of all of them sharing one vague sentence.
+ */
+function watch_death_message(reason, subject) {
+	if (reason === "denied") return `Chitchat can no longer read ${subject}. Reload the page to try again.`;
+	if (reason === "session_expired")
+		return `This Chitchat session expired, so ${subject} stopped updating. Reload the page to continue.`;
+	if (reason === "unavailable")
+		return `Chitchat cannot reach ${subject} right now. Nothing here will update until the connection returns.`;
+	if (reason === "capacity")
+		return `Chitchat has too many live views open, so ${subject} stopped updating. Close a thread, or reload the page.`;
+	return `Chitchat stopped reading ${subject}. Reload the page to try again.`;
+}
 function ThreadPanel(props) {
 	const { client, userId, root, memberNames } = props;
 	const [replies, setReplies] = useState([]);
 	const [repliesLoaded, setRepliesLoaded] = useState(false);
+	const [repliesTruncated, setRepliesTruncated] = useState(false);
+	const [repliesDeath, setRepliesDeath] = useState(null);
 	const storeRef = useRef(null);
 	const closeButtonRef = useRef(null);
 	useEffect(() => {
@@ -12291,11 +13244,17 @@ function ThreadPanel(props) {
 				keyPrefix: chat_reply_key_prefix(root.key),
 				limit: 100,
 			},
-			(docs) => {
-				if (docs === null) return;
-				store.apply_window(docs);
+			(update, info) => {
+				if (update === null) {
+					setRepliesDeath({ reason: info?.reason });
+					setRepliesLoaded(true);
+					return;
+				}
+				setRepliesDeath(null);
+				store.apply_window(update.docs);
 				setReplies(store.get_sorted());
 				setRepliesLoaded(true);
+				setRepliesTruncated(update.truncated);
 			},
 		);
 	}, [client, root.key]);
@@ -12308,10 +13267,15 @@ function ThreadPanel(props) {
 			storeRef.current?.apply_local(doc);
 			setReplies(storeRef.current?.get_sorted() ?? []);
 		},
+		onStorageFull: props.onStorageFull,
 	});
 	useEffect(() => {
-		const ids = [...new Set(replies.map((doc) => doc.createdBy))];
-		if (ids.length > 0) memberNames.resolve(ids);
+		const ids = /* @__PURE__ */ new Set();
+		for (const doc of replies) {
+			ids.add(doc.createdBy);
+			for (const id of doc.value.mentions ?? []) ids.add(id);
+		}
+		if (ids.size > 0) memberNames.resolve([...ids]);
 	}, [replies, memberNames]);
 	const handle_key_down = (event) => {
 		if (event.key === "Escape") {
@@ -12319,6 +13283,7 @@ function ThreadPanel(props) {
 			props.onClose();
 		}
 	};
+	const replyEntries = build_message_entries([...replies].reverse(), Date.now());
 	return /* @__PURE__ */ createVNode("section", {
 		className: "thread",
 		"aria-label": "Thread",
@@ -12336,7 +13301,7 @@ function ThreadPanel(props) {
 						type: "button",
 						className: "button",
 						onClick: props.onClose,
-						children: "Close thread",
+						children: props.isNarrow ? "Back to messages" : "Close thread",
 					}),
 				],
 			}),
@@ -12347,6 +13312,9 @@ function ThreadPanel(props) {
 					collection: "messages",
 					doc: root,
 					isOwn: root.createdBy === userId,
+					selfUserId: userId,
+					memberNames,
+					isContinuation: false,
 					authorName: memberNames.get(root.createdBy),
 					reactionGroups: props.reactionGroupsByTarget.get(root.key) ?? [],
 					replyCount: null,
@@ -12354,8 +13322,23 @@ function ThreadPanel(props) {
 					onOpenThread: null,
 					replyTriggerRef: null,
 					onApplyLocal: props.onApplyLocalRoot,
+					onStorageFull: props.onStorageFull,
 				}),
 			}),
+			repliesDeath !== null
+				? /* @__PURE__ */ createVNode("div", {
+						className: "channel-status is-error",
+						role: "alert",
+						children: watch_death_message(repliesDeath.reason, "the replies in this thread"),
+					})
+				: null,
+			repliesTruncated
+				? /* @__PURE__ */ createVNode("div", {
+						className: "channel-status",
+						role: "status",
+						children: "Only the newest 100 replies are shown.",
+					})
+				: null,
 			!repliesLoaded
 				? /* @__PURE__ */ createVNode("div", {
 						className: "channel-status",
@@ -12370,27 +13353,40 @@ function ThreadPanel(props) {
 					: /* @__PURE__ */ createVNode("ul", {
 							className: "message-list thread-replies",
 							children: [
-								[...replies].reverse().map((doc) =>
-									/* @__PURE__ */ createVNode(
-										MessageRow,
-										{
-											client,
-											collection: "replies",
-											doc,
-											isOwn: doc.createdBy === userId,
-											authorName: memberNames.get(doc.createdBy),
-											reactionGroups: props.reactionGroupsByTarget.get(doc.key) ?? [],
-											replyCount: null,
-											repliesHasMore: false,
-											onOpenThread: null,
-											replyTriggerRef: null,
-											onApplyLocal: (updated) => {
-												storeRef.current?.apply_local(updated);
-												setReplies(storeRef.current?.get_sorted() ?? []);
-											},
-										},
-										doc.key,
-									),
+								replyEntries.map((entry) =>
+									entry.kind === "divider"
+										? /* @__PURE__ */ createVNode(
+												"li",
+												{
+													className: "day-divider",
+													children: entry.label,
+												},
+												entry.key,
+											)
+										: /* @__PURE__ */ createVNode(
+												MessageRow,
+												{
+													client,
+													collection: "replies",
+													doc: entry.doc,
+													isOwn: entry.doc.createdBy === userId,
+													selfUserId: userId,
+													memberNames,
+													isContinuation: entry.isContinuation,
+													authorName: memberNames.get(entry.doc.createdBy),
+													reactionGroups: props.reactionGroupsByTarget.get(entry.doc.key) ?? [],
+													replyCount: null,
+													repliesHasMore: false,
+													onOpenThread: null,
+													replyTriggerRef: null,
+													onApplyLocal: (updated) => {
+														storeRef.current?.apply_local(updated);
+														setReplies(storeRef.current?.get_sorted() ?? []);
+													},
+													onStorageFull: props.onStorageFull,
+												},
+												entry.doc.key,
+											),
 								),
 								queue.pending.map((pending) =>
 									/* @__PURE__ */ createVNode(
@@ -12404,14 +13400,37 @@ function ThreadPanel(props) {
 								),
 							],
 						}),
+			props.storageFull !== null
+				? /* @__PURE__ */ createVNode("div", {
+						className: "channel-status is-error",
+						role: "alert",
+						children: props.storageFull,
+					})
+				: null,
 			/* @__PURE__ */ createVNode(Composer, {
 				client,
 				label: "Reply in thread",
 				busy: queue.busy,
+				disabled: props.storageFull !== null || repliesDeath !== null,
 				onSend: queue.send,
 			}),
 		],
 	});
+}
+/**
+ * How much newer a private send must be than the channel doc's `lastMessageAt` before the sender
+ * stamps it again. One stamp per burst keeps the doubled write inside the send rate budget.
+ */
+var PRIVATE_STAMP_DEBOUNCE_MS = 15e3;
+/**
+ * Whether a companion window can speak for one row. A window with nothing older left covers
+ * everything; otherwise it covers only roots strictly newer than the deepest root it delivered.
+ * An incomplete window covers nothing, because the gap could be anywhere inside its range, and a
+ * dead one covers nothing, because it stopped hearing about changes anywhere in its range.
+ */
+function companion_covers_root(coverage, rootKey) {
+	if (coverage.incomplete || coverage.death !== null) return false;
+	return !coverage.hasMore || (coverage.deepestRoot !== null && rootKey < coverage.deepestRoot);
 }
 /**
  * Message and reply keys are `<channel uuid (36)>:<inverted ms (13)>:<rand (4)>...`, so the
@@ -12419,15 +13438,40 @@ function ThreadPanel(props) {
  * (reactions, replies) extend a root key, so the same slice normalizes them all.
  */
 var ROOT_KEY_LENGTH = 55;
+/** How many documents one deep-history page asks for. The route's own ceiling is 100. */
+var DEEP_HISTORY_PAGE_SIZE = 100;
+/** §5's floors: the log never goes under 420px, and the thread panel never under 244px. */
+var MIN_LOG_WIDTH = 420;
+var MIN_THREAD_WIDTH = 244;
+var DEFAULT_THREAD_WIDTH = 340;
+/** One arrow press on the thread separator. */
+var THREAD_RESIZE_STEP = 16;
+/**
+ * Reads `retryAfterMs` out of a 429 body. The body is whatever the route sent, so a bad shape or
+ * unparseable text answers null and the caller falls back to a short wait.
+ */
+function read_retry_after_ms(responseText) {
+	if (typeof responseText !== "string") return null;
+	let parsed;
+	try {
+		parsed = JSON.parse(responseText);
+	} catch {
+		return null;
+	}
+	if (typeof parsed !== "object" || parsed === null) return null;
+	const value = parsed.retryAfterMs;
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
 /**
  * One open channel: message log, reactive document windows, composer, and thread panel.
  * The parent keys this component by channel key, so every mount owns exactly one channel.
  */
 function ChannelView(props) {
-	const { client, userId, channel, memberNames, announce } = props;
+	const { client, userId, channel, memberNames, announce, threadRootKey, setThreadRootKey, isNarrow, onNewestVisible } =
+		props;
 	const [messages, setMessages] = useState([]);
 	const [messagesLoaded, setMessagesLoaded] = useState(false);
-	const [messagesDead, setMessagesDead] = useState(false);
+	const [messagesDeath, setMessagesDeath] = useState(null);
 	const [messagesWindow, setMessagesWindow] = useState({
 		hasMore: false,
 		atCapacity: false,
@@ -12435,11 +13479,22 @@ function ChannelView(props) {
 	});
 	const [reactionDocs, setReactionDocs] = useState([]);
 	const [channelReplies, setChannelReplies] = useState([]);
+	const [reactionCoverage, setReactionCoverage] = useState({
+		hasMore: false,
+		deepestRoot: null,
+		incomplete: false,
+		death: null,
+	});
 	const [replyCoverage, setReplyCoverage] = useState({
 		hasMore: false,
 		deepestRoot: null,
+		incomplete: false,
+		death: null,
 	});
-	const [threadRootKey, setThreadRootKey] = useState(null);
+	const [storageFull, setStorageFull] = useState(null);
+	const [deepHistory, setDeepHistory] = useState({ kind: "idle" });
+	const [threadWidth, setThreadWidth] = useState(DEFAULT_THREAD_WIDTH);
+	const [bodyWidth, setBodyWidth] = useState(0);
 	const messagesStoreRef = useRef(null);
 	const messagesWindowRef = useRef(null);
 	const reactionsWindowRef = useRef(null);
@@ -12447,6 +13502,10 @@ function ChannelView(props) {
 	const reactionsCoverageRef = useRef(null);
 	const repliesCoverageRef = useRef(null);
 	const oldestRootRef = useRef(null);
+	const windowOldestKeyRef = useRef(null);
+	/** The last key the previous HTTP page returned. The next page continues strictly after it. */
+	const httpOldestKeyRef = useRef(null);
+	const channelBodyRef = useRef(null);
 	const channelNameRef = useRef(channel.value.name);
 	const seenKeysRef = useRef(null);
 	const replyTriggersRef = useRef(/* @__PURE__ */ new Map());
@@ -12483,21 +13542,25 @@ function ChannelView(props) {
 				keyPrefix: chat_message_key_prefix(channel.key),
 				pageSize: 100,
 			},
-			(update) => {
+			(update, info) => {
 				if (update === null) {
-					setMessagesDead(true);
+					setMessagesDeath({ reason: info?.reason });
 					return;
 				}
 				const windowDocs = store.apply_window(update.docs);
-				const sorted = store.get_sorted();
-				setMessages(sorted);
+				setMessages(store.get_sorted());
 				setMessagesLoaded(true);
 				setMessagesWindow({
 					hasMore: update.hasMore,
 					atCapacity: update.atCapacity,
 					incomplete: update.incomplete,
 				});
-				oldestRootRef.current = sorted.length > 0 ? sorted[sorted.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null;
+				const windowOldestKey = windowDocs.reduce(
+					(oldest, doc) => (oldest === null || doc.key > oldest ? doc.key : oldest),
+					null,
+				);
+				windowOldestKeyRef.current = windowOldestKey;
+				oldestRootRef.current = windowOldestKey === null ? null : windowOldestKey.slice(0, ROOT_KEY_LENGTH);
 				evaluate_companion_catch_up();
 				const seen = seenKeysRef.current;
 				if (seen === null) {
@@ -12538,18 +13601,30 @@ function ChannelView(props) {
 				keyPrefix: chat_message_key_prefix(channel.key),
 				pageSize: 100,
 			},
-			(update) => {
+			(update, info) => {
 				if (update === null) {
 					reactionsCoverageRef.current = null;
+					setReactionCoverage((previous) => ({
+						...previous,
+						death: { reason: info?.reason },
+					}));
 					return;
 				}
 				const validated = store.apply_window(update.docs);
 				setReactionDocs(validated);
+				const deepestRoot = validated.length > 0 ? validated[validated.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null;
 				reactionsCoverageRef.current = {
 					hasMore: update.hasMore,
 					atCapacity: update.atCapacity,
-					deepestRoot: validated.length > 0 ? validated[validated.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null,
+					deepestRoot,
+					incomplete: update.incomplete,
 				};
+				setReactionCoverage({
+					hasMore: update.hasMore,
+					deepestRoot,
+					incomplete: update.incomplete,
+					death: null,
+				});
 				evaluate_companion_catch_up();
 			},
 		);
@@ -12568,9 +13643,13 @@ function ChannelView(props) {
 				keyPrefix: chat_message_key_prefix(channel.key),
 				pageSize: 100,
 			},
-			(update) => {
+			(update, info) => {
 				if (update === null) {
 					repliesCoverageRef.current = null;
+					setReplyCoverage((previous) => ({
+						...previous,
+						death: { reason: info?.reason },
+					}));
 					return;
 				}
 				const validated = store.apply_window(update.docs);
@@ -12580,10 +13659,13 @@ function ChannelView(props) {
 					hasMore: update.hasMore,
 					atCapacity: update.atCapacity,
 					deepestRoot,
+					incomplete: update.incomplete,
 				};
 				setReplyCoverage({
 					hasMore: update.hasMore,
 					deepestRoot,
+					incomplete: update.incomplete,
+					death: null,
 				});
 				evaluate_companion_catch_up();
 			},
@@ -12595,6 +13677,37 @@ function ChannelView(props) {
 			watchWindow.unsubscribe();
 		};
 	}, [client, channel.key]);
+	/**
+	 * §7.4's private-channel mitigation: after a successful append in a private channel the
+	 * sender stamps `lastMessageAt` on the channel doc, because a rangeless read never sees a
+	 * private scope and members with the channel closed have nothing else to say "unread" from.
+	 * Compare-and-set so a concurrent rename is not clobbered; a lost race parks the timestamp
+	 * and the effect below retries once from the fresher doc the channels watch delivers.
+	 */
+	const stampRetryRef = useRef(null);
+	const stamp_last_message = (channelDoc, at) => {
+		client.data
+			.put({
+				collection: "channels",
+				key: channelDoc.key,
+				value: {
+					...channelDoc.value,
+					lastMessageAt: at,
+				},
+				expectedRevision: channelDoc.revision,
+			})
+			.then((result) => {
+				if ("_nay" in result && result._nay.name === "conflict" && stampRetryRef.current === null)
+					stampRetryRef.current = at;
+			})
+			.catch(() => {});
+	};
+	useEffect(() => {
+		const at = stampRetryRef.current;
+		if (at === null) return;
+		stampRetryRef.current = null;
+		if ((channel.value.lastMessageAt ?? 0) < at) stamp_last_message(channel, at);
+	}, [channel]);
 	const queue = use_send_queue({
 		client,
 		collection: "messages",
@@ -12604,14 +13717,29 @@ function ChannelView(props) {
 			messagesStoreRef.current?.apply_local(doc);
 			seenKeysRef.current?.add(doc.key);
 			setMessages(messagesStoreRef.current?.get_sorted() ?? []);
+			if (
+				chat_channel_is_private(channel.key) &&
+				doc.timestamp - (channel.value.lastMessageAt ?? 0) >= PRIVATE_STAMP_DEBOUNCE_MS
+			)
+				stamp_last_message(channel, doc.timestamp);
 		},
+		onStorageFull: setStorageFull,
 	});
 	useEffect(() => {
 		const ids = /* @__PURE__ */ new Set();
-		for (const doc of messages) ids.add(doc.createdBy);
-		for (const doc of channelReplies) ids.add(doc.createdBy);
+		for (const doc of messages) {
+			ids.add(doc.createdBy);
+			for (const id of doc.value.mentions ?? []) ids.add(id);
+		}
+		for (const doc of channelReplies) {
+			ids.add(doc.createdBy);
+			for (const id of doc.value.mentions ?? []) ids.add(id);
+		}
 		if (ids.size > 0) memberNames.resolve([...ids]);
 	}, [messages, channelReplies, memberNames]);
+	useEffect(() => {
+		if (messages.length > 0) onNewestVisible(messages[0].timestamp);
+	}, [messages, onNewestVisible]);
 	useEffect(() => {
 		const newestKey = messages.length > 0 ? messages[0].key : null;
 		const newestChanged = newestKey !== null && newestKey !== newestKeyRef.current;
@@ -12622,6 +13750,124 @@ function ChannelView(props) {
 	}, [messages, queue.pending.length]);
 	const handle_load_older = () => {
 		messagesWindowRef.current?.loadOlder();
+	};
+	/**
+	 * Once the window has spent its intervals, older history comes over HTTP instead.
+	 *
+	 * The continuation is a fencepost, not a cursor. The route now takes a cursor beside a key range,
+	 * but it binds each cursor to the exact range it was issued for and refuses one sent back with a
+	 * different range. A fencepost is just a key, so it needs no such binding and it survives a page
+	 * reload. The first press continues from the window's own oldest key, so nothing the window
+	 * already holds is fetched again.
+	 */
+	const handle_load_older_http = () => {
+		const fencepost = httpOldestKeyRef.current ?? windowOldestKeyRef.current;
+		if (fencepost === null) return;
+		setDeepHistory({ kind: "loading" });
+		client
+			.fetchJson("/api/v1/plugin-data/list", {
+				body: {
+					collection: "messages",
+					keyPrefix: chat_message_key_prefix(channel.key),
+					keyStartExclusive: fencepost,
+					limit: DEEP_HISTORY_PAGE_SIZE,
+				},
+			})
+			.then((raw) => {
+				const parsed = chat_plugin_data_list_response_schema.safeParse(raw);
+				if (!parsed.success) {
+					setDeepHistory({
+						kind: "failed",
+						message: "Unexpected response for older messages.",
+						retryAt: null,
+					});
+					return;
+				}
+				const store = messagesStoreRef.current;
+				if (store === null) return;
+				const merged = store.apply_window(parsed.data.documents);
+				setMessages(store.get_sorted());
+				for (const doc of merged) {
+					seenKeysRef.current?.add(doc.key);
+					if (httpOldestKeyRef.current === null || doc.key > httpOldestKeyRef.current)
+						httpOldestKeyRef.current = doc.key;
+				}
+				setDeepHistory(parsed.data.isDone ? { kind: "exhausted" } : { kind: "idle" });
+			})
+			.catch((error) => {
+				if (error.status !== 429) {
+					setDeepHistory({
+						kind: "failed",
+						message: chat_get_error_message(error),
+						retryAt: null,
+					});
+					return;
+				}
+				const retryAfterMs = read_retry_after_ms(error.responseText) ?? 1e3;
+				setDeepHistory({
+					kind: "failed",
+					message: "Older messages are being loaded too quickly. Waiting a moment before you can try again.",
+					retryAt: Date.now() + retryAfterMs,
+				});
+			});
+	};
+	useEffect(() => {
+		if (deepHistory.kind !== "failed" || deepHistory.retryAt === null) return;
+		const timer = setTimeout(
+			() => {
+				setDeepHistory({ kind: "idle" });
+			},
+			Math.max(0, deepHistory.retryAt - Date.now()),
+		);
+		return () => {
+			clearTimeout(timer);
+		};
+	}, [deepHistory]);
+	useEffect(() => {
+		const body = channelBodyRef.current;
+		if (threadRootKey === null || body === null) return;
+		setBodyWidth(body.clientWidth);
+		const observer = new ResizeObserver(() => setBodyWidth(body.clientWidth));
+		observer.observe(body);
+		return () => observer.disconnect();
+	}, [threadRootKey]);
+	/**
+	 * Moves the separator between the log and the thread panel.
+	 *
+	 * `.thread` takes its width from `--thread-width` as a flex basis, so writing `width` would
+	 * move nothing. The clamp keeps §5's two floors; when the container is too narrow to hold both
+	 * (or has not been laid out yet, so its width reads 0) the maximum collapses onto the minimum
+	 * and the separator simply does not move.
+	 *
+	 * The stored width is the member's preference and is never rewritten by a resize. Only what the
+	 * panel actually gets, and what the separator announces, pass through this clamp — so shrinking
+	 * the window and growing it back returns the panel to the width they chose.
+	 */
+	const clamp_thread_width = (width) => {
+		const maximum = Math.max(MIN_THREAD_WIDTH, bodyWidth - MIN_LOG_WIDTH);
+		return Math.min(maximum, Math.max(MIN_THREAD_WIDTH, width));
+	};
+	const handle_resize_key_down = (event) => {
+		if (event.key === "ArrowLeft") {
+			event.preventDefault();
+			setThreadWidth(clamp_thread_width(threadWidth + THREAD_RESIZE_STEP));
+		} else if (event.key === "ArrowRight") {
+			event.preventDefault();
+			setThreadWidth(clamp_thread_width(threadWidth - THREAD_RESIZE_STEP));
+		} else if (event.key === "Home") {
+			event.preventDefault();
+			setThreadWidth(clamp_thread_width(DEFAULT_THREAD_WIDTH));
+		}
+	};
+	const handle_resize_pointer_down = (event) => {
+		event.preventDefault();
+		event.currentTarget.setPointerCapture(event.pointerId);
+	};
+	const handle_resize_pointer_move = (event) => {
+		if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+		const bounds = channelBodyRef.current?.getBoundingClientRect();
+		if (bounds === void 0) return;
+		setThreadWidth(clamp_thread_width(bounds.right - event.clientX));
 	};
 	const reactionGroupsByTarget = useMemo(() => chat_group_reactions(reactionDocs, userId), [reactionDocs, userId]);
 	const replyCounts = useMemo(() => chat_count_replies(channelReplies), [channelReplies]);
@@ -12635,17 +13881,16 @@ function ChannelView(props) {
 		if (key !== null) replyTriggersRef.current.get(key)?.focus();
 	};
 	const threadRoot = threadRootKey === null ? null : (messages.find((doc) => doc.key === threadRootKey) ?? null);
-	if (messagesDead)
+	const messageEntries = build_message_entries([...messages].reverse(), Date.now());
+	const threadWidthMaximum = Math.max(MIN_THREAD_WIDTH, bodyWidth - MIN_LOG_WIDTH);
+	const threadWidthEffective = clamp_thread_width(threadWidth);
+	if (messagesDeath !== null)
 		return /* @__PURE__ */ createVNode("div", {
 			className: "channel",
 			children: /* @__PURE__ */ createVNode("div", {
 				className: "channel-dead",
 				role: "alert",
-				children: [
-					"Access to messages in #",
-					channel.value.name,
-					" ended. Your permissions may have changed — reload the page to try again.",
-				],
+				children: watch_death_message(messagesDeath.reason, `messages in #${channel.value.name}`),
 			}),
 		});
 	return /* @__PURE__ */ createVNode("div", {
@@ -12654,9 +13899,26 @@ function ChannelView(props) {
 			/* @__PURE__ */ createVNode("header", {
 				className: "channel-head",
 				children: [
-					/* @__PURE__ */ createVNode("h2", {
-						className: "channel-title",
-						children: ["#", channel.value.name],
+					/* @__PURE__ */ createVNode("div", {
+						className: "channel-head-main",
+						children: [
+							/* @__PURE__ */ createVNode("h2", {
+								className: "channel-title",
+								children: ["#", channel.value.name],
+							}),
+							channel.value.topic !== void 0 && channel.value.topic !== ""
+								? /* @__PURE__ */ createVNode("p", {
+										className: "channel-topic",
+										children: channel.value.topic,
+									})
+								: null,
+							chat_channel_is_private(channel.key)
+								? /* @__PURE__ */ createVNode("p", {
+										className: "channel-privacy",
+										children: chat_PRIVATE_CHANNEL_DISCLOSURE,
+									})
+								: null,
+						],
 					}),
 					channel.value.archivedAt !== null
 						? /* @__PURE__ */ createVNode("span", {
@@ -12667,7 +13929,9 @@ function ChannelView(props) {
 				],
 			}),
 			/* @__PURE__ */ createVNode("div", {
+				ref: channelBodyRef,
 				className: "channel-body",
+				style: { "--thread-width": `${threadWidthEffective}px` },
 				children: [
 					/* @__PURE__ */ createVNode("div", {
 						ref: logRef,
@@ -12689,15 +13953,65 @@ function ChannelView(props) {
 								: null,
 							messagesLoaded && messagesWindow.hasMore && messagesWindow.atCapacity
 								? /* @__PURE__ */ createVNode("div", {
-										className: "channel-status",
-										children: "Older messages can't be loaded right now.",
+										className: "log-older",
+										children: [
+											/* @__PURE__ */ createVNode("span", {
+												className: "channel-status",
+												role: "status",
+												children:
+													deepHistory.kind === "loading"
+														? "Loading older messages…"
+														: deepHistory.kind === "exhausted"
+															? `You have reached the start of #${channel.value.name}.`
+															: "The live view stopped growing. Older messages load on request.",
+											}),
+											deepHistory.kind === "exhausted"
+												? null
+												: /* @__PURE__ */ createVNode("button", {
+														type: "button",
+														className: "button",
+														disabled:
+															deepHistory.kind === "loading" ||
+															(deepHistory.kind === "failed" && deepHistory.retryAt !== null),
+														onClick: handle_load_older_http,
+														children: "Load older messages",
+													}),
+											deepHistory.kind === "failed"
+												? /* @__PURE__ */ createVNode("span", {
+														className: "channel-status is-error",
+														role: "alert",
+														children: deepHistory.message,
+													})
+												: null,
+										],
 									})
 								: null,
 							messagesWindow.incomplete
 								? /* @__PURE__ */ createVNode("div", {
 										className: "channel-status",
 										role: "alert",
-										children: "Some messages in this range could not be loaded.",
+										children: "Older messages in view may be out of date.",
+									})
+								: null,
+							reactionCoverage.incomplete || replyCoverage.incomplete
+								? /* @__PURE__ */ createVNode("div", {
+										className: "channel-status",
+										role: "alert",
+										children: "Some reactions and replies in this range could not be loaded.",
+									})
+								: null,
+							reactionCoverage.death !== null
+								? /* @__PURE__ */ createVNode("div", {
+										className: "channel-status is-error",
+										role: "alert",
+										children: watch_death_message(reactionCoverage.death.reason, "reactions in this channel"),
+									})
+								: null,
+							replyCoverage.death !== null
+								? /* @__PURE__ */ createVNode("div", {
+										className: "channel-status is-error",
+										role: "alert",
+										children: watch_death_message(replyCoverage.death.reason, "reply counts in this channel"),
 									})
 								: null,
 							!messagesLoaded
@@ -12714,32 +14028,50 @@ function ChannelView(props) {
 									: /* @__PURE__ */ createVNode("ul", {
 											className: "message-list",
 											children: [
-												[...messages].reverse().map((doc) =>
-													/* @__PURE__ */ createVNode(
-														MessageRow,
-														{
-															client,
-															collection: "messages",
-															doc,
-															isOwn: doc.createdBy === userId,
-															authorName: memberNames.get(doc.createdBy),
-															reactionGroups: reactionGroupsByTarget.get(doc.key) ?? [],
-															replyCount:
-																!replyCoverage.hasMore ||
-																(replyCoverage.deepestRoot !== null &&
-																	doc.key.slice(0, ROOT_KEY_LENGTH) < replyCoverage.deepestRoot)
-																	? (replyCounts.get(doc.key) ?? 0)
-																	: "unknown",
-															repliesHasMore: replyCoverage.hasMore,
-															onOpenThread: (root) => setThreadRootKey(root.key),
-															replyTriggerRef: (el) => {
-																if (el === null) replyTriggersRef.current.delete(doc.key);
-																else replyTriggersRef.current.set(doc.key, el);
-															},
-															onApplyLocal: apply_local_message,
-														},
-														doc.key,
-													),
+												messageEntries.map((entry) =>
+													entry.kind === "divider"
+														? /* @__PURE__ */ createVNode(
+																"li",
+																{
+																	className: "day-divider",
+																	children: entry.label,
+																},
+																entry.key,
+															)
+														: /* @__PURE__ */ createVNode(
+																MessageRow,
+																{
+																	client,
+																	collection: "messages",
+																	doc: entry.doc,
+																	isOwn: entry.doc.createdBy === userId,
+																	selfUserId: userId,
+																	memberNames,
+																	isContinuation: entry.isContinuation,
+																	authorName: memberNames.get(entry.doc.createdBy),
+																	reactionGroups: companion_covers_root(
+																		reactionCoverage,
+																		entry.doc.key.slice(0, ROOT_KEY_LENGTH),
+																	)
+																		? (reactionGroupsByTarget.get(entry.doc.key) ?? [])
+																		: "unknown",
+																	replyCount: companion_covers_root(
+																		replyCoverage,
+																		entry.doc.key.slice(0, ROOT_KEY_LENGTH),
+																	)
+																		? (replyCounts.get(entry.doc.key) ?? 0)
+																		: "unknown",
+																	repliesHasMore: replyCoverage.hasMore,
+																	onOpenThread: (root) => setThreadRootKey(root.key),
+																	replyTriggerRef: (el) => {
+																		if (el === null) replyTriggersRef.current.delete(entry.doc.key);
+																		else replyTriggersRef.current.set(entry.doc.key, el);
+																	},
+																	onApplyLocal: apply_local_message,
+																	onStorageFull: setStorageFull,
+																},
+																entry.doc.key,
+															),
 												),
 												queue.pending.map((pending) =>
 													/* @__PURE__ */ createVNode(
@@ -12756,6 +14088,22 @@ function ChannelView(props) {
 						],
 					}),
 					threadRoot !== null
+						? /* @__PURE__ */ createVNode("div", {
+								className: "thread-resize",
+								role: "separator",
+								tabIndex: 0,
+								"aria-orientation": "vertical",
+								"aria-label": "Resize thread panel",
+								"aria-valuenow": threadWidthEffective,
+								"aria-valuemin": MIN_THREAD_WIDTH,
+								"aria-valuemax": threadWidthMaximum,
+								onKeyDown: handle_resize_key_down,
+								onPointerDown: handle_resize_pointer_down,
+								onPointerMove: handle_resize_pointer_move,
+								onDoubleClick: () => setThreadWidth(clamp_thread_width(DEFAULT_THREAD_WIDTH)),
+							})
+						: null,
+					threadRoot !== null
 						? /* @__PURE__ */ createVNode(
 								ThreadPanel,
 								{
@@ -12764,6 +14112,9 @@ function ChannelView(props) {
 									root: threadRoot,
 									reactionGroupsByTarget,
 									memberNames,
+									isNarrow,
+									storageFull,
+									onStorageFull: setStorageFull,
 									onApplyLocalRoot: apply_local_message,
 									onClose: handle_close_thread,
 								},
@@ -12772,10 +14123,18 @@ function ChannelView(props) {
 						: null,
 				],
 			}),
+			storageFull !== null
+				? /* @__PURE__ */ createVNode("div", {
+						className: "channel-status is-error",
+						role: "alert",
+						children: storageFull,
+					})
+				: null,
 			/* @__PURE__ */ createVNode(Composer, {
 				client,
 				label: `Message #${channel.value.name}`,
 				busy: queue.busy,
+				disabled: storageFull !== null,
 				onSend: queue.send,
 			}),
 		],
@@ -12793,18 +14152,28 @@ function ChannelView(props) {
  * rebuild the subscription and its accumulated store — collapsing "Load older" history
  * back to the newest window on every remote arrival.
  */
+/**
+ * How long a resolved name is trusted. A member can change their display name, and a member who was
+ * not in the workspace yet resolves to null — both are permanent in a cache that never expires, and
+ * a page open all day is the ordinary case for a chat plugin.
+ */
+var MEMBER_NAME_MAX_AGE_MS = 300 * 1e3;
 function use_member_names(client) {
 	const namesRef = useRef(/* @__PURE__ */ new Map());
-	const requestedRef = useRef(/* @__PURE__ */ new Set());
+	const requestedRef = useRef(/* @__PURE__ */ new Map());
 	const [, setResolutionCount] = useState(0);
 	const get = useCallback((userId) => {
 		return namesRef.current.has(userId) ? namesRef.current.get(userId) : void 0;
 	}, []);
 	const resolve = useCallback(
 		async (userIds) => {
-			const missing = [...new Set(userIds)].filter((id) => !requestedRef.current.has(id));
+			const now = Date.now();
+			const missing = [...new Set(userIds)].filter((id) => {
+				const requestedAt = requestedRef.current.get(id);
+				return requestedAt === void 0 || now - requestedAt >= MEMBER_NAME_MAX_AGE_MS;
+			});
 			if (missing.length === 0) return;
-			for (const id of missing) requestedRef.current.add(id);
+			for (const id of missing) requestedRef.current.set(id, now);
 			for (let start = 0; start < missing.length; start += 50) {
 				const batch = missing.slice(start, start + 50);
 				try {
@@ -12826,10 +14195,108 @@ function use_member_names(client) {
 		[get, resolve],
 	);
 }
+/**
+ * Reads the first page of the roster once, when a dialog that needs it opens.
+ *
+ * One page only. A picker is a small list a person reads, so paging further would grow the dialog
+ * past what anybody scrolls; the dialog says so instead of pretending the list is complete.
+ */
+function use_roster(client) {
+	const [roster, setRoster] = useState(null);
+	useEffect(() => {
+		let cancelled = false;
+		client.members.list({ limit: 100 }).then((result) => {
+			if (cancelled) return;
+			if ("_nay" in result) {
+				setRoster({
+					members: [],
+					error: result._nay.message,
+					truncated: false,
+				});
+				return;
+			}
+			setRoster({
+				members: result._yay.members,
+				error: null,
+				truncated: result._yay.cursor !== null,
+			});
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [client]);
+	return roster;
+}
+/**
+ * The people picker both dialogs use.
+ *
+ * The caller is not in the list. They are in every private channel they create by definition, and a
+ * checkbox that cannot be unticked is a control that does nothing.
+ */
+function MemberPicker(props) {
+	const roster = use_roster(props.client);
+	if (roster === null)
+		return /* @__PURE__ */ createVNode("p", {
+			className: "channel-status",
+			role: "status",
+			children: "Loading people…",
+		});
+	if (roster.error !== null)
+		return /* @__PURE__ */ createVNode("p", {
+			className: "form-error",
+			role: "alert",
+			children: roster.error,
+		});
+	const others = roster.members
+		.filter((member) => member.userId !== props.selfUserId)
+		.sort((a, b) => (a.displayName ?? "").localeCompare(b.displayName ?? ""));
+	if (others.length === 0)
+		return /* @__PURE__ */ createVNode("p", {
+			className: "channel-status",
+			children: "Nobody else is in this workspace yet.",
+		});
+	return /* @__PURE__ */ createVNode(Fragment, {
+		children: [
+			/* @__PURE__ */ createVNode("ul", {
+				className: "people-list",
+				children: others.map((member) =>
+					/* @__PURE__ */ createVNode(
+						"li",
+						{
+							className: "people-item",
+							children: /* @__PURE__ */ createVNode("label", {
+								children: [
+									/* @__PURE__ */ createVNode("input", {
+										type: "checkbox",
+										checked: props.selected.includes(member.userId),
+										onChange: (event) => props.onToggle(member.userId, event.currentTarget.checked),
+									}),
+									member.displayName ?? "Someone with no name yet",
+								],
+							}),
+						},
+						member.userId,
+					),
+				),
+			}),
+			roster.truncated
+				? /* @__PURE__ */ createVNode("p", {
+						className: "channel-status",
+						children: "Showing the first 100 people in this workspace.",
+					})
+				: null,
+		],
+	});
+}
 function ChannelNameDialog(props) {
 	const titleId = useId();
 	const inputId = useId();
+	const topicId = useId();
+	const privateId = useId();
 	const [name, setName] = useState(props.initialName);
+	const [topic, setTopic] = useState(props.initialTopic);
+	const [isPrivate, setIsPrivate] = useState(false);
+	const [invited, setInvited] = useState([]);
 	const [validationError, setValidationError] = useState(null);
 	const handle_submit = () => {
 		if (props.busy) return;
@@ -12838,8 +14305,16 @@ function ChannelNameDialog(props) {
 			setValidationError(`Enter a name between 1 and 64 characters.`);
 			return;
 		}
+		const trimmedTopic = topic.trim();
+		if (trimmedTopic.length > 250) {
+			setValidationError(`Keep the topic under 250 characters.`);
+			return;
+		}
 		setValidationError(null);
-		props.onSubmit(trimmed);
+		props.onSubmit(trimmed, trimmedTopic, {
+			isPrivate,
+			userIds: invited,
+		});
 	};
 	const error = validationError ?? props.error;
 	return /* @__PURE__ */ createVNode(Dialog, {
@@ -12874,6 +14349,71 @@ function ChannelNameDialog(props) {
 					}),
 				],
 			}),
+			/* @__PURE__ */ createVNode("div", {
+				className: "field",
+				children: [
+					/* @__PURE__ */ createVNode("label", {
+						htmlFor: topicId,
+						children: "Topic (optional)",
+					}),
+					/* @__PURE__ */ createVNode("input", {
+						id: topicId,
+						type: "text",
+						value: topic,
+						maxLength: 250,
+						onInput: (event) => setTopic(event.currentTarget.value),
+						onKeyDown: (event) => {
+							if (event.key === "Enter") {
+								event.preventDefault();
+								handle_submit();
+							}
+						},
+					}),
+				],
+			}),
+			props.privacy !== null
+				? /* @__PURE__ */ createVNode("div", {
+						className: "field",
+						children: [
+							/* @__PURE__ */ createVNode("label", {
+								className: "checkbox-label",
+								htmlFor: privateId,
+								children: [
+									/* @__PURE__ */ createVNode("input", {
+										id: privateId,
+										type: "checkbox",
+										checked: isPrivate,
+										onChange: (event) => setIsPrivate(event.currentTarget.checked),
+									}),
+									"Private channel",
+								],
+							}),
+							isPrivate
+								? /* @__PURE__ */ createVNode(Fragment, {
+										children: [
+											/* @__PURE__ */ createVNode("p", {
+												className: "field-note",
+												children: chat_PRIVATE_CHANNEL_DISCLOSURE,
+											}),
+											/* @__PURE__ */ createVNode("p", {
+												className: "field-note",
+												children: "Tick one person for a direct message, or several for a group.",
+											}),
+											/* @__PURE__ */ createVNode(MemberPicker, {
+												client: props.privacy.client,
+												selfUserId: props.privacy.selfUserId,
+												selected: invited,
+												onToggle: (userId, selected) =>
+													setInvited((current) =>
+														selected ? [...current, userId] : current.filter((id) => id !== userId),
+													),
+											}),
+										],
+									})
+								: null,
+						],
+					})
+				: null,
 			error !== null
 				? /* @__PURE__ */ createVNode("p", {
 						className: "form-error",
@@ -12899,6 +14439,156 @@ function ChannelNameDialog(props) {
 						children: props.busy ? "Saving…" : props.submitLabel,
 					}),
 				],
+			}),
+		],
+	});
+}
+/**
+ * Who is in one private channel, and the only screen that changes it.
+ *
+ * The list comes from the server, not from what this page remembers writing: a colleague with
+ * `manage` may have changed it since, and after a reload the page knows nothing at all.
+ */
+function ChannelPeopleDialog(props) {
+	const titleId = useId();
+	const [principals, setPrincipals] = useState(null);
+	const [loaded, setLoaded] = useState(false);
+	const [busy, setBusy] = useState(false);
+	const [error, setError] = useState(null);
+	const reload = useCallback(() => {
+		return props.client.scopes.listPrincipals({ scopeId: props.channel.key }).then((result) => {
+			setPrincipals(result);
+			setLoaded(true);
+			if (result !== null) props.memberNames.resolve(result.map((principal) => principal.userId));
+			return result;
+		});
+	}, [props.client, props.channel.key, props.memberNames]);
+	useEffect(() => {
+		reload();
+	}, [reload]);
+	const change = (action) => {
+		setBusy(true);
+		setError(null);
+		action
+			.then((result) => {
+				if ("_nay" in result) {
+					setError(result._nay.message);
+					return;
+				}
+				return reload().then(() => void 0);
+			})
+			.finally(() => setBusy(false));
+	};
+	const inScope = new Set((principals ?? []).map((principal) => principal.userId));
+	const canManage = (principals ?? []).some(
+		(principal) => principal.userId === props.selfUserId && principal.level === "manage",
+	);
+	return /* @__PURE__ */ createVNode(Dialog, {
+		labelledBy: titleId,
+		onClose: props.onClose,
+		children: [
+			/* @__PURE__ */ createVNode("h2", {
+				id: titleId,
+				className: "dialog-title",
+				children: ["People in #", props.channel.value.name],
+			}),
+			/* @__PURE__ */ createVNode("p", {
+				className: "field-note",
+				children: chat_PRIVATE_CHANNEL_DISCLOSURE,
+			}),
+			!loaded
+				? /* @__PURE__ */ createVNode("p", {
+						className: "channel-status",
+						role: "status",
+						children: "Loading people…",
+					})
+				: principals === null
+					? /* @__PURE__ */ createVNode("p", {
+							className: "form-error",
+							role: "alert",
+							children: "This channel's people list is no longer readable. Reload the page.",
+						})
+					: /* @__PURE__ */ createVNode("ul", {
+							className: "people-list current-people",
+							"aria-label": "People in this channel",
+							children: principals.map((principal) =>
+								/* @__PURE__ */ createVNode(
+									"li",
+									{
+										className: "people-item",
+										children: [
+											/* @__PURE__ */ createVNode("span", {
+												children: [
+													props.memberNames.get(principal.userId) ?? principal.userId,
+													principal.level === "manage" ? " (can add people)" : "",
+												],
+											}),
+											canManage && principal.userId !== props.selfUserId
+												? /* @__PURE__ */ createVNode("button", {
+														type: "button",
+														className: "button channel-item-action",
+														disabled: busy,
+														onClick: () =>
+															change(
+																props.client.scopes.removePrincipal({
+																	scopeId: props.channel.key,
+																	userId: principal.userId,
+																}),
+															),
+														children: "Remove",
+													})
+												: null,
+										],
+									},
+									principal.userId,
+								),
+							),
+						}),
+			loaded && principals !== null && canManage
+				? /* @__PURE__ */ createVNode("div", {
+						className: "field",
+						children: [
+							/* @__PURE__ */ createVNode("p", {
+								className: "field-label",
+								children: "Add people",
+							}),
+							/* @__PURE__ */ createVNode(MemberPicker, {
+								client: props.client,
+								selfUserId: props.selfUserId,
+								selected: [...inScope],
+								onToggle: (userId, selected) =>
+									change(
+										selected
+											? props.client.scopes.setPrincipal({
+													scopeId: props.channel.key,
+													userId,
+													level: "member",
+												})
+											: props.client.scopes.removePrincipal({
+													scopeId: props.channel.key,
+													userId,
+												}),
+									),
+							}),
+						],
+					})
+				: null,
+			error !== null
+				? /* @__PURE__ */ createVNode("p", {
+						className: "form-error",
+						role: "alert",
+						children: error,
+					})
+				: null,
+			/* @__PURE__ */ createVNode("div", {
+				className: "dialog-actions",
+				children: /* @__PURE__ */ createVNode("button", {
+					type: "button",
+					className: "button",
+					"data-dialog-initial": true,
+					onClick: props.onClose,
+					children: "Close",
+				}),
 			}),
 		],
 	});
@@ -12947,15 +14637,416 @@ function ArchiveChannelDialog(props) {
 		],
 	});
 }
+/**
+ * The three sidebar views. They share the one selection state with channels — opening a view
+ * closes the channel — so a view never holds live subscriptions while a channel is open and vice
+ * versa. The keys contain `:`, which no channel key does (a UUID, optionally under `p/`), so a
+ * view key can never collide with a channel key in `selectedKey`.
+ */
+var VIEWS = [
+	{
+		key: "view:unreads",
+		name: "Unreads",
+	},
+	{
+		key: "view:threads",
+		name: "Threads",
+	},
+	{
+		key: "view:activity",
+		name: "Activity",
+	},
+];
+/** "Former member" for a deleted user, "…" while the name has not resolved yet. */
+function author_label(name) {
+	return name === null ? "Former member" : (name ?? "…");
+}
+/** The one-line preview a view row shows, cut like the announcer cuts arrivals. */
+function preview_text(text) {
+	return text.length > 80 ? `${text.slice(0, 80)}…` : text;
+}
+function UnreadsView(props) {
+	const rows = [];
+	for (const channel of props.channels) {
+		if (chat_channel_is_private(channel.key)) {
+			const last = channel.value.lastMessageAt;
+			if (last !== void 0 && last > (props.privateCursors.get(channel.key)?.at ?? 0))
+				rows.push({
+					channel,
+					at: last,
+					mentionCount: 0,
+					preview: null,
+				});
+			continue;
+		}
+		const unread = props.publicUnreads.get(channel.key);
+		if (unread !== void 0)
+			rows.push({
+				channel,
+				at: unread.latest.timestamp,
+				mentionCount: unread.mentionCount,
+				preview: unread.latest,
+			});
+	}
+	rows.sort((a, b) => b.at - a.at);
+	const memberNames = props.memberNames;
+	useEffect(() => {
+		const ids = [...props.publicUnreads.values()].map((unread) => unread.latest.createdBy);
+		if (ids.length > 0) memberNames.resolve(ids);
+	}, [props.publicUnreads, memberNames]);
+	const now = Date.now();
+	return /* @__PURE__ */ createVNode("section", {
+		className: "view",
+		"aria-label": "Unreads",
+		children: [
+			/* @__PURE__ */ createVNode("header", {
+				className: "view-head",
+				children: /* @__PURE__ */ createVNode("h2", {
+					className: "view-title",
+					children: "Unreads",
+				}),
+			}),
+			/* @__PURE__ */ createVNode("p", {
+				className: "view-note",
+				children:
+					"Only the newest 100 public messages are checked, so an older unread channel can be missing here. Private channels show their name only.",
+			}),
+			props.recentDead
+				? /* @__PURE__ */ createVNode("div", {
+						className: "channel-status is-error",
+						role: "alert",
+						children: "The recent-messages feed stopped, so unread state for public channels is not updating.",
+					})
+				: null,
+			rows.length === 0
+				? /* @__PURE__ */ createVNode("div", {
+						className: "channel-status",
+						children: "You are all caught up.",
+					})
+				: /* @__PURE__ */ createVNode("ul", {
+						className: "view-rows",
+						children: rows.map((row) =>
+							/* @__PURE__ */ createVNode(
+								"li",
+								{
+									className: "view-row",
+									children: /* @__PURE__ */ createVNode("button", {
+										type: "button",
+										className: "view-row-button",
+										onClick: () => props.onSelectChannel(row.channel),
+										children: [
+											/* @__PURE__ */ createVNode("span", {
+												className: "view-row-title",
+												children: [
+													"#",
+													row.channel.value.name,
+													row.mentionCount > 0
+														? /* @__PURE__ */ createVNode("span", {
+																className: "mention-badge",
+																children: [
+																	row.mentionCount,
+																	/* @__PURE__ */ createVNode("span", {
+																		className: "visually-hidden",
+																		children: " mentions of you",
+																	}),
+																],
+															})
+														: null,
+												],
+											}),
+											/* @__PURE__ */ createVNode("span", {
+												className: "view-row-time",
+												children: chat_format_recency(row.at, now),
+											}),
+											row.preview !== null
+												? /* @__PURE__ */ createVNode("span", {
+														className: "view-row-preview",
+														children: `${author_label(memberNames.get(row.preview.createdBy))}: ${preview_text(row.preview.value.text)}`,
+													})
+												: null,
+										],
+									}),
+								},
+								row.channel.key,
+							),
+						),
+					}),
+		],
+	});
+}
+function ActivityView(props) {
+	const channelsByKey = new Map(props.channels.map((channel) => [channel.key, channel]));
+	const groups = [];
+	for (const doc of props.feed) {
+		if (doc.value.deletedAt !== null) continue;
+		const channelKey = chat_message_channel_key(doc.key);
+		const channel = channelKey === null ? void 0 : channelsByKey.get(channelKey);
+		if (channel === void 0) continue;
+		const lastGroup = groups[groups.length - 1];
+		if (lastGroup !== void 0 && lastGroup.channel.key === channel.key) lastGroup.messages.push(doc);
+		else
+			groups.push({
+				channel,
+				messages: [doc],
+			});
+	}
+	const memberNames = props.memberNames;
+	useEffect(() => {
+		const ids = [...new Set(props.feed.map((doc) => doc.createdBy))];
+		if (ids.length > 0) memberNames.resolve(ids);
+	}, [props.feed, memberNames]);
+	const now = Date.now();
+	return /* @__PURE__ */ createVNode("section", {
+		className: "view",
+		"aria-label": "Activity",
+		children: [
+			/* @__PURE__ */ createVNode("header", {
+				className: "view-head",
+				children: /* @__PURE__ */ createVNode("h2", {
+					className: "view-title",
+					children: "Activity",
+				}),
+			}),
+			/* @__PURE__ */ createVNode("p", {
+				className: "view-note",
+				children: "The newest public messages. Private channels are not shown here.",
+			}),
+			props.recentDead
+				? /* @__PURE__ */ createVNode("div", {
+						className: "channel-status is-error",
+						role: "alert",
+						children: "The recent-messages feed stopped, so this view is not updating.",
+					})
+				: null,
+			groups.length === 0
+				? /* @__PURE__ */ createVNode("div", {
+						className: "channel-status",
+						children: "No public messages yet.",
+					})
+				: /* @__PURE__ */ createVNode("div", {
+						className: "view-groups",
+						children: groups.map((group, index) =>
+							/* @__PURE__ */ createVNode(
+								"section",
+								{
+									className: "view-group",
+									children: [
+										/* @__PURE__ */ createVNode("h3", {
+											className: "view-group-title",
+											children: /* @__PURE__ */ createVNode("button", {
+												type: "button",
+												className: "view-group-link",
+												onClick: () => props.onSelectChannel(group.channel),
+												children: ["#", group.channel.value.name],
+											}),
+										}),
+										/* @__PURE__ */ createVNode("ul", {
+											className: "view-rows",
+											children: group.messages.map((doc) =>
+												/* @__PURE__ */ createVNode(
+													"li",
+													{
+														className: doc.value.mentions?.includes(props.selfUserId)
+															? "view-row mention-self"
+															: "view-row",
+														children: [
+															/* @__PURE__ */ createVNode("span", {
+																className: "view-row-title",
+																children: author_label(memberNames.get(doc.createdBy)),
+															}),
+															/* @__PURE__ */ createVNode("span", {
+																className: "view-row-time",
+																children: chat_format_recency(doc.timestamp, now),
+															}),
+															/* @__PURE__ */ createVNode("span", {
+																className: "view-row-preview",
+																children: preview_text(doc.value.text),
+															}),
+														],
+													},
+													doc.key,
+												),
+											),
+										}),
+									],
+								},
+								`${group.channel.key}:${index}`,
+							),
+						),
+					}),
+		],
+	});
+}
+function ThreadsView(props) {
+	const [replies, setReplies] = useState([]);
+	const [loaded, setLoaded] = useState(false);
+	const [dead, setDead] = useState(false);
+	useEffect(() => {
+		const store = chat_create_window_store(chat_validate_message_doc);
+		return props.client.data.watchRecent(
+			{
+				collection: "replies",
+				limit: 100,
+				order: "desc",
+			},
+			(update) => {
+				if (update === null) {
+					setDead(true);
+					setLoaded(true);
+					return;
+				}
+				setReplies(store.apply_window(update.docs));
+				setLoaded(true);
+			},
+		);
+	}, [props.client]);
+	const channelsByKey = new Map(props.channels.map((channel) => [channel.key, channel]));
+	const threads = /* @__PURE__ */ new Map();
+	for (const doc of replies) {
+		if (doc.value.deletedAt !== null) continue;
+		const rootKey = chat_reply_root_key(doc.key);
+		const channelKey = rootKey === null ? null : chat_message_channel_key(rootKey);
+		const channel = channelKey === null ? void 0 : channelsByKey.get(channelKey);
+		if (rootKey === null || channel === void 0) continue;
+		const existing = threads.get(rootKey);
+		if (existing === void 0)
+			threads.set(rootKey, {
+				channel,
+				newest: doc,
+				count: 1,
+			});
+		else existing.count += 1;
+	}
+	const memberNames = props.memberNames;
+	useEffect(() => {
+		const ids = [...new Set(replies.map((doc) => doc.createdBy))];
+		if (ids.length > 0) memberNames.resolve(ids);
+	}, [replies, memberNames]);
+	const now = Date.now();
+	return /* @__PURE__ */ createVNode("section", {
+		className: "view",
+		"aria-label": "Threads",
+		children: [
+			/* @__PURE__ */ createVNode("header", {
+				className: "view-head",
+				children: /* @__PURE__ */ createVNode("h2", {
+					className: "view-title",
+					children: "Threads",
+				}),
+			}),
+			/* @__PURE__ */ createVNode("p", {
+				className: "view-note",
+				children:
+					"The newest public reply activity; counts read the newest 100 replies. Private channels are not shown here.",
+			}),
+			dead
+				? /* @__PURE__ */ createVNode("div", {
+						className: "channel-status is-error",
+						role: "alert",
+						children: "The replies feed stopped, so this view is not updating.",
+					})
+				: null,
+			!loaded
+				? /* @__PURE__ */ createVNode("div", {
+						className: "channel-status",
+						role: "status",
+						children: "Loading threads…",
+					})
+				: threads.size === 0
+					? /* @__PURE__ */ createVNode("div", {
+							className: "channel-status",
+							children: "No recent thread activity.",
+						})
+					: /* @__PURE__ */ createVNode("ul", {
+							className: "view-rows",
+							children: [...threads.entries()].map(([rootKey, thread]) =>
+								/* @__PURE__ */ createVNode(
+									"li",
+									{
+										className: "view-row",
+										children: /* @__PURE__ */ createVNode("button", {
+											type: "button",
+											className: "view-row-button",
+											onClick: () => props.onOpenThread(thread.channel, rootKey),
+											children: [
+												/* @__PURE__ */ createVNode("span", {
+													className: "view-row-title",
+													children: ["#", thread.channel.value.name],
+												}),
+												/* @__PURE__ */ createVNode("span", {
+													className: "view-row-time",
+													children: chat_format_recency(thread.newest.timestamp, now),
+												}),
+												/* @__PURE__ */ createVNode("span", {
+													className: "view-row-preview",
+													children: `${thread.count} ${thread.count === 1 ? "reply" : "replies"} · ${author_label(memberNames.get(thread.newest.createdBy))}: ${preview_text(thread.newest.value.text)}`,
+												}),
+											],
+										}),
+									},
+									rootKey,
+								),
+							),
+						}),
+		],
+	});
+}
+/**
+ * What the page says when its channels subscription dies. The reasons are not interchangeable: a
+ * member whose plugin was uninstalled cannot fix anything by signing in again, and a member whose
+ * session ran out only has to reload.
+ */
+function channels_death_message(reason) {
+	if (reason === "denied") return "Chitchat can no longer read its data. Reload the page to try again.";
+	if (reason === "session_expired") return "This Chitchat session expired. Reload the page to continue.";
+	if (reason === "unavailable")
+		return "Chitchat cannot reach its data right now. Nothing will update until the connection returns.";
+	if (reason === "capacity") return "Chitchat has too many live views open. Close a thread, or reload the page.";
+	return "Chitchat stopped reading its data. Reload the page to try again.";
+}
+/** `surfaceRaised` becomes `--bonobo-surface-raised`, the spelling the stylesheet reads. */
+function theme_property_name(token) {
+	return `--bonobo-${token.replace(/[A-Z]/gu, (letter) => `-${letter.toLowerCase()}`)}`;
+}
+/**
+ * How many private scopes this page watches. Worst-case slot spend with a channel and a thread
+ * open: channels 1 + scope list 1 + N scope reads + cursors 1 + recent feed 1 + three channel
+ * windows + one thread watch = 8 + N, and the SDK allows 16 — so N is 8. The sidebar says when
+ * scopes past this line exist instead of silently hiding them.
+ */
+var MAX_WATCHED_SCOPES = 8;
+/** How long the page waits after new messages render before it moves the read cursor. */
+var MARK_READ_DEBOUNCE_MS = 2e3;
 function App(props) {
 	const { client } = props;
 	const userId = client.context.userId;
 	const memberNames = use_member_names(client);
-	const [channels, setChannels] = useState([]);
+	const [publicChannels, setPublicChannels] = useState([]);
+	/**
+	 * The private ranges this member is in, and the channels found inside each one. A read with no
+	 * key range answers only the public part of a collection, so a private channel is reached by its
+	 * own read, one per scope, and the two lists are merged for the sidebar.
+	 */
+	const [scopes, setScopes] = useState([]);
+	const [privateChannelsByScope, setPrivateChannelsByScope] = useState({});
 	const [channelsLoaded, setChannelsLoaded] = useState(false);
-	const [channelsDead, setChannelsDead] = useState(false);
+	const [channelsDeath, setChannelsDeath] = useState(null);
+	const [channelsTruncated, setChannelsTruncated] = useState(false);
+	/** The member's public cursor map doc, delivered live. Null until it exists or when it dies. */
+	const [cursorDoc, setCursorDoc] = useState(null);
+	/** The newest 100 public messages, newest first — the one feed behind unreads and Activity. */
+	const [recentFeed, setRecentFeed] = useState([]);
+	const [recentDead, setRecentDead] = useState(false);
+	/** This member's own private read cursors, delivered by the per-scope channels reads. */
+	const [privateCursorsByScope, setPrivateCursorsByScope] = useState({});
+	/** Holds either a channel key or a `view:*` key — views share the one selection. */
 	const [selectedKey, setSelectedKey] = useState(null);
-	const [showArchived, setShowArchived] = useState(false);
+	/**
+	 * The open thread, held here rather than in `ChannelView`, because the icon rail collapses on the
+	 * `.chitchat` root and only this component renders it.
+	 */
+	const [threadRootKey, setThreadRootKey] = useState(null);
+	const [railExpanded, setRailExpanded] = useState(false);
 	const [dialog, setDialog] = useState(null);
 	const [dialogBusy, setDialogBusy] = useState(false);
 	const [dialogError, setDialogError] = useState(null);
@@ -12964,8 +15055,61 @@ function App(props) {
 		sequence: 0,
 		text: "",
 	});
+	/** What the live region currently holds. The effect below clears it, then sets it again. */
+	const [spokenText, setSpokenText] = useState("");
+	/**
+	 * Whether the drawer is currently the narrow overlay. `inert` may only be applied then: at
+	 * desktop widths the drawer is always open, and an unconditional `inert={!drawerOpen}` would put
+	 * the whole channel list out of reach at every width.
+	 */
+	const [isNarrow, setIsNarrow] = useState(false);
 	const navRef = useRef(null);
 	const drawerToggleRef = useRef(null);
+	const railExpandRef = useRef(null);
+	/** The latest cursor doc, readable by write paths without a stale closure. */
+	const cursorDocRef = useRef(null);
+	/** The map a conflicted cursor write wanted; the retry effect merges it over the winner. */
+	const cursorRetryRef = useRef(null);
+	const markReadTimerRef = useRef(null);
+	const pendingMarkReadRef = useRef(null);
+	const channels = [...publicChannels, ...Object.values(privateChannelsByScope).flat()].sort((a, b) =>
+		a.value.name.localeCompare(b.value.name),
+	);
+	/** channelKey → this member's own private cursor, flattened from the per-scope deliveries. */
+	const privateCursors = new Map(
+		Object.values(privateCursorsByScope)
+			.flat()
+			.map((doc) => [doc.channelKey, doc]),
+	);
+	const publicUnreads = useMemo(
+		() =>
+			chat_fold_public_unreads({
+				docs: recentFeed,
+				cursorChannels: cursorDoc?.value.channels ?? {},
+				selfUserId: userId,
+			}),
+		[recentFeed, cursorDoc, userId],
+	);
+	/**
+	 * Whether a channel row shows an unread mark. The selected channel never does: opening it is
+	 * reading it, and the cursor writes below make that stick across a reload.
+	 */
+	const channel_has_unread = (channel) => {
+		if (channel.key === selectedKey || channel.value.archivedAt !== null) return false;
+		if (chat_channel_is_private(channel.key)) {
+			const last = channel.value.lastMessageAt;
+			return last !== void 0 && last > (privateCursors.get(channel.key)?.at ?? 0);
+		}
+		return publicUnreads.has(channel.key);
+	};
+	/** Unread mentions of this member in a channel. Zero for private ones: a shared doc cannot say. */
+	const channel_mention_count = (channel) => {
+		return channel.key === selectedKey || channel.value.archivedAt !== null
+			? 0
+			: (publicUnreads.get(channel.key)?.mentionCount ?? 0);
+	};
+	const channelsSectionId = useId();
+	const archivedSectionId = useId();
 	const announce = useCallback((text) => {
 		setAnnouncement((current) => ({
 			sequence: current.sequence + 1,
@@ -12973,72 +15117,395 @@ function App(props) {
 		}));
 	}, []);
 	useEffect(() => {
+		if (announcement.text === "") return;
+		setSpokenText("");
+		const frame = requestAnimationFrame(() => setSpokenText(announcement.text));
+		return () => cancelAnimationFrame(frame);
+	}, [announcement]);
+	useEffect(() => {
+		const query = window.matchMedia("(max-width: 719px)");
+		setIsNarrow(query.matches);
+		const handle_change = (event) => setIsNarrow(event.matches);
+		query.addEventListener("change", handle_change);
+		return () => query.removeEventListener("change", handle_change);
+	}, []);
+	useEffect(() => {
+		const apply_theme = (theme) => {
+			const root = document.documentElement;
+			root.classList.toggle("theme-light", theme.mode === "light");
+			for (const [token, value] of Object.entries(theme.tokens))
+				root.style.setProperty(theme_property_name(token), value);
+		};
+		const current = client.theme.current();
+		if (current !== null) apply_theme(current);
+		return client.theme.subscribe(apply_theme);
+	}, [client]);
+	useEffect(() => {
 		const store = chat_create_window_store(chat_validate_channel_doc);
 		return client.data.watch(
 			{
 				collection: "channels",
 				limit: 100,
 			},
-			(docs) => {
-				if (docs === null) {
-					setChannelsDead(true);
+			(update, info) => {
+				if (update === null) {
+					setChannelsDeath({ ...(info?.reason === void 0 ? {} : { reason: info.reason }) });
 					return;
 				}
-				const sorted = [...store.apply_window(docs)].sort((a, b) => a.value.name.localeCompare(b.value.name));
-				setChannels(sorted);
+				setPublicChannels(store.apply_window(update.docs));
 				setChannelsLoaded(true);
+				setChannelsTruncated(update.truncated);
+			},
+		);
+	}, [client]);
+	useEffect(() => {
+		return client.scopes.watchMine((list) => {
+			setScopes(list ?? []);
+		});
+	}, [client]);
+	useEffect(() => {
+		const unsubscribes = scopes.slice(0, MAX_WATCHED_SCOPES).map((scope) => {
+			const store = chat_create_window_store(chat_validate_channel_doc);
+			return client.data.watch(
+				{
+					collection: "channels",
+					keyPrefix: scope.keyPrefix,
+					limit: 100,
+				},
+				(update) => {
+					const channelDocs =
+						update === null
+							? []
+							: update.docs.filter((raw) => {
+									const key = raw.key;
+									return !(typeof key === "string" && chat_parse_private_cursor_key(key) !== null);
+								});
+					setPrivateChannelsByScope((current) => {
+						if (update === null) {
+							const { [scope.scopeId]: _gone, ...rest } = current;
+							return rest;
+						}
+						return {
+							...current,
+							[scope.scopeId]: store.apply_window(channelDocs),
+						};
+					});
+					setPrivateCursorsByScope((current) => {
+						if (update === null) {
+							const { [scope.scopeId]: _gone, ...rest } = current;
+							return rest;
+						}
+						const mine = update.docs
+							.map(chat_validate_private_cursor_doc)
+							.filter((doc) => doc !== null && doc.createdBy === userId);
+						return {
+							...current,
+							[scope.scopeId]: mine,
+						};
+					});
+				},
+			);
+		});
+		return () => {
+			for (const unsubscribe of unsubscribes) unsubscribe();
+		};
+	}, [client, scopes, userId]);
+	useEffect(() => {
+		return client.data.watch(
+			{
+				collection: "cursors",
+				keyPrefix: chat_cursor_stored_key(userId),
+				limit: 1,
+			},
+			(update) => {
+				if (update === null) {
+					setCursorDoc(null);
+					cursorDocRef.current = null;
+					return;
+				}
+				const doc = update.docs.map(chat_validate_cursor_map_doc).find((entry) => entry !== null) ?? null;
+				setCursorDoc(doc);
+				cursorDocRef.current = doc;
+			},
+		);
+	}, [client, userId]);
+	useEffect(() => {
+		const store = chat_create_window_store(chat_validate_message_doc);
+		return client.data.watchRecent(
+			{
+				collection: "messages",
+				limit: 100,
+				order: "desc",
+			},
+			(update) => {
+				if (update === null) {
+					setRecentDead(true);
+					setRecentFeed([]);
+					return;
+				}
+				setRecentDead(false);
+				setRecentFeed(store.apply_window(update.docs));
 			},
 		);
 	}, [client]);
 	useEffect(() => {
 		if (selectedKey === null) {
 			const firstActive = channels.find((channel) => channel.value.archivedAt === null);
-			if (firstActive !== void 0) setSelectedKey(firstActive.key);
+			if (firstActive !== void 0) setSelectedKey((current) => current ?? firstActive.key);
 		}
 	}, [channels, selectedKey]);
 	useEffect(() => {
 		if (drawerOpen) navRef.current?.focus();
 	}, [drawerOpen]);
 	const is_narrow = () => window.matchMedia("(max-width: 719px)").matches;
+	/**
+	 * Moves one public channel's read cursor forward in the member's map doc. Compare-and-set
+	 * against the doc the watch delivered; on a lost race the wanted map is parked in
+	 * `cursorRetryRef` and the retry effect below merges it over the winner. On success the doc
+	 * is echoed locally (like a message edit) so the badge clears before the watch echoes back.
+	 */
+	const write_public_cursor = (channelKey, at) => {
+		const base = cursorDocRef.current;
+		const currentChannels = base?.value.channels ?? {};
+		if ((currentChannels[channelKey] ?? 0) >= at) return;
+		const value = {
+			channels: {
+				...currentChannels,
+				[channelKey]: at,
+			},
+		};
+		const expectedRevision = base?.revision ?? 0;
+		const apply_local = (revision, applied) => {
+			const now = Date.now();
+			const stored = {
+				key: chat_cursor_stored_key(userId),
+				value: applied,
+				revision,
+				createdBy: userId,
+				updatedBy: userId,
+				createdAt: base?.createdAt ?? now,
+				updatedAt: now,
+				timestamp: base?.timestamp ?? now,
+			};
+			cursorDocRef.current = stored;
+			setCursorDoc(stored);
+		};
+		client.data
+			.putOwned({
+				collection: "cursors",
+				key: "me",
+				value,
+				expectedRevision,
+			})
+			.then((result) => {
+				if ("_yay" in result) {
+					apply_local(result._yay.revision, value);
+					return;
+				}
+				if (result._nay.name === "conflict") {
+					const latest = cursorDocRef.current;
+					if (latest !== null && latest.revision !== expectedRevision) {
+						const merged = chat_merge_cursor_maps(latest.value, value);
+						client.data
+							.putOwned({
+								collection: "cursors",
+								key: "me",
+								value: merged,
+								expectedRevision: latest.revision,
+							})
+							.then((retryResult) => {
+								if ("_yay" in retryResult) apply_local(retryResult._yay.revision, merged);
+							})
+							.catch(() => {});
+						return;
+					}
+					cursorRetryRef.current = {
+						channels: value.channels,
+						attemptedRevision: expectedRevision,
+					};
+					return;
+				}
+				const sidebarKeys = new Set(channels.map((channel) => channel.key));
+				const kept = Object.fromEntries(
+					Object.entries(value.channels).filter(([key]) => key === channelKey || sidebarKeys.has(key)),
+				);
+				if (Object.keys(kept).length === Object.keys(value.channels).length) {
+					console.warn("[chitchat] A read-cursor write was refused", { message: result._nay.message });
+					return;
+				}
+				client.data
+					.putOwned({
+						collection: "cursors",
+						key: "me",
+						value: { channels: kept },
+						expectedRevision,
+					})
+					.then((retryResult) => {
+						if ("_yay" in retryResult) apply_local(retryResult._yay.revision, { channels: kept });
+						else console.warn("[chitchat] A read-cursor write was refused", { message: retryResult._nay.message });
+					})
+					.catch(() => {});
+			})
+			.catch((error) => {
+				console.warn("[chitchat] A read-cursor write failed", { message: chat_get_error_message(error) });
+			});
+	};
+	/**
+	 * Moves this member's read cursor for one private channel. The doc lives inside the scope's
+	 * range, so a `p/` key never enters the public map. Only this member writes this doc, so a
+	 * conflict is a race with this page's own concurrent write and the next mark-read heals it.
+	 */
+	const write_private_cursor = (channel, at) => {
+		const existing = privateCursors.get(channel.key);
+		if ((existing?.at ?? 0) >= at) return;
+		client.data
+			.putOwned({
+				collection: "channels",
+				key: chat_private_cursor_caller_key(channel.key),
+				value: { at },
+				expectedRevision: existing?.revision ?? 0,
+			})
+			.then((result) => {
+				if ("_nay" in result && result._nay.name !== "conflict")
+					console.warn("[chitchat] A private read-cursor write was refused", { message: result._nay.message });
+			})
+			.catch((error) => {
+				console.warn("[chitchat] A private read-cursor write failed", { message: chat_get_error_message(error) });
+			});
+	};
+	const mark_channel_read = (channel, at) => {
+		if (chat_channel_is_private(channel.key)) write_private_cursor(channel, at);
+		else write_public_cursor(channel.key, at);
+	};
+	/**
+	 * The channel reports the newest message it rendered; the write is debounced so a burst of
+	 * arrivals costs one cursor write, not one per message.
+	 */
+	const handle_newest_visible = (channel, timestamp) => {
+		const pending = pendingMarkReadRef.current;
+		pendingMarkReadRef.current =
+			pending !== null && pending.channel.key === channel.key
+				? {
+						channel,
+						at: Math.max(pending.at, timestamp),
+					}
+				: {
+						channel,
+						at: timestamp,
+					};
+		if (markReadTimerRef.current === null)
+			markReadTimerRef.current = setTimeout(() => {
+				markReadTimerRef.current = null;
+				const entry = pendingMarkReadRef.current;
+				pendingMarkReadRef.current = null;
+				if (entry !== null) mark_channel_read(entry.channel, entry.at);
+			}, MARK_READ_DEBOUNCE_MS);
+	};
 	const handle_select_channel = (channel) => {
 		setSelectedKey(channel.key);
+		setThreadRootKey(null);
+		if (channel_has_unread(channel) || channel_mention_count(channel) > 0) mark_channel_read(channel, Date.now());
 		announce(`#${channel.value.name}`);
 		if (drawerOpen && is_narrow()) {
 			setDrawerOpen(false);
 			drawerToggleRef.current?.focus();
 		}
 	};
+	const handle_select_view = (view) => {
+		setSelectedKey(view.key);
+		setThreadRootKey(null);
+		announce(view.name);
+		if (drawerOpen && is_narrow()) {
+			setDrawerOpen(false);
+			drawerToggleRef.current?.focus();
+		}
+	};
+	/**
+	 * A Threads-view row opens its channel and asks for the thread. `handle_select_channel`
+	 * clears the thread key, so set it after — the later state write wins. If the root is
+	 * outside the channel's loaded window, the channel opens without the panel.
+	 */
+	const handle_open_thread_from_view = (channel, rootKey) => {
+		handle_select_channel(channel);
+		setThreadRootKey(rootKey);
+	};
+	useEffect(() => {
+		const pending = cursorRetryRef.current;
+		if (pending === null || cursorDoc === null || cursorDoc.revision === pending.attemptedRevision) return;
+		cursorRetryRef.current = null;
+		const merged = chat_merge_cursor_maps(cursorDoc.value, { channels: pending.channels });
+		client.data
+			.putOwned({
+				collection: "cursors",
+				key: "me",
+				value: merged,
+				expectedRevision: cursorDoc.revision,
+			})
+			.then((result) => {
+				if ("_nay" in result && result._nay.name !== "conflict")
+					console.warn("[chitchat] The read-cursor retry was refused", { message: result._nay.message });
+			})
+			.catch(() => {});
+	}, [cursorDoc, client]);
+	useEffect(() => {
+		return () => {
+			if (markReadTimerRef.current !== null) clearTimeout(markReadTimerRef.current);
+		};
+	}, []);
 	const close_dialog = () => {
 		setDialog(null);
 		setDialogBusy(false);
 		setDialogError(null);
 	};
-	const handle_create_channel = (name) => {
+	const handle_create_channel = (name, topic, people) => {
 		setDialogBusy(true);
 		setDialogError(null);
-		const key = chat_create_channel_key();
-		client.data
-			.put({
+		const key = chat_create_channel_key(people.isPrivate ? "private" : "public");
+		(async () => {
+			if (people.isPrivate) {
+				const scope = await client.scopes.create({
+					scopeId: key,
+					collections: chat_PRIVATE_CHANNEL_COLLECTIONS,
+					keyPrefix: key,
+				});
+				if ("_nay" in scope) {
+					setDialogBusy(false);
+					setDialogError(scope._nay.message);
+					return;
+				}
+				for (const userId of people.userIds) {
+					const added = await client.scopes.setPrincipal({
+						scopeId: key,
+						userId,
+						level: "member",
+					});
+					if ("_nay" in added) {
+						setDialogBusy(false);
+						setDialogError(added._nay.message);
+						return;
+					}
+				}
+			}
+			const result = await client.data.put({
 				collection: "channels",
 				key,
 				value: {
 					name,
 					archivedAt: null,
+					...(topic === "" ? {} : { topic }),
 				},
-			})
-			.then((result) => {
-				if ("_nay" in result) {
-					setDialogBusy(false);
-					setDialogError(result._nay.message);
-					return;
-				}
-				setSelectedKey(key);
-				close_dialog();
-			})
-			.catch((error) => {
-				setDialogBusy(false);
-				setDialogError(chat_get_error_message(error));
 			});
+			if ("_nay" in result) {
+				setDialogBusy(false);
+				setDialogError(result._nay.message);
+				return;
+			}
+			setSelectedKey(key);
+			close_dialog();
+		})().catch((error) => {
+			setDialogBusy(false);
+			setDialogError(chat_get_error_message(error));
+		});
 	};
 	const put_channel_value = (channel, value) => {
 		setDialogBusy(true);
@@ -13085,7 +15552,7 @@ function App(props) {
 				announce(chat_get_error_message(error));
 			});
 	};
-	if (channelsDead)
+	if (channelsDeath !== null)
 		return /* @__PURE__ */ createVNode("div", {
 			className: "chitchat",
 			children: /* @__PURE__ */ createVNode("div", {
@@ -13093,139 +15560,268 @@ function App(props) {
 				role: "alert",
 				children: [
 					/* @__PURE__ */ createVNode("h1", { children: "Chitchat" }),
-					/* @__PURE__ */ createVNode("p", {
-						children:
-							"Access to this plugin's data ended — the plugin may have been disabled or your permissions changed. The composer is disabled. Reload the page after access is restored.",
-					}),
+					/* @__PURE__ */ createVNode("p", { children: channels_death_message(channelsDeath.reason) }),
 				],
 			}),
 		});
-	const visibleChannels = channels.filter((channel) => showArchived || channel.value.archivedAt === null);
+	const by_name = (a, b) => a.value.name.localeCompare(b.value.name);
+	const activeChannels = channels.filter((channel) => channel.value.archivedAt === null).sort(by_name);
+	const archivedChannels = channels.filter((channel) => channel.value.archivedAt !== null).sort(by_name);
 	const selected = channels.find((channel) => channel.key === selectedKey) ?? null;
-	return /* @__PURE__ */ createVNode("div", {
-		className: "chitchat",
-		children: [
-			/* @__PURE__ */ createVNode("button", {
-				ref: drawerToggleRef,
-				type: "button",
-				className: "button drawer-toggle",
-				"aria-expanded": drawerOpen,
-				onClick: () => setDrawerOpen((current) => !current),
-				children: "Channels",
-			}),
-			/* @__PURE__ */ createVNode("nav", {
-				ref: navRef,
-				className: drawerOpen ? "sidebar is-open" : "sidebar",
-				"aria-label": "Channels",
-				tabIndex: -1,
-				children: [
-					/* @__PURE__ */ createVNode("div", {
-						className: "sidebar-head",
-						children: [
-							/* @__PURE__ */ createVNode("h1", {
-								className: "sidebar-title",
-								children: "Chitchat",
-							}),
-							/* @__PURE__ */ createVNode("button", {
-								type: "button",
-								className: "button",
-								onClick: () => setDialog({ kind: "create" }),
-								children: "Create channel",
-							}),
-						],
-					}),
-					!channelsLoaded
-						? /* @__PURE__ */ createVNode("div", {
-								className: "channel-status",
-								role: "status",
-								children: "Loading channels…",
-							})
-						: visibleChannels.length === 0
-							? /* @__PURE__ */ createVNode("div", {
-									className: "channel-status",
-									children: "No channels yet",
-								})
-							: /* @__PURE__ */ createVNode("ul", {
-									className: "channel-list",
-									children: visibleChannels.map((channel) =>
-										/* @__PURE__ */ createVNode(
-											"li",
-											{
-												className: "channel-item",
+	const unreadChannelCount = activeChannels.filter(channel_has_unread).length;
+	const totalMentions = activeChannels.reduce((sum, channel) => sum + channel_mention_count(channel), 0);
+	const unwatchedScopeCount = Math.max(0, scopes.length - MAX_WATCHED_SCOPES);
+	const render_channel_section = (title, sectionChannels, id) => {
+		if (sectionChannels.length === 0) return null;
+		return /* @__PURE__ */ createVNode("div", {
+			className: "channel-section",
+			children: [
+				/* @__PURE__ */ createVNode("h2", {
+					id,
+					className: "channel-section-title",
+					children: title,
+				}),
+				/* @__PURE__ */ createVNode("ul", {
+					className: "channel-list",
+					"aria-labelledby": id,
+					children: sectionChannels.map((channel) => {
+						const hasUnread = channel_has_unread(channel);
+						const mentionCount = channel_mention_count(channel);
+						return /* @__PURE__ */ createVNode(
+							"li",
+							{
+								className: "channel-item",
+								children: [
+									/* @__PURE__ */ createVNode("button", {
+										type: "button",
+										className: hasUnread || mentionCount > 0 ? "channel-link is-unread" : "channel-link",
+										"aria-current": channel.key === selectedKey ? "page" : void 0,
+										onClick: () => handle_select_channel(channel),
+										children: [
+											/* @__PURE__ */ createVNode("span", {
+												className: "channel-initial",
+												"aria-hidden": "true",
+												children: channel.value.name.slice(0, 1).toUpperCase(),
+											}),
+											/* @__PURE__ */ createVNode("span", {
+												className: "channel-name",
 												children: [
-													/* @__PURE__ */ createVNode("button", {
-														type: "button",
-														className: "channel-link",
-														"aria-current": channel.key === selectedKey ? "page" : void 0,
-														onClick: () => handle_select_channel(channel),
-														children: ["#", channel.value.name, channel.value.archivedAt !== null ? " (archived)" : ""],
-													}),
-													/* @__PURE__ */ createVNode("span", {
-														className: "channel-item-actions",
-														children: [
-															/* @__PURE__ */ createVNode("button", {
-																type: "button",
-																className: "button channel-item-action",
-																"aria-label": `Rename #${channel.value.name}`,
-																onClick: () =>
-																	setDialog({
-																		kind: "rename",
-																		channel,
-																	}),
-																children: "Rename",
-															}),
-															channel.value.archivedAt === null
-																? /* @__PURE__ */ createVNode("button", {
-																		type: "button",
-																		className: "button channel-item-action",
-																		"aria-label": `Archive #${channel.value.name}`,
-																		onClick: () =>
-																			setDialog({
-																				kind: "archive",
-																				channel,
-																			}),
-																		children: "Archive",
-																	})
-																: /* @__PURE__ */ createVNode("button", {
-																		type: "button",
-																		className: "button channel-item-action",
-																		"aria-label": `Unarchive #${channel.value.name}`,
-																		onClick: () => handle_unarchive(channel),
-																		children: "Unarchive",
-																	}),
-														],
-													}),
+													"#",
+													channel.value.name,
+													chat_channel_is_private(channel.key) ? " (private)" : "",
+													channel.value.archivedAt !== null ? " (archived)" : "",
 												],
-											},
-											channel.key,
-										),
-									),
-								}),
+											}),
+											mentionCount > 0
+												? /* @__PURE__ */ createVNode("span", {
+														className: "mention-badge",
+														children: [
+															mentionCount,
+															/* @__PURE__ */ createVNode("span", {
+																className: "visually-hidden",
+																children: " unread mentions",
+															}),
+														],
+													})
+												: hasUnread
+													? /* @__PURE__ */ createVNode(Fragment, {
+															children: [
+																/* @__PURE__ */ createVNode("span", {
+																	className: "unread-dot",
+																	"aria-hidden": "true",
+																}),
+																/* @__PURE__ */ createVNode("span", {
+																	className: "visually-hidden",
+																	children: "unread",
+																}),
+															],
+														})
+													: null,
+										],
+									}),
+									/* @__PURE__ */ createVNode("span", {
+										className: "channel-item-actions",
+										children: [
+											chat_channel_is_private(channel.key)
+												? /* @__PURE__ */ createVNode("button", {
+														type: "button",
+														className: "button channel-item-action",
+														"aria-label": `People in #${channel.value.name}`,
+														onClick: () =>
+															setDialog({
+																kind: "people",
+																channel,
+															}),
+														children: "People",
+													})
+												: null,
+											/* @__PURE__ */ createVNode("button", {
+												type: "button",
+												className: "button channel-item-action",
+												"aria-label": `Rename #${channel.value.name}`,
+												onClick: () =>
+													setDialog({
+														kind: "rename",
+														channel,
+													}),
+												children: "Rename",
+											}),
+											channel.value.archivedAt === null
+												? /* @__PURE__ */ createVNode("button", {
+														type: "button",
+														className: "button channel-item-action",
+														"aria-label": `Archive #${channel.value.name}`,
+														onClick: () =>
+															setDialog({
+																kind: "archive",
+																channel,
+															}),
+														children: "Archive",
+													})
+												: /* @__PURE__ */ createVNode("button", {
+														type: "button",
+														className: "button channel-item-action",
+														"aria-label": `Unarchive #${channel.value.name}`,
+														onClick: () => handle_unarchive(channel),
+														children: "Unarchive",
+													}),
+										],
+									}),
+								],
+							},
+							channel.key,
+						);
+					}),
+				}),
+			],
+		});
+	};
+	return /* @__PURE__ */ createVNode("div", {
+		className: threadRootKey === null ? "chitchat" : "chitchat has-thread",
+		children: [
+			/* @__PURE__ */ createVNode("header", {
+				className: "app-bar",
+				children: [
+					/* @__PURE__ */ createVNode("h1", {
+						className: "visually-hidden",
+						children: "Chitchat",
+					}),
 					/* @__PURE__ */ createVNode("button", {
+						ref: drawerToggleRef,
 						type: "button",
-						className: "button sidebar-archived-toggle",
-						"aria-pressed": showArchived,
-						onClick: () => setShowArchived((current) => !current),
-						children: "Show archived",
+						className: "button drawer-toggle",
+						"aria-expanded": drawerOpen,
+						onClick: () => setDrawerOpen((current) => !current),
+						children: "Channels",
 					}),
 				],
 			}),
-			/* @__PURE__ */ createVNode("main", {
-				className: "main",
-				children:
-					selected !== null
-						? /* @__PURE__ */ createVNode(
-								ChannelView,
-								{
-									client,
-									userId,
-									channel: selected,
-									memberNames,
-									announce,
-								},
-								selected.key,
-							)
-						: !channelsLoaded
+			/* @__PURE__ */ createVNode("nav", {
+				ref: navRef,
+				className: `sidebar${drawerOpen ? " is-open" : ""}${railExpanded ? " is-expanded" : ""}`,
+				"aria-label": "Channels",
+				tabIndex: -1,
+				children: /* @__PURE__ */ createVNode("div", {
+					className: "sidebar-inner",
+					inert: isNarrow && !drawerOpen ? true : void 0,
+					children: [
+						/* @__PURE__ */ createVNode("div", {
+							className: "sidebar-head",
+							children: [
+								/* @__PURE__ */ createVNode("p", {
+									className: "sidebar-title",
+									children: "Chitchat",
+								}),
+								/* @__PURE__ */ createVNode("button", {
+									ref: railExpandRef,
+									type: "button",
+									className: "button sidebar-expand",
+									"aria-expanded": railExpanded,
+									"aria-label": railExpanded ? "Collapse channel rail" : "Expand channel rail",
+									onClick: () => setRailExpanded((current) => !current),
+									children: railExpanded ? "«" : "»",
+								}),
+								/* @__PURE__ */ createVNode("button", {
+									type: "button",
+									className: "button",
+									onClick: () => setDialog({ kind: "create" }),
+									children: "Create channel",
+								}),
+							],
+						}),
+						channelsTruncated
+							? /* @__PURE__ */ createVNode("div", {
+									className: "channel-status",
+									role: "status",
+									children: "Only the first 100 channels are shown.",
+								})
+							: null,
+						unwatchedScopeCount > 0
+							? /* @__PURE__ */ createVNode("div", {
+									className: "channel-status",
+									role: "status",
+									children: `This page can watch ${MAX_WATCHED_SCOPES} private channels at a time; ${unwatchedScopeCount} more ${unwatchedScopeCount === 1 ? "is" : "are"} hidden.`,
+								})
+							: null,
+						/* @__PURE__ */ createVNode("ul", {
+							className: "view-list",
+							"aria-label": "Views",
+							children: VIEWS.map((view) =>
+								/* @__PURE__ */ createVNode(
+									"li",
+									{
+										className: "view-item",
+										children: /* @__PURE__ */ createVNode("button", {
+											type: "button",
+											className:
+												view.key === "view:unreads" && (unreadChannelCount > 0 || totalMentions > 0)
+													? "channel-link view-link is-unread"
+													: "channel-link view-link",
+											"aria-current": selectedKey === view.key ? "page" : void 0,
+											onClick: () => handle_select_view(view),
+											children: [
+												/* @__PURE__ */ createVNode("span", {
+													className: "channel-initial",
+													"aria-hidden": "true",
+													children: view.name.slice(0, 1),
+												}),
+												/* @__PURE__ */ createVNode("span", {
+													className: "channel-name",
+													children: view.name,
+												}),
+												view.key === "view:unreads" && totalMentions > 0
+													? /* @__PURE__ */ createVNode("span", {
+															className: "mention-badge",
+															children: [
+																totalMentions,
+																/* @__PURE__ */ createVNode("span", {
+																	className: "visually-hidden",
+																	children: " mentions of you",
+																}),
+															],
+														})
+													: view.key === "view:unreads" && unreadChannelCount > 0
+														? /* @__PURE__ */ createVNode(Fragment, {
+																children: [
+																	/* @__PURE__ */ createVNode("span", {
+																		className: "unread-dot",
+																		"aria-hidden": "true",
+																	}),
+																	/* @__PURE__ */ createVNode("span", {
+																		className: "visually-hidden",
+																		children: "unread",
+																	}),
+																],
+															})
+														: null,
+											],
+										}),
+									},
+									view.key,
+								),
+							),
+						}),
+						!channelsLoaded
 							? /* @__PURE__ */ createVNode("div", {
 									className: "channel-status",
 									role: "status",
@@ -13234,23 +15830,101 @@ function App(props) {
 							: channels.length === 0
 								? /* @__PURE__ */ createVNode("div", {
 										className: "channel-status",
-										children: /* @__PURE__ */ createVNode("span", {
-											children: "No channels yet — create the first one.",
-										}),
+										children: "No channels yet",
 									})
-								: /* @__PURE__ */ createVNode("div", {
-										className: "channel-status",
-										children: "Select a channel.",
+								: /* @__PURE__ */ createVNode(Fragment, {
+										children: [
+											render_channel_section("Channels", activeChannels, channelsSectionId),
+											render_channel_section("Archived", archivedChannels, archivedSectionId),
+										],
 									}),
+					],
+				}),
+			}),
+			/* @__PURE__ */ createVNode("main", {
+				className: "main",
+				children:
+					selectedKey === "view:unreads"
+						? /* @__PURE__ */ createVNode(UnreadsView, {
+								channels: activeChannels,
+								publicUnreads,
+								privateCursors,
+								recentDead,
+								memberNames,
+								onSelectChannel: handle_select_channel,
+							})
+						: selectedKey === "view:threads"
+							? /* @__PURE__ */ createVNode(ThreadsView, {
+									client,
+									channels: activeChannels,
+									memberNames,
+									onOpenThread: handle_open_thread_from_view,
+								})
+							: selectedKey === "view:activity"
+								? /* @__PURE__ */ createVNode(ActivityView, {
+										feed: recentFeed,
+										channels: activeChannels,
+										selfUserId: userId,
+										recentDead,
+										memberNames,
+										onSelectChannel: handle_select_channel,
+									})
+								: selected !== null
+									? /* @__PURE__ */ createVNode(
+											ChannelView,
+											{
+												client,
+												userId,
+												channel: selected,
+												memberNames,
+												announce,
+												threadRootKey,
+												setThreadRootKey,
+												isNarrow,
+												onNewestVisible: (timestamp) => handle_newest_visible(selected, timestamp),
+											},
+											selected.key,
+										)
+									: !channelsLoaded
+										? /* @__PURE__ */ createVNode("div", {
+												className: "channel-status",
+												role: "status",
+												children: "Loading channels…",
+											})
+										: channels.length === 0
+											? /* @__PURE__ */ createVNode("div", {
+													className: "channel-status",
+													children: /* @__PURE__ */ createVNode("span", {
+														children: "No channels yet — create the first one.",
+													}),
+												})
+											: /* @__PURE__ */ createVNode("div", {
+													className: "channel-status",
+													children: "Select a channel.",
+												}),
 			}),
 			dialog !== null && dialog.kind === "create"
 				? /* @__PURE__ */ createVNode(ChannelNameDialog, {
 						title: "Create channel",
 						submitLabel: "Create",
 						initialName: "",
+						initialTopic: "",
+						privacy: {
+							client,
+							selfUserId: userId,
+						},
 						busy: dialogBusy,
 						error: dialogError,
 						onSubmit: handle_create_channel,
+						onClose: close_dialog,
+					})
+				: null,
+			dialog !== null && dialog.kind === "people"
+				? /* @__PURE__ */ createVNode(ChannelPeopleDialog, {
+						client,
+						channel: dialog.channel,
+						selfUserId: userId,
+						memberNames,
 						onClose: close_dialog,
 					})
 				: null,
@@ -13259,12 +15933,15 @@ function App(props) {
 						title: `Rename #${dialog.channel.value.name}`,
 						submitLabel: "Rename",
 						initialName: dialog.channel.value.name,
+						initialTopic: dialog.channel.value.topic ?? "",
+						privacy: null,
 						busy: dialogBusy,
 						error: dialogError,
-						onSubmit: (name) =>
+						onSubmit: (name, topic) =>
 							put_channel_value(dialog.channel, {
 								...dialog.channel.value,
 								name,
+								...(topic === "" ? { topic: void 0 } : { topic }),
 							}),
 						onClose: close_dialog,
 					})
@@ -13287,11 +15964,8 @@ function App(props) {
 				role: "status",
 				"aria-live": "polite",
 				children: [
-					/* @__PURE__ */ createVNode("span", {
-						"data-announcement-sequence": String(announcement.sequence),
-						children: announcement.sequence,
-					}),
-					announcement.text !== "" ? ` ${announcement.text}` : "",
+					/* @__PURE__ */ createVNode("span", { "data-announcement-sequence": String(announcement.sequence) }),
+					spokenText,
 				],
 			}),
 		],

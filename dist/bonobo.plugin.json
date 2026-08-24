@@ -2,8 +2,8 @@
 	"schemaVersion": 1,
 	"name": "chitchat",
 	"displayName": "Chitchat",
-	"version": "0.1.5",
-	"description": "Team chat for the workspace: channels, one-level threads, reactions, and workspace-file attachments, all stored in the plugin's own document store.",
+	"version": "0.3.0",
+	"description": "Team chat for the workspace: channels, one-level threads, reactions, workspace-file attachments, unread and mention badges, and Unreads, Threads, and Activity views, all stored in the plugin's own document store.",
 	"compatibility": {
 		"bonoboPluginRuntime": "1"
 	},
@@ -18,7 +18,7 @@
 			}
 		}
 	],
-	"capabilities": ["plugin.data.read", "plugin.data.user-write", "workspace.files.read"],
+	"capabilities": ["plugin.data.read", "plugin.data.user-write", "workspace.files.read", "workspace.members.read"],
 	"outboundOrigins": [],
 	"files": [
 		{
@@ -29,14 +29,14 @@
 		},
 		{
 			"path": "dist/frontend/assets/index.js",
-			"sha256": "sha256:2bf178f2977ecc5e7f389c67886186e8fb5010fbde25f3a52b02ac657de5f5a3",
-			"bytes": 431863,
+			"sha256": "sha256:83c4b90daf9a801bb64b5322f0df689a698d0ebb3c3c231876417bc0b1384602",
+			"bytes": 529995,
 			"contentType": "application/javascript"
 		},
 		{
 			"path": "dist/frontend/assets/index.css",
-			"sha256": "sha256:a44e6c629e97aeb1198ad90f1dde39b6cf2dc6406bd6519d39cac0dd93e9287b",
-			"bytes": 12683,
+			"sha256": "sha256:583818d2b0e4142ec264da376fe96f52a049ac4a007da7b22a9ec2035cd9a941",
+			"bytes": 34218,
 			"contentType": "text/css"
 		}
 	]

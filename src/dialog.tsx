@@ -31,6 +31,39 @@ export function Dialog(props: Dialog_Props) {
 		};
 	}, []);
 
+	// Preact can destroy the control the person is standing on while the dialog stays open, and focus
+	// then falls to the document body. Its child matching treats an old child that rendered as null as
+	// a match before it compares keys, so a section appearing in the middle of the dialog can shift
+	// the actions row onto one of those empty slots. The real row is then unmounted and built again.
+	// Escape stops working too, because the handler below lives on the panel. Keys on the children do
+	// not prevent it. Measured in the people dialog, where the roster arriving destroyed the focused
+	// Close button.
+	//
+	// Only a focus that landed nowhere is repaired. A person clicking something always lands on an
+	// element, and pulling focus back from that would fight them instead of helping.
+	useEffect(() => {
+		const panel = panelRef.current;
+		if (!panel) {
+			return;
+		}
+
+		const restore_lost_focus = () => {
+			if (!panel.isConnected || document.activeElement !== document.body) {
+				return;
+			}
+			const next =
+				panel.querySelector<HTMLElement>("[data-dialog-initial]") ??
+				panel.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
+			next?.focus();
+		};
+
+		// focusout runs while the node is being removed, before the replacement is in place, so the
+		// check waits for the render to finish.
+		const handle_focus_out = () => queueMicrotask(restore_lost_focus);
+		panel.addEventListener("focusout", handle_focus_out);
+		return () => panel.removeEventListener("focusout", handle_focus_out);
+	}, []);
+
 	const handle_key_down = (event: KeyboardEvent<HTMLDivElement>) => {
 		if (event.key === "Escape") {
 			event.stopPropagation();

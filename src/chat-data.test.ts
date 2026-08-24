@@ -1,11 +1,13 @@
 import { describe, expect, test } from "vitest";
 import {
+	chat_channel_is_private,
 	chat_channel_value_schema,
 	chat_create_channel_key,
 	chat_key_timestamp,
 	chat_message_key_prefix,
 	chat_message_value_schema,
 	chat_parse_reaction_key,
+	chat_plugin_data_list_response_schema,
 	chat_reaction_caller_key,
 	chat_reply_key_prefix,
 	chat_reply_root_key,
@@ -65,12 +67,30 @@ describe("chat_key_timestamp", () => {
 
 describe("key builders", () => {
 	test("chat_create_channel_key mints unique printable-ASCII keys with prefix room to spare", () => {
-		const key = chat_create_channel_key();
-		expect(key).toMatch(/^[\x21-\x7E]+$/);
-		expect(key).not.toBe(chat_create_channel_key());
-		// The key must still work as a message keyPrefix: channel + message tail (19) +
-		// reply tail (19) + longest token (10) + server user-id suffix (33) within 128.
-		expect(key.length + 19 + 19 + 10 + 33).toBeLessThanOrEqual(128);
+		for (const visibility of ["public", "private"] as const) {
+			const key = chat_create_channel_key(visibility);
+			expect(key).toMatch(/^[\x21-\x7E]+$/);
+			expect(key).not.toBe(chat_create_channel_key(visibility));
+			// The key must still work as a message keyPrefix: channel + message tail (19) +
+			// reply tail (19) + longest token (10) + server user-id suffix (33) within 128.
+			expect(key.length + 19 + 19 + 10 + 33).toBeLessThanOrEqual(128);
+			// A private channel is told apart by its key alone, and by nothing else. The key never
+			// changes, while a flag in the channel value would be rewritable by anybody who sees it.
+			expect(chat_channel_is_private(key)).toBe(visibility === "private");
+		}
+	});
+
+	test("a private channel key carries no colon, so every key parser still counts the same parts", () => {
+		const key = chat_create_channel_key("private");
+		const messageKey = message_key(key, 3_000);
+		const replyKey = message_key(messageKey, 3_100);
+		expect(key).not.toContain(":");
+		expect(chat_reply_root_key(replyKey)).toBe(messageKey);
+		expect(chat_parse_reaction_key(`${messageKey}:heart:user_1`)).toEqual({
+			targetKey: messageKey,
+			token: "heart",
+			keyTailUserId: "user_1",
+		});
 	});
 
 	test("prefixes end with a colon so the channel key is a strict prefix", () => {
@@ -125,6 +145,19 @@ describe("value schemas", () => {
 		expect(chat_channel_value_schema.safeParse({ name: "x".repeat(65), archivedAt: null }).success).toBe(false);
 	});
 
+	test("channel topics are optional and capped", () => {
+		// A channel stored before the topic existed carries none, and it must still parse. If it did
+		// not, every such channel would be dropped on read and the workspace would show no channels.
+		expect(chat_channel_value_schema.safeParse({ name: "general", archivedAt: null }).success).toBe(true);
+		expect(chat_channel_value_schema.safeParse({ name: "general", archivedAt: null, topic: "" }).success).toBe(true);
+		expect(
+			chat_channel_value_schema.safeParse({ name: "general", archivedAt: null, topic: "x".repeat(250) }).success,
+		).toBe(true);
+		expect(
+			chat_channel_value_schema.safeParse({ name: "general", archivedAt: null, topic: "x".repeat(251) }).success,
+		).toBe(false);
+	});
+
 	test("message values validate text, attachments, and the tombstone fields", () => {
 		expect(
 			chat_message_value_schema.safeParse({
@@ -139,6 +172,26 @@ describe("value schemas", () => {
 			chat_message_value_schema.safeParse({ text: "hi", attachments: [{ fileNodeId: "" }], editedAt: null, deletedAt: null })
 				.success,
 		).toBe(false);
+	});
+});
+
+describe("chat_plugin_data_list_response_schema", () => {
+	test("rejects an envelope with no documents and keeps a null cursor", () => {
+		// The deep-history fallback reads this off `fetchJson`, which resolves `unknown`. The store
+		// validates each document but never the envelope, so this is the only check on the shape the
+		// page destructures.
+		expect(chat_plugin_data_list_response_schema.safeParse({ cursor: null, isDone: true }).success).toBe(false);
+		expect(
+			chat_plugin_data_list_response_schema.safeParse({ documents: [], cursor: 7, isDone: true }).success,
+		).toBe(false);
+
+		const parsed = chat_plugin_data_list_response_schema.safeParse({
+			documents: [{ key: "anything" }],
+			cursor: null,
+			isDone: false,
+		});
+		// `cursor: null` is a legal first page, so it must survive parsing as null and not be dropped.
+		expect(parsed.success && parsed.data).toEqual({ documents: [{ key: "anything" }], cursor: null, isDone: false });
 	});
 });
 

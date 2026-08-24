@@ -54,17 +54,67 @@ export function chat_key_timestamp(key: string): number | null {
 }
 
 /**
+ * What a private channel's key starts with, and what its scope covers.
+ *
+ * A private channel is not a different kind of channel. It is an ordinary channel whose key sits
+ * under this prefix, so the scope created over that key hides the channel, its messages, its replies
+ * and its reactions in one go — they all key off the channel key. A direct message is a private
+ * channel with two people in it and nothing else.
+ *
+ * `/` and not `:`, because every key parser here splits on `:` and counts the parts.
+ */
+const PRIVATE_CHANNEL_KEY_PREFIX = "p/";
+
+/**
+ * The collections a private channel's scope must cover.
+ *
+ * All four, in one `scopes.create` call. A scope covering three of them would leave the fourth
+ * readable by the whole workspace, and the channel doc alone carries the channel's name.
+ */
+export const chat_PRIVATE_CHANNEL_COLLECTIONS = ["channels", "messages", "replies", "reactions"];
+
+/**
+ * What "private" really means here, in the same words everywhere the word appears.
+ *
+ * The organization owner passes every permission check before any grant is read, so the owner reads
+ * every private channel and every direct message. Copy that says "private" and stops there is a
+ * disclosure, so this sentence travels with it.
+ */
+export const chat_PRIVATE_CHANNEL_DISCLOSURE =
+	"Only the people added here can read it — and the organization owner, who can read everything in this workspace.";
+
+/**
  * Channel keys are client-generated so channels are created through `put`, which makes the
  * doc SHARED — any member can rename or archive it. A UUID is printable ASCII and short
  * enough (36 chars) to leave room for the message and reply segments under the 128 budget.
  */
-export function chat_create_channel_key(): string {
-	return crypto.randomUUID();
+export function chat_create_channel_key(visibility: "public" | "private"): string {
+	const id = crypto.randomUUID();
+	return visibility === "private" ? `${PRIVATE_CHANNEL_KEY_PREFIX}${id}` : id;
+}
+
+/**
+ * Whether a channel is private, read from its own key.
+ *
+ * The key is the only source. Storing a flag in the channel value would let the two disagree, and
+ * the value is writable by everybody who can see the channel while the key never changes.
+ */
+export function chat_channel_is_private(channelKey: string): boolean {
+	return channelKey.startsWith(PRIVATE_CHANNEL_KEY_PREFIX);
 }
 
 /** Message keys are `<channelKey>:<invertedPaddedMs>:<rand4>` — appended under this prefix. */
 export function chat_message_key_prefix(channelKey: string) {
 	return `${channelKey}:`;
+}
+
+/** The channel key of a message key, or null when the key is not message-shaped. */
+export function chat_message_channel_key(messageKey: string): string | null {
+	const parts = messageKey.split(":");
+	if (parts.length < 3 || chat_key_timestamp(messageKey) === null) {
+		return null;
+	}
+	return parts.slice(0, -2).join(":");
 }
 
 /** Reply keys are `<rootMessageKey>:<invertedPaddedMs>:<rand4>` — appended under this prefix. */
@@ -121,13 +171,71 @@ export function chat_reply_root_key(replyKey: string): string | null {
 	return rootKey;
 }
 
+/**
+ * The caller key of the member's public read-cursor document in the `cursors` collection. It is
+ * written with `putOwned` and the server appends `:<userId>`, so the stored key is `me:<userId>`
+ * — one document per member, and nobody can write another member's.
+ */
+export const chat_CURSOR_CALLER_KEY = "me";
+
+/** The stored key of one member's public cursor doc — what the cursors watch narrows to. */
+export function chat_cursor_stored_key(userId: string) {
+	return `${chat_CURSOR_CALLER_KEY}:${userId}`;
+}
+
+/**
+ * The caller key of this member's read cursor for one private channel. The doc lives in the
+ * `channels` collection INSIDE the channel's scope range, because a `p/` key in the public cursor
+ * map would tell every member the channel exists. The server appends `:<userId>` on `putOwned`,
+ * so the stored key is `<channelKey>:read:<userId>` and the per-scope channels watch already
+ * delivers it at no extra subscription. `chat_validate_channel_doc` drops it from channel lists
+ * because its value has no `name`.
+ */
+export function chat_private_cursor_caller_key(channelKey: string) {
+	return `${channelKey}:read`;
+}
+
+/**
+ * Splits a stored private-cursor key into its channel key and the server-appended user id tail.
+ * Returns null for every other key shape in the channels collection — real channel docs and
+ * foreign keys alike. Match the owner by the doc's `createdBy`, not the tail: the server stamps
+ * `createdBy`, while the tail is only parsed here for completeness.
+ */
+export function chat_parse_private_cursor_key(storedKey: string): { channelKey: string; keyTailUserId: string } | null {
+	const parts = storedKey.split(":");
+	if (parts.length !== 3 || parts[1] !== "read") {
+		return null;
+	}
+	if (!chat_channel_is_private(parts[0])) {
+		return null;
+	}
+	return { channelKey: parts[0], keyTailUserId: parts[2] };
+}
+
 // #region value schemas
 
 export const chat_CHANNEL_NAME_MAX_LENGTH = 64;
 
+export const chat_CHANNEL_TOPIC_MAX_LENGTH = 250;
+
 export const chat_channel_value_schema = z.object({
 	name: z.string().min(1).max(chat_CHANNEL_NAME_MAX_LENGTH),
 	archivedAt: z.number().nullable(),
+	/**
+	 * Optional, and it must stay optional. Every channel written before the topic existed carries no
+	 * `topic`, `chat_validate_channel_doc` drops a value that fails to parse, and the store drops
+	 * every null — so a required field would empty the channel list of an existing workspace.
+	 */
+	topic: z.string().max(chat_CHANNEL_TOPIC_MAX_LENGTH).optional(),
+	/**
+	 * When the newest message in this channel was sent, epoch ms. Only private channels carry it:
+	 * a rangeless read never sees a private scope, so this stamp is how a CLOSED private channel
+	 * can say "unread". The sender stamps it after a successful append, debounced to one write
+	 * per 15 s so a burst does not double its rate-limit cost. Public channels get the same
+	 * answer from the recent-messages feed instead. Optional: channels written before the stamp
+	 * existed carry none.
+	 */
+	lastMessageAt: z.number().optional(),
 });
 
 export type chat_ChannelValue = z.infer<typeof chat_channel_value_schema>;
@@ -144,9 +252,32 @@ export const chat_message_value_schema = z.object({
 	attachments: z.array(chat_attachment_schema),
 	editedAt: z.number().nullable(),
 	deletedAt: z.number().nullable(),
+	/**
+	 * User ids the author mentioned with `@Name` in `text`. Only ids whose name is still present
+	 * in the text at send time are stored. Optional: messages written before mentions existed
+	 * carry none, and a required field would drop them all at validation.
+	 */
+	mentions: z.array(z.string()).optional(),
 });
 
 export type chat_MessageValue = z.infer<typeof chat_message_value_schema>;
+
+/**
+ * The member's public read cursor map: newest read time per public channel key, epoch ms. One doc
+ * per member (`me:<userId>` in `cursors`). Private channel keys must never appear here — a `p/`
+ * key in a workspace-readable value discloses the channel's existence. Private read state lives
+ * in each scope's own range instead (see `chat_private_cursor_caller_key`).
+ */
+export const chat_cursor_map_value_schema = z.object({
+	channels: z.record(z.string(), z.number()),
+});
+
+export type chat_CursorMapValue = z.infer<typeof chat_cursor_map_value_schema>;
+
+/** A private channel's per-member read cursor: the newest read time, epoch ms. */
+export const chat_private_cursor_value_schema = z.object({
+	at: z.number(),
+});
 
 // #endregion value schemas
 
@@ -260,7 +391,151 @@ export function chat_validate_reaction_doc(raw: unknown): chat_ReactionDoc | nul
 	};
 }
 
+/** The member's public cursor doc, or null when the doc fails validation. */
+export function chat_validate_cursor_map_doc(raw: unknown): chat_Doc<chat_CursorMapValue> | null {
+	const envelope = public_doc_schema.safeParse(raw);
+	if (!envelope.success) {
+		return null;
+	}
+	const value = chat_cursor_map_value_schema.safeParse(envelope.data.value);
+	if (!value.success) {
+		return null;
+	}
+	return {
+		key: envelope.data.key,
+		value: value.data,
+		revision: envelope.data.revision,
+		createdBy: envelope.data.createdBy,
+		updatedBy: envelope.data.updatedBy,
+		createdAt: envelope.data.createdAt,
+		updatedAt: envelope.data.updatedAt,
+		// Cursor keys are client-chosen with no server time tail; use createdAt instead.
+		timestamp: envelope.data.createdAt,
+	};
+}
+
+/** A validated private-cursor document from the channels collection. */
+export type chat_PrivateCursorDoc = {
+	key: string;
+	channelKey: string;
+	createdBy: string;
+	at: number;
+	revision: number;
+};
+
+export function chat_validate_private_cursor_doc(raw: unknown): chat_PrivateCursorDoc | null {
+	const envelope = public_doc_schema.safeParse(raw);
+	if (!envelope.success) {
+		return null;
+	}
+	const parsed = chat_parse_private_cursor_key(envelope.data.key);
+	if (parsed === null) {
+		return null;
+	}
+	const value = chat_private_cursor_value_schema.safeParse(envelope.data.value);
+	if (!value.success) {
+		return null;
+	}
+	return {
+		key: envelope.data.key,
+		channelKey: parsed.channelKey,
+		createdBy: envelope.data.createdBy,
+		at: value.data.at,
+		revision: envelope.data.revision,
+	};
+}
+
 // #endregion document validation
+
+// #region unread state
+
+/**
+ * Merges two cursor maps by per-channel maximum. The conflict retry uses it: the winner the
+ * watch delivered and the write that lost both carry real read times, and a plain overwrite in
+ * either direction would move some channel's cursor backwards.
+ */
+export function chat_merge_cursor_maps(a: chat_CursorMapValue, b: chat_CursorMapValue): chat_CursorMapValue {
+	const channels: Record<string, number> = { ...a.channels };
+	for (const [channelKey, at] of Object.entries(b.channels)) {
+		const existing = channels[channelKey];
+		channels[channelKey] = existing === undefined ? at : Math.max(existing, at);
+	}
+	return { channels };
+}
+
+/** Per-channel unread state folded from the public recent feed against the cursor map. */
+export type chat_PublicUnread = {
+	/** Messages newer than the cursor, capped by the feed's 100-message horizon. */
+	unreadCount: number;
+	/** How many of those name the member. */
+	mentionCount: number;
+	/** The newest unread message, for the Unreads view's one-line preview. */
+	latest: chat_Doc<chat_MessageValue>;
+};
+
+/**
+ * Folds the public recent feed into per-channel unread state. A message counts when it is newer
+ * than the channel's cursor, not deleted, and not the member's own. The feed holds only the
+ * newest 100 public messages, so a channel whose news has fallen out of it shows as read — the
+ * accepted horizon of the zero-write unread design.
+ */
+export function chat_fold_public_unreads(opts: {
+	docs: chat_Doc<chat_MessageValue>[];
+	cursorChannels: Record<string, number>;
+	selfUserId: string;
+}): Map<string, chat_PublicUnread> {
+	const result = new Map<string, chat_PublicUnread>();
+	for (const doc of opts.docs) {
+		const channelKey = chat_message_channel_key(doc.key);
+		if (channelKey === null || chat_channel_is_private(channelKey)) {
+			continue;
+		}
+		if (doc.value.deletedAt !== null || doc.createdBy === opts.selfUserId) {
+			continue;
+		}
+		const lastReadMs = opts.cursorChannels[channelKey];
+		if (lastReadMs !== undefined && doc.timestamp <= lastReadMs) {
+			continue;
+		}
+
+		const mention = doc.value.mentions?.includes(opts.selfUserId) ? 1 : 0;
+		const existing = result.get(channelKey);
+		if (existing === undefined) {
+			result.set(channelKey, { unreadCount: 1, mentionCount: mention, latest: doc });
+		} else {
+			existing.unreadCount += 1;
+			existing.mentionCount += mention;
+			if (doc.timestamp > existing.latest.timestamp) {
+				existing.latest = doc;
+			}
+		}
+	}
+	return result;
+}
+
+/**
+ * Design decision 5's one time ladder for thread summaries and channel recency: relative under
+ * 24 hours, clock time within the last 7 days, the absolute date beyond. Message rows do NOT use
+ * this — they show clock time and carry the absolute date in their accessible name.
+ */
+export function chat_format_recency(timestamp: number, now: number): string {
+	const age = now - timestamp;
+	if (age < 60_000) {
+		return "just now";
+	}
+	if (age < 60 * 60_000) {
+		return `${Math.floor(age / 60_000)}m ago`;
+	}
+	if (age < 24 * 60 * 60_000) {
+		return `${Math.floor(age / (60 * 60_000))}h ago`;
+	}
+	if (age < 7 * 24 * 60 * 60_000) {
+		return new Date(timestamp).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+	}
+	return new Date(timestamp).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+// #endregion unread state
 
 // #region HTTP response schemas
 
@@ -278,6 +553,18 @@ export type chat_FilesListItem = z.infer<typeof chat_files_list_item_schema>;
 /** Response of `POST /api/v1/files/list`. */
 export const chat_files_list_response_schema = z.object({
 	items: z.array(chat_files_list_item_schema),
+	cursor: z.string().nullable(),
+	isDone: z.boolean(),
+});
+
+/**
+ * Response of `POST /api/v1/plugin-data/list`, the deep-history fallback's envelope.
+ *
+ * `fetchJson` resolves `unknown`, and the accumulating store validates each **document** and never
+ * the envelope around them. Without this schema the page would read `documents` off an `unknown`.
+ */
+export const chat_plugin_data_list_response_schema = z.object({
+	documents: z.array(z.unknown()),
 	cursor: z.string().nullable(),
 	isDone: z.boolean(),
 });

@@ -48,13 +48,16 @@ describe("bonobo.plugin.json", () => {
 		expect(entry?.contentType).toBe("text/html");
 	});
 
-	test("declares exactly the data-read, user-write, and files-read capabilities", () => {
+	test("declares exactly the data-read, user-write, files-read, and members-read capabilities", () => {
 		// plugin.data.user-write requires plugin.data.read — dropping the read capability
-		// is a publish rejection.
+		// is a publish rejection. workspace.members.read is what the private-channel people
+		// picker reads; without it a member could create a private channel and never add
+		// anybody to it.
 		expect([...manifest.capabilities].sort()).toEqual([
 			"plugin.data.read",
 			"plugin.data.user-write",
 			"workspace.files.read",
+			"workspace.members.read",
 		]);
 	});
 
