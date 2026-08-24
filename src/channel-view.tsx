@@ -1,10 +1,12 @@
 import type { BonoboUiFrontendClient, BonoboUiMember } from "bonobo-plugin-sdk/frontend";
 import type { CSSProperties, KeyboardEvent, PointerEvent } from "react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { ArrowUp, Paperclip } from "lucide-react";
 import {
 	chat_channel_is_private,
 	chat_download_urls_response_schema,
 	chat_files_list_response_schema,
+	chat_format_recency,
 	chat_get_error_message,
 	chat_key_timestamp,
 	chat_message_key_prefix,
@@ -571,20 +573,45 @@ function Composer(props: Composer_Props) {
 					))}
 				</ul>
 			) : null}
-			<textarea
-				ref={textareaRef}
-				className="composer-input"
-				aria-label={props.label}
-				aria-describedby={hintId}
-				rows={2}
-				value={text}
-				onInput={(event) => {
-					const value = event.currentTarget.value;
-					setText(value);
-					update_mention_query(value, event.currentTarget.selectionStart ?? value.length);
-				}}
-				onKeyDown={handle_key_down}
-			/>
+			{/* One bar, not a tall box above a button row: the composer used to cost ~130px of a
+			    900px frame and read heavier than the log it serves. */}
+			<div className="composer-bar">
+				<textarea
+					ref={textareaRef}
+					className="composer-input"
+					aria-label={props.label}
+					aria-describedby={hintId}
+					placeholder={props.label}
+					rows={1}
+					value={text}
+					onInput={(event) => {
+						const value = event.currentTarget.value;
+						setText(value);
+						update_mention_query(value, event.currentTarget.selectionStart ?? value.length);
+					}}
+					onKeyDown={handle_key_down}
+				/>
+				{/* Icon-only, like the reference composer. The label moves to `aria-label`, so the control
+				    keeps the same accessible name it had as a text button. */}
+				<button
+					type="button"
+					className="composer-action"
+					aria-label="Attach file"
+					disabled={props.disabled}
+					onClick={() => setPickerOpen(true)}
+				>
+					<Paperclip size={18} aria-hidden="true" />
+				</button>
+				<button
+					type="button"
+					className="composer-action composer-send"
+					aria-label={props.busy ? "Sending…" : "Send"}
+					disabled={props.busy || props.disabled}
+					onClick={handle_send}
+				>
+					<ArrowUp size={18} aria-hidden="true" />
+				</button>
+			</div>
 			{mentionQuery !== null && mentionCandidates.length > 0 ? (
 				<>
 					<ul className="mention-menu" role="listbox" aria-label="Mention somebody">
@@ -611,22 +638,9 @@ function Composer(props: Composer_Props) {
 					</span>
 				</>
 			) : null}
-			<div className="composer-row">
-				<span id={hintId} className="composer-hint">
-					Enter sends · Shift+Enter for a new line
-				</span>
-				<button type="button" className="button" disabled={props.disabled} onClick={() => setPickerOpen(true)}>
-					Attach file
-				</button>
-				<button
-					type="button"
-					className="button button-primary"
-					disabled={props.busy || props.disabled}
-					onClick={handle_send}
-				>
-					{props.busy ? "Sending…" : "Send"}
-				</button>
-			</div>
+			<span id={hintId} className="composer-hint">
+				Enter sends · Shift+Enter for a new line
+			</span>
 			{pickerOpen ? (
 				<AttachmentPickerDialog
 					client={props.client}
@@ -771,9 +785,10 @@ function author_initials(authorName: string | null | undefined) {
 	return `${words[0][0]}${last}`.toUpperCase();
 }
 
-/** One entry of a rendered log: a day divider, or a message row with its grouping flag. */
+/** One entry of a rendered log: a day divider, the unread mark, or a message row. */
 type MessageListEntry =
 	| { kind: "divider"; key: string; label: string }
+	| { kind: "new"; key: string }
 	| { kind: "message"; doc: chat_Doc<chat_MessageValue>; isContinuation: boolean };
 
 /**
@@ -783,18 +798,40 @@ type MessageListEntry =
  * one day has none at all. A row continues the previous author's group when the same member wrote
  * it, on the same day, soon enough after the row above. Grouping is visual only: a continuation
  * still renders its author and time, hidden from sight but not from assistive technology.
+ *
+ * `unread` places the "New" mark above the first message the member has not read. Its `lastReadAt`
+ * is frozen when the channel opens, not read live: opening a channel writes the read cursor a
+ * moment later, and a live value would erase the mark while the member is still looking at it. The
+ * member's own messages never trigger the mark — they are not news to their author. A message
+ * directly under the mark still starts a new author group, so the mark never lands inside one.
  */
-function build_message_entries(docs: chat_Doc<chat_MessageValue>[], now: number): MessageListEntry[] {
+function build_message_entries(
+	docs: chat_Doc<chat_MessageValue>[],
+	now: number,
+	unread: { lastReadAt: number; selfUserId: string } | null = null,
+): MessageListEntry[] {
 	const entries: MessageListEntry[] = [];
 	let previous: chat_Doc<chat_MessageValue> | null = null;
+	let markPlaced = false;
 	for (const doc of docs) {
 		const startsNewDay = previous !== null && new Date(previous.timestamp).toDateString() !== new Date(doc.timestamp).toDateString();
 		if (startsNewDay) {
 			entries.push({ kind: "divider", key: `divider:${doc.key}`, label: format_day_label(doc.timestamp, now) });
 		}
+		const startsUnread =
+			!markPlaced &&
+			unread !== null &&
+			doc.timestamp > unread.lastReadAt &&
+			doc.createdBy !== unread.selfUserId &&
+			doc.value.deletedAt === null;
+		if (startsUnread) {
+			markPlaced = true;
+			entries.push({ kind: "new", key: `new:${doc.key}` });
+		}
 		const isContinuation =
 			previous !== null &&
 			!startsNewDay &&
+			!startsUnread &&
 			previous.createdBy === doc.createdBy &&
 			doc.timestamp - previous.timestamp <= GROUP_MAX_GAP_MS;
 		entries.push({ kind: "message", doc, isContinuation });
@@ -875,6 +912,8 @@ type MessageRow_Props = {
 	 * "unknown" = the replies window does not reach this root yet, so no count is claimed.
 	 */
 	replyCount: number | "unknown" | null;
+	/** Newest reply time the window holds for this root, or null when it holds no reply for it. */
+	replyLatestAt: number | null;
 	/** True while the replies window says more replies exist below it — gates the "99+" cap. */
 	repliesHasMore: boolean;
 	onOpenThread: ((doc: chat_Doc<chat_MessageValue>) => void) | null;
@@ -1079,9 +1118,19 @@ export function MessageRow(props: MessageRow_Props) {
 							className="message-thread-summary"
 							onClick={() => props.onOpenThread?.(doc)}
 						>
-							{`${chat_format_reply_count(props.replyCount, props.repliesHasMore)} ${
-								props.replyCount === 1 ? "reply" : "replies"
-							}`}
+							<span className="message-thread-summary-icon" aria-hidden="true">
+								↳
+							</span>
+							<span className="message-thread-summary-count">
+								{`${chat_format_reply_count(props.replyCount, props.repliesHasMore)} ${
+									props.replyCount === 1 ? "reply" : "replies"
+								}`}
+							</span>
+							{props.replyLatestAt !== null ? (
+								<span className="message-thread-summary-recency">
+									{`Last reply ${chat_format_recency(props.replyLatestAt, Date.now())}`}
+								</span>
+							) : null}
 						</button>
 					) : null}
 				</>
@@ -1333,6 +1382,7 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 					authorName={memberNames.get(root.createdBy)}
 					reactionGroups={props.reactionGroupsByTarget.get(root.key) ?? []}
 					replyCount={null}
+					replyLatestAt={null}
 					repliesHasMore={false}
 					onOpenThread={null}
 					replyTriggerRef={null}
@@ -1363,7 +1413,8 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 							<li key={entry.key} className="day-divider">
 								{entry.label}
 							</li>
-						) : (
+						) : entry.kind === "new" ? // A thread panel passes no read cursor, so this entry never reaches it.
+						null : (
 							<MessageRow
 								key={entry.doc.key}
 								client={client}
@@ -1376,6 +1427,7 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 								authorName={memberNames.get(entry.doc.createdBy)}
 								reactionGroups={props.reactionGroupsByTarget.get(entry.doc.key) ?? []}
 								replyCount={null}
+								replyLatestAt={null}
 								repliesHasMore={false}
 								onOpenThread={null}
 								replyTriggerRef={null}
@@ -1431,6 +1483,13 @@ type ChannelView_Props = {
 	 * it into this member's read-cursor write, so what was on screen stays read after a reload.
 	 */
 	onNewestVisible: (timestamp: number) => void;
+	/**
+	 * Where this member's read cursor stood when the channel was opened, or null when nothing was
+	 * unread. The "New messages" mark goes above the first message newer than it. The app freezes
+	 * the value at open time, because opening a channel writes the cursor forward a moment later
+	 * and a live value would erase the mark while the member is still reading.
+	 */
+	openedAtLastReadAt: number | null;
 };
 
 /**
@@ -1547,7 +1606,18 @@ function read_retry_after_ms(responseText: unknown) {
  * The parent keys this component by channel key, so every mount owns exactly one channel.
  */
 export function ChannelView(props: ChannelView_Props) {
-	const { client, userId, channel, memberNames, announce, threadRootKey, setThreadRootKey, isNarrow, onNewestVisible } =
+	const {
+		client,
+		userId,
+		channel,
+		memberNames,
+		announce,
+		threadRootKey,
+		setThreadRootKey,
+		isNarrow,
+		onNewestVisible,
+		openedAtLastReadAt,
+	} =
 		props;
 	const [messages, setMessages] = useState<chat_Doc<chat_MessageValue>[]>([]);
 	const [messagesLoaded, setMessagesLoaded] = useState(false);
@@ -2035,7 +2105,11 @@ export function ChannelView(props: ChannelView_Props) {
 	};
 
 	const threadRoot = threadRootKey === null ? null : (messages.find((doc) => doc.key === threadRootKey) ?? null);
-	const messageEntries = build_message_entries([...messages].reverse(), Date.now());
+	const messageEntries = build_message_entries(
+		[...messages].reverse(),
+		Date.now(),
+		openedAtLastReadAt === null ? null : { lastReadAt: openedAtLastReadAt, selfUserId: userId },
+	);
 	const threadWidthMaximum = Math.max(MIN_THREAD_WIDTH, bodyWidth - MIN_LOG_WIDTH);
 	const threadWidthEffective = clamp_thread_width(threadWidth);
 
@@ -2153,6 +2227,13 @@ export function ChannelView(props: ChannelView_Props) {
 									<li key={entry.key} className="day-divider">
 										{entry.label}
 									</li>
+								) : entry.kind === "new" ? (
+									// Announced from its own content like the day divider, so it needs no role
+									// and no label. "New messages" and not "New": read out on its own, a bare
+									// "New" says nothing about what follows.
+									<li key={entry.key} className="new-divider">
+										<span className="new-divider-label">New messages</span>
+									</li>
 								) : (
 									<MessageRow
 										key={entry.doc.key}
@@ -2177,9 +2258,10 @@ export function ChannelView(props: ChannelView_Props) {
 										// the window).
 										replyCount={
 											companion_covers_root(replyCoverage, entry.doc.key.slice(0, ROOT_KEY_LENGTH))
-												? (replyCounts.get(entry.doc.key) ?? 0)
+												? (replyCounts.get(entry.doc.key)?.count ?? 0)
 												: "unknown"
 										}
+										replyLatestAt={replyCounts.get(entry.doc.key)?.latestAt ?? null}
 										repliesHasMore={replyCoverage.hasMore}
 										onOpenThread={(root) => setThreadRootKey(root.key)}
 										replyTriggerRef={(el) => {

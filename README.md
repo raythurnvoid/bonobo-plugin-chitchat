@@ -30,6 +30,40 @@ Server-appended message and reply keys end with `<invertedPaddedMs>:<rand4>`, so
 - Channel documents are shared: any member with content write access can rename or archive a channel. Channel and message writes are compare-and-set on the stored revision, so a concurrent edit answers a conflict instead of overwriting silently.
 - Attachment links are resolved through `/api/v1/files/download-urls` at click time and never stored, so file permissions are rechecked per member and per click.
 
+## UI stack: real React and Ariakit, and why the bundle is minified
+
+The page runs **React 19**, **Ariakit** (pinned to exact `0.4.20`) and **lucide-react**. It used to run
+Preact through `preact/compat`, which is smaller. Two things forced the move:
+
+- **Ariakit cannot run on Preact.** Ariakit's `useEvent` seeds its ref with a function that throws
+  "Cannot call an event handler while rendering", then replaces it from `useInsertionEffect`. Preact
+  maps `useInsertionEffect` onto `useLayoutEffect`, so on unmount the throwing initial value is the
+  one that runs. Every test teardown threw and leaked its DOM into the next test.
+- **Ariakit pulls a second React in.** It imports `use-sync-external-store/shim`, a CommonJS package
+  that requires `react` itself. Aliasing `react` to `preact/compat` never reached it, so the page ran
+  two Reacts and every hook call failed. The fix under Preact was a virtual-module shim; under real
+  React the problem does not exist.
+
+Pin Ariakit **exactly**. The `^0.4.19` range resolves to 0.4.38, which is a different lineage
+(`@ariakit/react-components`) that ships raw `src/*.tsx`.
+
+A published plugin file may not exceed **900,000 bytes**. Measured on this bundle:
+
+| Build                              | Bytes     |
+| ---------------------------------- | --------- |
+| React, no minification             | 947,309   |
+| Identifier names preserved         | 908,086   |
+| Full esbuild minify, then prettier | ~730,000  |
+
+So the readable build does not fit and identifier names have to go. `vite.config.ts` minifies the
+JavaScript, and the build script then reformats it with prettier, which puts it back on ~25,800 lines
+averaging 28 characters. The CSS is not minified — it is 43 KB and there is room.
+
+Of the publish gate's mechanical checks this trips only the single-character-identifier one, which is
+**advisory** and blocks nothing; it exists for exactly this case, a bundled dependency the author
+cannot rename. The three checks that actually reject a publish all pass: no `Function(`, no long
+base64 literal, and an escape density of 0.00008 against a 0.01 limit.
+
 ## Development
 
 ```

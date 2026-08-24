@@ -18,6 +18,13 @@
  * what the plugin shipped before the theme channel existed.
  */
 :root {
+	/* Tells the browser which way to paint the parts this file cannot reach: scrollbars first, plus
+	   any native control. Without it Chrome paints a light scrollbar with stepper arrows down the
+	   middle of the dark message list. The frame is its own document, so the host app's own
+	   `color-scheme` never reaches it — this has to be declared here, next to the palette it belongs
+	   to, and a new palette block needs its own. */
+	color-scheme: dark;
+
 	--cc-surface: var(--bonobo-surface, #0b0b0e);
 	--cc-surface-sunken: #0e0e12;
 	--cc-surface-log: #131318;
@@ -39,6 +46,9 @@
 	--cc-accent: var(--bonobo-accent, #8ab4ff);
 	--cc-accent-surface: #24304a;
 	--cc-accent-surface-hover: #2b3a59;
+	/* The selected channel row only. It is a stronger blue than the tinted primary button, because
+	   one row out of a list has to be findable at a glance while a button already stands alone. */
+	--cc-accent-surface-selected: #25488a;
 	--cc-accent-border: #3a4c74;
 	--cc-accent-border-strong: #5b79b4;
 
@@ -60,6 +70,8 @@
 }
 
 :root.theme-light {
+	color-scheme: light;
+
 	--cc-surface: var(--bonobo-surface, #ffffff);
 	--cc-surface-sunken: #f5f5f7;
 	--cc-surface-log: #fafafb;
@@ -81,6 +93,8 @@
 	--cc-accent: var(--bonobo-accent, #1f5bd0);
 	--cc-accent-surface: #dbe6fb;
 	--cc-accent-surface-hover: #c7d8f7;
+	/* Same job on light: clearly the chosen row, still dark text on it. Measured 8.6:1. */
+	--cc-accent-surface-selected: #b3cdf6;
 	--cc-accent-border: #a9c3f0;
 	--cc-accent-border-strong: #5b79b4;
 
@@ -338,7 +352,7 @@ body {
 
 .sidebar-head {
 	display: flex;
-	flex-direction: column;
+	align-items: center;
 	gap: 8px;
 }
 
@@ -347,9 +361,23 @@ body {
  * closed, inert drawer cannot take the document's only level-1 heading with it.
  */
 .sidebar-title {
+	flex: 1;
+	min-width: 0;
+
 	margin: 0;
 	font-size: 16px;
 	font-weight: 600;
+}
+
+/* Small, and on the wordmark's line. As a full-width block it was the loudest thing in the sidebar
+   and pushed the section list down, while the reference sidebar opens straight into that list. */
+.sidebar-create {
+	flex: none;
+
+	padding: 4px 10px;
+	min-height: 28px;
+
+	font-size: 12px;
 }
 
 .channel-section {
@@ -376,17 +404,21 @@ body {
 	gap: 2px;
 }
 
+/* The row actions overlay this box, so it is the positioning context. */
 .channel-item {
 	display: flex;
 	flex-direction: column;
+	position: relative;
 }
 
 .channel-link {
 	appearance: none;
 	border: none;
-	border-radius: 8px;
+	border-radius: 10px;
 	background: transparent;
-	color: var(--cc-text-strong);
+	/* A read channel is the quiet default and an unread one is the exception that stands out. The
+	   rail reads as a list of names, not as a wall of equally loud rows (V1 findings 1 and 2). */
+	color: var(--cc-text-muted);
 	padding: 10px 10px;
 	min-height: 48px;
 	font: inherit;
@@ -413,11 +445,13 @@ body {
 }
 
 .channel-link[aria-current="page"] {
-	background: var(--cc-accent-surface);
+	background: var(--cc-accent-surface-selected);
 	color: var(--cc-text);
 }
 
-/* Unread: a heavier, brighter name plus an amber mark. Selection stays blue (decision 1). */
+/* Unread: a heavier, brighter name plus an amber mark. Selection stays blue (decision 1).
+   `--cc-text`, not `--cc-text-strong`: in the dark palette "strong" is the DIMMER of the two, so it
+   would flatten the very step this rule exists to make. */
 .channel-link.is-unread {
 	font-weight: 600;
 	color: var(--cc-text);
@@ -463,21 +497,130 @@ body {
 	flex-direction: column;
 }
 
+/*
+ * The row actions overlay the end of their own row. In flow they were `display: none` -> `flex` on
+ * hover, which added a second line to the row and pushed every channel below it down — the list
+ * moved under the pointer while the member was aiming at it. Out of flow the row costs the same
+ * height whether or not it is hovered.
+ *
+ * Hidden with opacity, never `display: none`, so the buttons stay in the tab order and tabbing to
+ * one is what triggers the keyboard reveal. `pointer-events` stays off the container, which
+ * lies over the channel button, and is restored only on the buttons themselves.
+ */
 .channel-item-actions {
-	display: none;
-	gap: 4px;
-	padding: 2px 8px 6px;
-}
+	position: absolute;
+	top: 50%;
+	right: 6px;
+	transform: translateY(-50%);
+	z-index: 1;
 
-.channel-item:hover .channel-item-actions,
-.channel-item:focus-within .channel-item-actions {
 	display: flex;
+	gap: 4px;
+
+	opacity: 0;
+	pointer-events: none;
 }
 
-.channel-item-action {
-	padding: 4px 10px;
-	font-size: 12px;
+/*
+ * Keyboard focus reveals the cluster, a mouse click does not. Plain `:focus-within` also fired on the
+ * click that opens a channel, so the row a member had just chosen answered by covering its own name
+ * with Rename and Archive.
+ */
+.channel-item:hover .channel-item-actions,
+.channel-item:has(:focus-visible) .channel-item-actions,
+.channel-item:has([aria-expanded="true"]) .channel-item-actions {
+	opacity: 1;
 }
+
+.channel-item:hover .channel-item-actions *,
+.channel-item:has(:focus-visible) .channel-item-actions *,
+.channel-item:has([aria-expanded="true"]) .channel-item-actions * {
+	pointer-events: auto;
+}
+
+/*
+ * Reserve room so the revealed trigger never sits on top of the channel name. One 28px button needs
+ * far less than the old three-text-button cluster, so the name keeps almost the whole row.
+ */
+.channel-item:hover .channel-link,
+.channel-item:has(:focus-visible) .channel-link,
+.channel-item:has([aria-expanded="true"]) .channel-link {
+	padding-right: 42px;
+}
+
+/* #region channel row menu */
+
+/*
+ * One 28px trigger instead of up to three text buttons. The old cluster was 122px wide on a 215px
+ * row, so it covered the row's own centre and the reserve that kept it off the name truncated the
+ * name instead.
+ */
+.ChannelRowMenu-trigger {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+
+	appearance: none;
+	border: 1px solid transparent;
+	border-radius: 6px;
+	/* Transparent at rest, like the composer's icon buttons. A filled chip read as bolted onto the
+	   row, worst on the selected row where a dark box sat on the blue. The row only shows this
+	   button when it is hovered, focused, or open, so a muted rest colour bought nothing and cost
+	   contrast on that blue. */
+	background: transparent;
+	color: var(--cc-text);
+	width: 28px;
+	height: 28px;
+	padding: 0;
+	cursor: pointer;
+}
+
+.ChannelRowMenu-trigger:hover {
+	background: var(--cc-surface-hover);
+	color: var(--cc-text);
+}
+
+.ChannelRowMenu-trigger:focus-visible {
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
+}
+
+.ChannelRowMenu-popover {
+	display: flex;
+	flex-direction: column;
+
+	z-index: 40;
+	border: 1px solid var(--cc-border-strong);
+	border-radius: 10px;
+	background: var(--cc-surface-raised);
+	padding: 4px;
+	min-width: 180px;
+
+	/* Keep the shared alpha token; only this popover's spread is tuned. A small two-item menu carried
+	   a dialog-sized shadow and read heavier than the surface it floats over. */
+	box-shadow: 0 8px 24px var(--cc-shadow-popover);
+}
+
+.ChannelRowMenu-item {
+	display: flex;
+	align-items: center;
+
+	border-radius: 6px;
+	background: transparent;
+	color: var(--cc-text);
+	padding: 0 12px;
+	min-height: 32px;
+
+	font-size: 13px;
+	cursor: pointer;
+}
+
+/* Ariakit moves this with the keyboard as well as the pointer, so it is the one hover-ish state. */
+.ChannelRowMenu-item[data-active-item] {
+	background: var(--cc-surface-hover);
+}
+
+/* #endregion channel row menu */
 
 /*
  * The expand control for the collapsed icon rail. It only exists in the 720–903px band with a thread
@@ -871,6 +1014,35 @@ body {
 	color: var(--cc-text-subtle);
 }
 
+/*
+ * The unread mark. A plain list item like the day divider, so it is announced from its own content
+ * with no role and no label. The rule is drawn with a border on the row and the label sits on the
+ * end of it, which is the one place amber means something other than a channel badge: decision 1
+ * gives amber to unread and mention emphasis, and this is the log's own unread boundary.
+ */
+.new-divider {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	min-height: 32px;
+	padding: 0 10px;
+
+	color: var(--cc-unread-accent);
+	font-size: 12px;
+	font-weight: 600;
+}
+
+.new-divider::before {
+	content: "";
+	flex: 1;
+	height: 1px;
+	background: var(--cc-unread-accent);
+}
+
+.new-divider-label {
+	flex-shrink: 0;
+}
+
 .message-head {
 	display: flex;
 	align-items: baseline;
@@ -990,16 +1162,41 @@ body {
 	border-radius: 8px;
 	background: transparent;
 	color: var(--cc-text-thread-summary);
-	padding: 2px 0;
+	padding: 2px 6px 2px 4px;
+	margin-left: -4px;
 	min-height: 24px;
 	font: inherit;
 	font-size: 12px;
 	text-align: left;
-	text-decoration: underline;
 	cursor: pointer;
+
+	/* The reply glyph and the recency sit on one line with the count. */
+	display: inline-flex;
+	align-items: baseline;
+	gap: 6px;
+}
+
+/*
+ * The entry point was easy to miss, and it did not look attached to the message it belongs to
+ * (V1 finding 4). The glyph is what attaches it; the underline moves to hover, which is what
+ * decision 1 asks for. Colour stays neutral: blue would claim a state the member does not own.
+ */
+.message-thread-summary-icon {
+	color: var(--cc-text-subtle);
+}
+
+.message-thread-summary-count {
+	font-weight: 600;
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+
+.message-thread-summary-recency {
+	color: var(--cc-text-subtle);
 }
 
 .message-thread-summary:hover {
+	background: var(--cc-surface-control);
 	color: var(--cc-text);
 }
 
@@ -1190,8 +1387,8 @@ body {
 .composer {
 	display: flex;
 	flex-direction: column;
-	gap: 6px;
-	padding: 10px 16px 14px;
+	gap: 4px;
+	padding: 8px 16px 10px;
 	border-top: 1px solid var(--cc-border);
 
 	/* The @-menu is absolutely positioned against the composer. */
@@ -1266,32 +1463,98 @@ body {
 	outline-offset: 2px;
 }
 
-.composer-input {
+/*
+ * The text box and its two controls share one bordered box, so the composer is one field the height
+ * of a standalone control rather than a tall empty box stacked on a button row. The border sits here
+ * and not on the textarea, because the reference composer draws the controls inside the field.
+ */
+.composer-bar {
+	display: flex;
+	align-items: end;
+	gap: 8px;
+
 	border: 1px solid var(--cc-border-strong);
-	border-radius: 10px;
+	border-radius: 14px;
 	background: var(--cc-surface-field);
-	color: var(--cc-text);
-	padding: 10px 12px;
+	padding: 5px 6px 5px 0;
 	min-height: 44px;
-	font: inherit;
-	resize: vertical;
 }
 
-.composer-input:focus-visible {
+/* Focus lands on the textarea, but the ring belongs on the box a member reads as the field. */
+.composer-bar:focus-within {
 	outline: 2px solid var(--cc-accent);
 	outline-offset: 2px;
 }
 
-.composer-row {
-	display: flex;
+.composer-input {
+	flex: 1;
+	min-width: 0;
+
+	border: none;
+	background: transparent;
+	color: var(--cc-text);
+	padding: 8px 12px;
+	/* Growing past a few lines would eat the log; past that the box scrolls. */
+	max-height: 132px;
+	font: inherit;
+	resize: vertical;
+}
+
+/* The box already shows the ring, and a second one inside it read as two nested fields. */
+.composer-input:focus-visible {
+	outline: none;
+}
+
+/*
+ * Icon-only, quiet enough to sit inside the field without competing with the message it sends.
+ * 32px keeps it above the 24px WCAG 2.5.8 AA target size even though it is inside a dense bar.
+ */
+.composer-action {
+	display: inline-flex;
 	align-items: center;
-	gap: 8px;
+	justify-content: center;
+	flex: none;
+
+	appearance: none;
+	border: 1px solid transparent;
+	border-radius: 8px;
+	background: transparent;
+	color: var(--cc-text-muted);
+	width: 32px;
+	height: 32px;
+	padding: 0;
+	cursor: pointer;
+}
+
+.composer-action:hover:not(:disabled) {
+	background: var(--cc-surface-hover);
+	color: var(--cc-text);
+}
+
+.composer-action:focus-visible {
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
+}
+
+.composer-action:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+
+/* Send is the one filled control in the bar, the way the reference draws it. */
+.composer-send {
+	background: var(--cc-accent-surface);
+	border-color: var(--cc-accent-border);
+	color: var(--cc-text);
+}
+
+.composer-send:hover:not(:disabled) {
+	background: var(--cc-accent-surface-hover);
 }
 
 .composer-hint {
-	flex: 1;
 	min-width: 0;
-	font-size: 12px;
+	font-size: 11px;
 	color: var(--cc-text-subtle);
 }
 
@@ -1556,9 +1819,20 @@ body {
 		white-space: nowrap;
 	}
 
+	/* The wordmark and the create button do not fit in 56px. Left in, they clipped mid-word
+	   ("Chitch", "Crea chan") and gave the rail its own horizontal scrollbar. */
 	.chitchat.has-thread .channel-section-title,
+	.chitchat.has-thread .sidebar-title,
+	.chitchat.has-thread .sidebar-create,
 	.chitchat.has-thread .channel-item-actions {
 		display: none;
+	}
+
+	/* No actions here, so no room to reserve for them: the reserve would push the centred initial
+	   out of a 56px row on hover. */
+	.chitchat.has-thread .channel-item:hover .channel-link,
+	.chitchat.has-thread .channel-item:has(:focus-visible) .channel-link {
+		padding-right: 4px;
 	}
 
 	.chitchat.has-thread .sidebar-expand {
@@ -1596,8 +1870,23 @@ body {
 		clip-path: none;
 	}
 
-	.chitchat.has-thread .sidebar.is-expanded .channel-section-title {
+	.chitchat.has-thread .sidebar.is-expanded .channel-section-title,
+	.chitchat.has-thread .sidebar.is-expanded .sidebar-title,
+	.chitchat.has-thread .sidebar.is-expanded .sidebar-create {
 		display: block;
+	}
+
+	.chitchat.has-thread .sidebar.is-expanded .channel-item-actions {
+		display: flex;
+	}
+
+	/* The drawer shows the same single trigger as the wide rail, so it reserves the same 42px. It
+	   used to reserve min(150px, 55%), which was written for the old three-text-button cluster: on a
+	   215px row that is 118px held for a 28px button, and the channel name was cut to 95px. */
+	.chitchat.has-thread .sidebar.is-expanded .channel-item:hover .channel-link,
+	.chitchat.has-thread .sidebar.is-expanded .channel-item:has(:focus-visible) .channel-link,
+	.chitchat.has-thread .sidebar.is-expanded .channel-item:has([aria-expanded="true"]) .channel-link {
+		padding-right: 42px;
 	}
 }
 

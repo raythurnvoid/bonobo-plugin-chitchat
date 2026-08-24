@@ -37,6 +37,7 @@ import {
 } from "./chat-data";
 import { chat_create_window_store } from "./chat-store";
 import { ChannelView, type chat_MemberNamesApi } from "./channel-view";
+import { ChannelRowMenu } from "./channel-row-menu";
 import { Dialog } from "./dialog";
 
 // #region member names
@@ -885,6 +886,12 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	/** Holds either a channel key or a `view:*` key — views share the one selection. */
 	const [selectedKey, setSelectedKey] = useState<string | null>(null);
 	/**
+	 * The read cursor of the selected channel, frozen at the moment it was opened. `ChannelView`
+	 * puts its "New messages" mark above the first message newer than this. null = nothing was
+	 * unread when the channel opened, so no mark is drawn.
+	 */
+	const [openedAtLastReadAt, setOpenedAtLastReadAt] = useState<number | null>(null);
+	/**
 	 * The open thread, held here rather than in `ChannelView`, because the icon rail collapses on the
 	 * `.chitchat` root and only this component renders it.
 	 */
@@ -947,6 +954,13 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 			return last !== undefined && last > (privateCursors.get(channel.key)?.at ?? 0);
 		}
 		return publicUnreads.has(channel.key);
+	};
+
+	/** Where this member's read cursor stands for a channel right now, epoch ms. 0 = never read. */
+	const read_cursor_at = (channel: chat_Doc<chat_ChannelValue>) => {
+		return chat_channel_is_private(channel.key)
+			? (privateCursors.get(channel.key)?.at ?? 0)
+			: (cursorDoc?.value.channels[channel.key] ?? 0);
 	};
 
 	/** Unread mentions of this member in a channel. Zero for private ones: a shared doc cannot say. */
@@ -1303,7 +1317,13 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 		// Opening a channel reads it. Write only when something is unread, so channel switching
 		// does not spend the write budget on channels that were already read.
 		if (channel_has_unread(channel) || channel_mention_count(channel) > 0) {
+			// Freeze where the cursor stood BEFORE the write below moves it. The channel places its
+			// "New messages" mark on this value, so reading it live would erase the mark a moment
+			// after the member arrived.
+			setOpenedAtLastReadAt(read_cursor_at(channel));
 			mark_channel_read(channel, Date.now());
+		} else {
+			setOpenedAtLastReadAt(null);
 		}
 		// The switch is announced; focus stays on the invoked channel control (a11y contract C9).
 		announce(`#${channel.value.name}`);
@@ -1424,6 +1444,9 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 			// The sidebar shows the channel when the watch delivers it; select it now.
 			// (0.8.0 put results carry only revision and byteSize, so use the local key.)
 			setSelectedKey(key);
+			// A channel this member just created has nothing unread, and the frozen cursor belongs
+			// to the channel they were reading before this one.
+			setOpenedAtLastReadAt(null);
 			close_dialog();
 		})().catch((error: unknown) => {
 			setDialogBusy(false);
@@ -1529,6 +1552,9 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 									{channel.value.name.slice(0, 1).toUpperCase()}
 								</span>
 								<span className="channel-name">
+									{/* One text node on purpose. Wrapping the "#" in its own element to dim it
+									    made the accessible name "# general" instead of "#general", which is the
+									    name members hear and every QA locator matches on. */}
 									#{channel.value.name}
 									{/* Said on the channels that are in the list, and nowhere else. A member who is
 									    not in a private channel receives none of its documents, so it is absent from
@@ -1552,43 +1578,36 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 								) : null}
 							</button>
 							<span className="channel-item-actions">
-								{chat_channel_is_private(channel.key) ? (
-									<button
-										type="button"
-										className="button channel-item-action"
-										aria-label={`People in #${channel.value.name}`}
-										onClick={() => setDialog({ kind: "people", channel })}
-									>
-										People
-									</button>
-								) : null}
-								<button
-									type="button"
-									className="button channel-item-action"
-									aria-label={`Rename #${channel.value.name}`}
-									onClick={() => setDialog({ kind: "rename", channel })}
-								>
-									Rename
-								</button>
-								{channel.value.archivedAt === null ? (
-									<button
-										type="button"
-										className="button channel-item-action"
-										aria-label={`Archive #${channel.value.name}`}
-										onClick={() => setDialog({ kind: "archive", channel })}
-									>
-										Archive
-									</button>
-								) : (
-									<button
-										type="button"
-										className="button channel-item-action"
-										aria-label={`Unarchive #${channel.value.name}`}
-										onClick={() => handle_unarchive(channel)}
-									>
-										Unarchive
-									</button>
-								)}
+								<ChannelRowMenu
+									channelName={channel.value.name}
+									items={[
+										...(chat_channel_is_private(channel.key)
+											? [
+													{
+														id: "people",
+														label: `People in #${channel.value.name}`,
+														onSelect: () => setDialog({ kind: "people", channel }),
+													},
+												]
+											: []),
+										{
+											id: "rename",
+											label: `Rename #${channel.value.name}`,
+											onSelect: () => setDialog({ kind: "rename", channel }),
+										},
+										channel.value.archivedAt === null
+											? {
+													id: "archive",
+													label: `Archive #${channel.value.name}`,
+													onSelect: () => setDialog({ kind: "archive", channel }),
+												}
+											: {
+													id: "unarchive",
+													label: `Unarchive #${channel.value.name}`,
+													onSelect: () => handle_unarchive(channel),
+												},
+									]}
+								/>
 							</span>
 						</li>
 						);
@@ -1638,7 +1657,7 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 						>
 							{railExpanded ? "«" : "»"}
 						</button>
-						<button type="button" className="button" onClick={() => setDialog({ kind: "create" })}>
+						<button type="button" className="button sidebar-create" onClick={() => setDialog({ kind: "create" })}>
 							Create channel
 						</button>
 					</div>
@@ -1736,6 +1755,7 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 						setThreadRootKey={setThreadRootKey}
 						isNarrow={isNarrow}
 						onNewestVisible={(timestamp) => handle_newest_visible(selected, timestamp)}
+						openedAtLastReadAt={openedAtLastReadAt}
 					/>
 				) : !channelsLoaded ? (
 					<div className="channel-status" role="status">

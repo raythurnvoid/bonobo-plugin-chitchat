@@ -191,11 +191,27 @@ describe("chat_count_replies", () => {
 			...message_doc(0, {}),
 			collection: "replies",
 			key: `${root}:${inv(ms)}:r${ms}`,
+			timestamp: ms,
 		}));
 		const store = chat_create_accumulating_store(chat_validate_message_doc);
 		store.apply_window(docs);
 		const counts = chat_count_replies(store.get_sorted());
-		expect(counts.get(root)).toBe(3);
+		expect(counts.get(root)?.count).toBe(3);
+	});
+
+	test("reports the newest reply time per root, whatever order the window delivers", () => {
+		// The summary prints this as "Last reply …", so an older reply arriving after a newer one
+		// must not move it backwards.
+		const root = message_key(2_000);
+		const docs = [1_002, 1_000, 1_001].map((ms) => ({
+			...message_doc(0, {}),
+			collection: "replies",
+			key: `${root}:${inv(ms)}:r${ms}`,
+			timestamp: ms,
+		}));
+		const store = chat_create_accumulating_store(chat_validate_message_doc);
+		store.apply_window(docs);
+		expect(chat_count_replies(store.get_sorted()).get(root)?.latestAt).toBe(1_002);
 	});
 });
 

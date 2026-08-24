@@ -171,6 +171,137 @@ describe("chitchat.css density constants", () => {
 	});
 });
 
+describe("chitchat.css unread mark", () => {
+	test("the New messages rule paints in the unread amber and nothing else", () => {
+		// Decision 1 gives amber exactly two jobs, unread and mention emphasis. This is the log's
+		// own unread boundary, so it must read as the same amber the rail badges use — not as the
+		// blue that means "state the member owns".
+		const divider = rule_body("\\.new-divider");
+		expect(divider).toContain("var(--cc-unread-accent)");
+		expect(divider).not.toContain("var(--cc-accent");
+		expect(rule_body("\\.new-divider::before")).toContain("var(--cc-unread-accent)");
+	});
+
+	test("it is a full-width rule, not a floating word", () => {
+		// A bare label would read as a message. The line is what makes it a boundary.
+		const before = rule_body("\\.new-divider::before");
+		expect(before).toContain("flex: 1");
+		expect(before).toContain("height: 1px");
+	});
+});
+
+describe("chitchat.css selected channel row", () => {
+	test("carries its own blue, stronger than the tinted primary button", () => {
+		// Decision 1 gives blue to selection. Sharing the button's tint made the chosen row hard to
+		// find in the list, and brightening the shared role would have shouted from every Send button.
+		const selected = rule_body('\\.channel-link\\[aria-current="page"\\]');
+		expect(selected).toContain("var(--cc-accent-surface-selected)");
+		expect(selected).not.toContain("var(--cc-accent-surface)");
+		expect(selected).not.toContain("var(--cc-unread-accent)");
+	});
+});
+
+describe("chitchat.css channel row actions", () => {
+	const actions = rule_body("\\.channel-item-actions");
+
+	test("overlays its own row instead of adding a second line to it", () => {
+		// In flow the cluster was display:none -> flex on hover, which pushed every row below it
+		// down while the member was aiming at one of them.
+		expect(actions).toContain("position: absolute");
+		expect(actions).not.toContain("display: none");
+		expect(rule_body("\\.channel-item")).toContain("position: relative");
+	});
+
+	test("hides with opacity so the buttons stay in the tab order", () => {
+		expect(actions).toContain("opacity: 0");
+		expect(actions).not.toContain("visibility: hidden");
+		expect(css).toMatch(/\.channel-item:has\(:focus-visible\) \.channel-item-actions/u);
+	});
+
+	test("reveals for keyboard focus only, never for the click that opens the channel", () => {
+		// `:focus-within` also matched the mouse click that selects a row, so the chosen row answered
+		// by covering its own name with Rename and Archive.
+		expect(css).not.toMatch(/:focus-within \.channel-item-actions/u);
+		expect(css).not.toMatch(/\.channel-item:focus-within \.channel-link/u);
+	});
+
+	test("stays revealed while its menu is open, so the trigger cannot vanish under the pointer", () => {
+		// The menu takes focus out of the row, so hover and :focus-visible both stop matching. Without
+		// this the trigger disappeared the moment its own menu opened. Assert the reveal rule itself:
+		// naming the selector alone also matched the pointer-events rule, and passed with the reveal
+		// deleted.
+		expect(
+			rule_body(
+				'\\.channel-item:hover \\.channel-item-actions,\\s*\\.channel-item:has\\(:focus-visible\\) \\.channel-item-actions,\\s*\\.channel-item:has\\(\\[aria-expanded="true"\\]\\) \\.channel-item-actions',
+			),
+		).toContain("opacity: 1");
+	});
+
+	test("keeps the cluster transparent to the pointer and restores it on the buttons", () => {
+		// The cluster's box lies over the channel button underneath it.
+		expect(actions).toContain("pointer-events: none");
+		expect(
+			rule_body(
+				'\\.channel-item:hover \\.channel-item-actions \\*,\\s*\\.channel-item:has\\(:focus-visible\\) \\.channel-item-actions \\*,\\s*\\.channel-item:has\\(\\[aria-expanded="true"\\]\\) \\.channel-item-actions \\*',
+			),
+		).toContain("pointer-events: auto");
+	});
+
+	test("reserves only one trigger's width, not a row of text buttons", () => {
+		// Three text buttons needed min(150px, 55%) and still truncated the name. One 28px trigger
+		// leaves the name almost the whole row.
+		expect(
+			rule_body(
+				'\\.channel-item:hover \\.channel-link,\\s*\\.channel-item:has\\(:focus-visible\\) \\.channel-link,\\s*\\.channel-item:has\\(\\[aria-expanded="true"\\]\\) \\.channel-link',
+			),
+		).toContain("padding-right: 42px");
+	});
+
+	test("the trigger takes the dense target size, not the standalone one", () => {
+		const trigger = rule_body("\\.ChannelRowMenu-trigger");
+		expect(trigger).toContain("width: 28px");
+		expect(trigger).toContain("height: 28px");
+	});
+
+	test("the menu floats above the sidebar instead of being clipped by it", () => {
+		// The sidebar scrolls, so an in-flow menu was cut off by the first row opened near the bottom.
+		const popover = rule_body("\\.ChannelRowMenu-popover");
+		expect(popover).toMatch(/z-index:\s*\d/u);
+		expect(popover).toContain("box-shadow");
+	});
+});
+
+describe("chitchat.css composer", () => {
+	test("the input and its controls share one line", () => {
+		// Stacked, the composer cost ~130px of a 900px frame and read heavier than the log.
+		expect(rule_body("\\.composer-bar")).toContain("display: flex");
+		expect(rule_body("\\.composer-input")).toContain("flex: 1");
+	});
+
+	test("the bar keeps a standalone target height and the input keeps a growth ceiling", () => {
+		expect(rule_body("\\.composer-bar")).toContain("min-height: 44px");
+		expect(rule_body("\\.composer-input")).toMatch(/max-height:\s*\d/u);
+	});
+
+	test("the field border is drawn once, around the whole bar", () => {
+		// The reference composer puts the controls inside the field. A border on the textarea as well
+		// drew a box inside a box, and the controls sat outside both.
+		expect(rule_body("\\.composer-bar")).toContain("border: 1px solid var(--cc-border-strong)");
+		expect(rule_body("\\.composer-input")).toContain("border: none");
+		expect(rule_body("\\.composer-bar:focus-within")).toContain("outline: 2px solid var(--cc-accent)");
+	});
+});
+
+describe("chitchat.css thread summary", () => {
+	test("stays neutral: no blue call to action and no amber", () => {
+		// Decision 1: blue is state the member owns and amber is unread. A summary is a link.
+		const summary = rule_body("\\.message-thread-summary");
+		expect(summary).toContain("var(--cc-text-thread-summary)");
+		expect(summary).not.toContain("var(--cc-unread-accent)");
+		expect(rule_body("\\.message-thread-summary-recency")).toContain("var(--cc-text-subtle)");
+	});
+});
+
 describe("chitchat.css thread column", () => {
 	test("the column resizes by its flex basis, with a floor and a hit area", () => {
 		// A definite flex-basis is the flex base size, so a handle writing `width` moves nothing at
@@ -226,6 +357,46 @@ describe("chitchat.css icon rail", () => {
 	// where `.chitchat.has-thread .sidebar` outranks the drawer's own `.sidebar` three classes to one.
 	const rail = media_body("(min-width: 720px) and (max-width: 903px)");
 
+	test("hides the two head controls that do not fit in 56px", () => {
+		// Left in, the wordmark and the create button clipped mid-word ("Chitch", "Crea chan") and
+		// gave the rail its own horizontal scrollbar.
+		const hidden = rule_body(
+			"\\.chitchat\\.has-thread \\.channel-section-title,\\s*\\.chitchat\\.has-thread \\.sidebar-title,\\s*\\.chitchat\\.has-thread \\.sidebar-create,\\s*\\.chitchat\\.has-thread \\.channel-item-actions",
+			rail,
+		);
+		expect(hidden).toContain("display: none");
+		// And the expanded overlay must bring them back, or expanding the rail shows a headless list.
+		expect(rail).toMatch(/\.sidebar\.is-expanded \.sidebar-title/u);
+		expect(rail).toMatch(/\.sidebar\.is-expanded \.sidebar-create/u);
+	});
+
+	test("drops the hover reserve, because the collapsed rail shows no row actions", () => {
+		// The reserve is written for a 240px row. Left to apply here it would push the centred
+		// initial out of a 56px one on hover.
+		expect(
+			rule_body(
+				"\\.chitchat\\.has-thread \\.channel-item:hover \\.channel-link,\\s*\\.chitchat\\.has-thread \\.channel-item:has\\(:focus-visible\\) \\.channel-link",
+				rail,
+			),
+		).toContain("padding-right: 4px");
+	});
+
+	test("the expanded drawer reserves the same 42px as the wide rail", () => {
+		// The drawer shows the same single trigger, so it must reserve the same room. It kept the old
+		// three-button min(150px, 55%) when the trigger replaced them: measured in the browser, that
+		// held 118px of a 215px row for a 28px button and cut the channel name to 95px.
+		expect(
+			rule_body(
+				'\\.chitchat\\.has-thread \\.sidebar\\.is-expanded \\.channel-item:hover \\.channel-link,\\s*\\.chitchat\\.has-thread \\.sidebar\\.is-expanded \\.channel-item:has\\(:focus-visible\\) \\.channel-link,\\s*\\.chitchat\\.has-thread \\.sidebar\\.is-expanded \\.channel-item:has\\(\\[aria-expanded="true"\\]\\) \\.channel-link',
+				rail,
+			),
+		).toContain("padding-right: 42px");
+		// No rail rule may bring a percentage reserve back. The trigger is a fixed 28px, so a reserve
+		// that scales with the row width is always the old cluster's value. Scoped to the rail on
+		// purpose: message rows still carry several inline buttons and keep their own percentage.
+		expect(rail).not.toMatch(/padding-right:\s*min\(/u);
+	});
+
 	test("collapses only while a thread is open, inside the two-bound band", () => {
 		expect(rail).not.toBe("");
 		expect(rule_body("\\.chitchat\\.has-thread \\.sidebar", rail)).toContain("width: 56px");
@@ -278,6 +449,15 @@ describe("chitchat.css theme", () => {
 		// this environment, so the two lists are what catches it.
 		expect(dark.length).toBeGreaterThan(20);
 		expect(light).toEqual(dark);
+	});
+
+	test("each palette block declares the matching color-scheme", () => {
+		// Scrollbars and native controls are painted by the browser, not by this file, and they follow
+		// `color-scheme` alone. Without it Chrome drew a light scrollbar with stepper arrows down the
+		// middle of the dark message list. The frame is its own document, so the host app's own
+		// declaration never reaches it.
+		expect(rule_body(":root")).toContain("color-scheme: dark");
+		expect(rule_body(":root\\.theme-light")).toContain("color-scheme: light");
 	});
 
 	test("no rule outside the palette writes a colour of its own", () => {

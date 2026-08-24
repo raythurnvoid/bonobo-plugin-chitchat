@@ -150,15 +150,30 @@ export function chat_group_reactions(docs: chat_ReactionDoc[], myUserId: string)
 	return groups;
 }
 
-/** Replies per root message key, counted from the bounded channel-wide replies watch. */
-export function chat_count_replies(docs: chat_Doc<chat_MessageValue>[]): Map<string, number> {
-	const counts = new Map<string, number>();
+/**
+ * Replies per root message key, counted from the bounded channel-wide replies watch.
+ *
+ * `latestAt` is the newest reply time the window holds for that root. The summary line shows it as
+ * "Last reply …", and it is only honest for a root the window already covers. A root it does not
+ * reach reports `replyCount: "unknown"` and renders no summary at all, so no caller can read a
+ * time here that the window did not actually deliver.
+ */
+export function chat_count_replies(
+	docs: chat_Doc<chat_MessageValue>[],
+): Map<string, { count: number; latestAt: number }> {
+	const counts = new Map<string, { count: number; latestAt: number }>();
 	for (const doc of docs) {
 		const rootKey = chat_reply_root_key(doc.key);
 		if (rootKey === null) {
 			continue;
 		}
-		counts.set(rootKey, (counts.get(rootKey) ?? 0) + 1);
+		const existing = counts.get(rootKey);
+		if (existing === undefined) {
+			counts.set(rootKey, { count: 1, latestAt: doc.timestamp });
+		} else {
+			existing.count += 1;
+			existing.latestAt = Math.max(existing.latestAt, doc.timestamp);
+		}
 	}
 	return counts;
 }

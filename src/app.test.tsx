@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/preact";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { BonoboUiFrontendClient, BonoboUiTheme } from "bonobo-plugin-sdk/frontend";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App } from "./app";
@@ -367,6 +367,17 @@ async function boot(h: ReturnType<typeof make_harness>, channels: unknown[] = [c
 	return utils;
 }
 
+/**
+ * Opens a channel row's overflow menu and returns one of its items.
+ *
+ * The row's actions used to be buttons sitting in the row itself. They live in a floating menu now,
+ * so a test has to open it before the item exists at all.
+ */
+async function open_channel_menu_item(channelName: string, itemName: string) {
+	fireEvent.click(screen.getByRole("button", { name: `Actions for #${channelName}` }));
+	return await screen.findByRole("menuitem", { name: itemName });
+}
+
 /** Listeners the app registered on the narrow media query, so a test can flip the match. */
 const narrowQueryListeners = new Set<(event: MediaQueryListEvent) => void>();
 let narrowMatches = false;
@@ -383,8 +394,15 @@ function set_viewport_narrow(matches: boolean): void {
 	}
 }
 
-/** Callbacks the app handed to `ResizeObserver`, so a test can report a new container size. */
-const resizeObserverCallbacks = new Set<() => void>();
+/**
+ * What each `ResizeObserver` callback is watching, so a test can report a new size to the observers
+ * of one element only.
+ *
+ * Tracking the targets is not decoration. Ariakit positions its menu with floating-ui, which
+ * registers its own ResizeObserver and destructures the entries argument. Firing every observer with
+ * no arguments threw in there and took an unrelated test down with it.
+ */
+const resizeObserverTargets = new Map<ResizeObserverCallback, Set<Element>>();
 
 /**
  * Reports a container resize. happy-dom's ResizeObserver never fires, so the separator's range
@@ -394,23 +412,42 @@ const resizeObserverCallbacks = new Set<() => void>();
 function report_container_resize(width: number): void {
 	const body = document.querySelector(".channel-body")!;
 	Object.defineProperty(body, "clientWidth", { configurable: true, value: width });
-	for (const callback of resizeObserverCallbacks) {
-		callback();
+
+	// Only the observers actually watching this element, the way a real ResizeObserver behaves.
+	for (const [callback, targets] of resizeObserverTargets) {
+		if (!targets.has(body)) {
+			continue;
+		}
+
+		const entries = [...targets].map((target) => ({ target, contentRect: target.getBoundingClientRect() }));
+		callback(entries as unknown as ResizeObserverEntry[], null as unknown as ResizeObserver);
 	}
 }
 
 beforeEach(() => {
 	narrowQueryListeners.clear();
 	narrowMatches = false;
-	resizeObserverCallbacks.clear();
+	resizeObserverTargets.clear();
 	vi.stubGlobal(
 		"ResizeObserver",
 		class {
-			constructor(callback: () => void) {
-				resizeObserverCallbacks.add(callback);
+			#callback: ResizeObserverCallback;
+			#targets = new Set<Element>();
+
+			constructor(callback: ResizeObserverCallback) {
+				this.#callback = callback;
+				resizeObserverTargets.set(callback, this.#targets);
 			}
-			observe() {}
-			disconnect() {}
+			observe(target: Element) {
+				this.#targets.add(target);
+			}
+			unobserve(target: Element) {
+				this.#targets.delete(target);
+			}
+			disconnect() {
+				this.#targets.clear();
+				resizeObserverTargets.delete(this.#callback);
+			}
 		},
 	);
 	vi.stubGlobal("matchMedia", (query: string) => ({
@@ -576,7 +613,7 @@ test("a rename carries the channel topic and an emptied topic is removed", async
 	const h = make_harness();
 	await boot(h, [{ ...channel_doc(CH1_KEY, "general"), value: { name: "general", archivedAt: null, topic: "standups" } }]);
 
-	fireEvent.click(screen.getByRole("button", { name: "Rename #general" }));
+	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
 	const dialog = await screen.findByRole("dialog");
 	// The topic is editable here, and it round-trips: a rename that dropped it would delete the
 	// topic on every rename, because the put replaces the whole value.
@@ -684,7 +721,7 @@ test("a non-creator can rename a channel: the shared put succeeds and the dialog
 	// from this member (user_me) goes through.
 	await boot(h, [{ ...channel_doc(CH1_KEY, "general"), createdBy: "user_other", updatedBy: "user_other" }]);
 
-	fireEvent.click(screen.getByRole("button", { name: "Rename #general" }));
+	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
 	const dialog = await screen.findByRole("dialog");
 	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "renamed" } });
 	fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
@@ -706,7 +743,7 @@ test("rename is compare-and-set: a conflict keeps the dialog open with a clear e
 	});
 	await boot(h, [{ ...channel_doc(CH1_KEY, "general"), revision: 4 }]);
 
-	fireEvent.click(screen.getByRole("button", { name: "Rename #general" }));
+	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
 	const dialog = await screen.findByRole("dialog");
 	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "renamed" } });
 	fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
@@ -1473,7 +1510,7 @@ test("reply counts follow the replies window: covered roots get counts, the deep
 			})),
 		),
 	);
-	expect(await screen.findByRole("button", { name: "3 replies" })).toBeTruthy();
+	expect(await screen.findByRole("button", { name: /^3 replies/ })).toBeTruthy();
 
 	// While more replies exist below the window, rootNew is fully covered (the window
 	// reaches the older rootOld), so its big count shows — capped at 99+. rootOld is the
@@ -1490,13 +1527,13 @@ test("reply counts follow the replies window: covered roots get counts, the deep
 		key: `${rootOld.key}:${inv(2_000)}:ro00`,
 	};
 	replies.onUpdate(window_update([...hundredOnNew, oneOnOld], { hasMore: true }));
-	expect(await screen.findByRole("button", { name: "99+ replies" })).toBeTruthy();
+	expect(await screen.findByRole("button", { name: /^99\+ replies/ })).toBeTruthy();
 	expect(screen.getByRole("button", { name: "View thread" })).toBeTruthy();
 
 	// Once nothing more exists below, every count is exact and prints uncapped.
 	replies.onUpdate(window_update([...hundredOnNew, oneOnOld]));
-	expect(await screen.findByRole("button", { name: "100 replies" })).toBeTruthy();
-	expect(screen.getByRole("button", { name: "1 reply" })).toBeTruthy();
+	expect(await screen.findByRole("button", { name: /^100 replies/ })).toBeTruthy();
+	expect(screen.getByRole("button", { name: /^1 reply/ })).toBeTruthy();
 	expect(screen.queryByRole("button", { name: "View thread" })).toBeNull();
 });
 
@@ -1605,13 +1642,13 @@ test("a dead replies window makes an exact count read unknown", async () => {
 	replies.onUpdate(
 		window_update([{ ...message_doc(900, {}), collection: "replies", key: `${root.key}:${inv(900)}:r0` }]),
 	);
-	expect(await screen.findByRole("button", { name: "1 reply" })).toBeTruthy();
+	expect(await screen.findByRole("button", { name: /^1 reply/ })).toBeTruthy();
 
 	// hasMore was false, so the count was exact. A dead window keeps that number on the row while
 	// replies go on arriving: the most confident thing on the row becomes the stalest.
 	replies.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
 	expect(await screen.findByRole("button", { name: "View thread" })).toBeTruthy();
-	expect(screen.queryByRole("button", { name: "1 reply" })).toBeNull();
+	expect(screen.queryByRole("button", { name: /^1 reply/ })).toBeNull();
 });
 
 test("the thread summary is body content on a root with replies, outside the hover cluster", async () => {
@@ -1629,7 +1666,7 @@ test("the thread summary is body content on a root with replies, outside the hov
 	// The cluster is an opacity: 0 overlay revealed on hover and focus, so a summary inside it is
 	// invisible until somebody points at the row — the "easy to miss" finding this move answers.
 	// Assert containment, not presence: presence alone was already true before the move.
-	const summary = await screen.findByRole("button", { name: "2 replies" });
+	const summary = await screen.findByRole("button", { name: /^2 replies/ });
 	expect(summary.closest(".message-actions")).toBeNull();
 	expect(summary.classList.contains("message-thread-summary")).toBe(true);
 	expect(document.activeElement).not.toBe(summary);
@@ -2275,7 +2312,9 @@ test("the same channel shows normally for a member who is in it", async () => {
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 	expect(nav.querySelectorAll(".channel-item")).toHaveLength(2);
 	expect(within(nav).getByText("#secret-plans (private)")).toBeTruthy();
-	expect(within(nav).getByRole("button", { name: "People in #secret-plans" })).toBeTruthy();
+	// The row itself only carries the menu trigger; the action lives in the floating menu it opens.
+	expect(within(nav).getByRole("button", { name: "Actions for #secret-plans" })).toBeTruthy();
+	expect(await open_channel_menu_item("secret-plans", "People in #secret-plans")).toBeTruthy();
 });
 
 test("a private channel arrives through its own scope read, and leaves when the member is taken out", async () => {
@@ -2387,7 +2426,7 @@ test("the people dialog shows who is in a private channel and can take somebody 
 	]);
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 
-	fireEvent.click(screen.getByRole("button", { name: "People in #secret-plans" }));
+	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
 	const dialog = await screen.findByRole("dialog");
 	// The list comes from the server, not from what this page remembers writing — after a reload
 	// the page knows nothing, and a colleague with `manage` may have changed it since.
@@ -2439,6 +2478,79 @@ test("a message newer than the cursor marks its channel unread, and a newer curs
 		]),
 	);
 	await waitFor(() => expect(randomRow().className).not.toContain("is-unread"));
+});
+
+test("opening an unread channel marks where reading stopped, and the mark survives the read write", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	// Bob wrote in #random after this member's cursor stopped at t=1000.
+	h.find_recent("messages")!.onUpdate(
+		watch_update([message_doc(2000, { channelKey: CH2_KEY, createdBy: "user_other", rand: "u1" })]),
+	);
+	h.find_watch("cursors", "me:user_me")!.onUpdate(watch_update([cursor_doc({ [CH2_KEY]: 1000 }, 3)]));
+	const randomRow = () => within(nav).getByRole("button", { name: /^#random/ });
+	await waitFor(() => expect(randomRow().className).toContain("is-unread"));
+
+	fireEvent.click(randomRow());
+	const window2 = await waitFor(() => {
+		const found = h.find_window("messages", `${CH2_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	// Newest first, as a window delivers them: one read message, then two unread ones, and this
+	// member's own send in between the unread pair.
+	window2.onUpdate(
+		window_update([
+			message_doc(3000, { channelKey: CH2_KEY, createdBy: "user_me", rand: "u3", text: "mine after" }),
+			message_doc(2000, { channelKey: CH2_KEY, createdBy: "user_other", rand: "u1", text: "first unread" }),
+			message_doc(500, { channelKey: CH2_KEY, createdBy: "user_other", rand: "u0", text: "already read" }),
+		]),
+	);
+	await screen.findByText("first unread");
+
+	// The mark sits directly above the first message this member has not read, and nowhere else.
+	const divider = await waitFor(() => {
+		const found = document.querySelector(".new-divider");
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	expect(document.querySelectorAll(".new-divider").length).toBe(1);
+	expect(divider.textContent).toContain("New messages");
+	expect(divider.nextElementSibling?.textContent).toContain("first unread");
+
+	// Opening the channel writes the cursor forward. The mark is placed on the value frozen at
+	// open time, so the member keeps seeing where they stopped instead of watching it vanish.
+	h.find_watch("cursors", "me:user_me")!.onUpdate(watch_update([cursor_doc({ [CH2_KEY]: 9000 }, 4)]));
+	await waitFor(() => expect(randomRow().className).not.toContain("is-unread"));
+	expect(document.querySelectorAll(".new-divider").length).toBe(1);
+});
+
+test("a channel with nothing unread opens without the mark", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	// The cursor is past everything the feed holds, so the row carries no mark to begin with.
+	h.find_recent("messages")!.onUpdate(
+		watch_update([message_doc(2000, { channelKey: CH2_KEY, createdBy: "user_other", rand: "u1" })]),
+	);
+	h.find_watch("cursors", "me:user_me")!.onUpdate(watch_update([cursor_doc({ [CH2_KEY]: 5000 }, 3)]));
+	const randomRow = within(nav).getByRole("button", { name: /^#random/ });
+	await waitFor(() => expect(randomRow.className).not.toContain("is-unread"));
+
+	fireEvent.click(randomRow);
+	const window2 = await waitFor(() => {
+		const found = h.find_window("messages", `${CH2_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	window2.onUpdate(
+		window_update([message_doc(2000, { channelKey: CH2_KEY, createdBy: "user_other", rand: "u1", text: "read one" })]),
+	);
+	await screen.findByText("read one");
+	expect(document.querySelector(".new-divider")).toBeNull();
 });
 
 test("unread mentions of this member show as an amber count, on the row and on the Unreads view", async () => {
