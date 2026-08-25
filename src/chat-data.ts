@@ -441,8 +441,8 @@ export function chat_validate_message_doc(raw: unknown): chat_Doc<chat_MessageVa
 
 /**
  * A live reaction is `{}`. A removal is `{ removed: true }` on the same owned key, so the
- * change feed can see it. Extra fields are refused: the store is multi-writer and a stray
- * property must not turn a marker into a live chip or the other way around.
+ * change feed can see it. Extra fields are ignored: `z.object` strips them. A strict schema
+ * would make an older client drop the whole doc if a later version adds a field.
  */
 export const chat_reaction_value_schema = z.object({
 	removed: z.literal(true).optional(),
@@ -659,14 +659,6 @@ export const chat_plugin_data_list_response_schema = z.object({
 	documents: z.array(z.unknown()),
 	cursor: z.string().nullable(),
 	isDone: z.boolean(),
-});
-
-/**
- * Response of `POST /api/v1/plugin-data/read`. `document` is null when the key is absent.
- * A plugin token must omit `installationId` on this route; sending it is a 400.
- */
-export const chat_plugin_data_read_response_schema = z.object({
-	document: z.unknown().nullable(),
 });
 
 /** Response of `POST /api/v1/files/download-urls`. */

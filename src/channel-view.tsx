@@ -19,7 +19,6 @@ import {
 	chat_mention_roster_refusal_copy,
 	chat_message_key_prefix,
 	chat_plugin_data_list_response_schema,
-	chat_plugin_data_read_response_schema,
 	chat_PRIVATE_CHANNEL_DISCLOSURE,
 	chat_reaction_caller_key,
 	chat_REACTION_EMOJI,
@@ -1039,7 +1038,8 @@ type MessageRow_Props = {
 	/**
 	 * "unknown" = the reactions list does not cover this row, so the app cannot say which
 	 * reactions it has. An empty array here would render as "nobody reacted", which is a different
-	 * statement and a false one. The row shows an uncovered state instead, and the toggle refuses.
+	 * statement and a false one. The row shows an uncovered state instead. Add stays live;
+	 * remove is hidden because there are no chips.
 	 */
 	reactionGroups: chat_ReactionGroup[] | "unknown";
 	/**
@@ -1295,8 +1295,8 @@ export function MessageRow(props: MessageRow_Props) {
 							{props.replyCount === "unknown" ? "View thread" : "Reply in thread"}
 						</button>
 					) : null}
-					{/* An uncovered row has no known pressed state, so the palette shows none. The
-					    toggle refuses the click and says why. */}
+					{/* An uncovered row has no known pressed state, so the palette shows none.
+					    Add still writes this member's own key. Remove is hidden — no chips. */}
 					<AddReactionButton
 						groups={props.reactionGroups === "unknown" ? [] : props.reactionGroups}
 						onPick={handle_toggle_reaction}
@@ -1693,6 +1693,21 @@ function newest_raw_updated_at(docs: unknown[]): number | null {
 	return newest;
 }
 
+function next_feed_since(args: { current: number; newest: number | null; truncated: boolean }) {
+	if (args.newest === null) {
+		return null;
+	}
+	// The host returns at most 100 rows. A full page still on this millisecond would never
+	// advance, so later edits stay hidden. Step one millisecond past it.
+	if (args.truncated && args.newest === args.current) {
+		return args.newest + 1;
+	}
+	if (args.newest > args.current) {
+		return args.newest;
+	}
+	return null;
+}
+
 function docs_in_prefix(docs: unknown[], prefix: string) {
 	return docs.filter((raw) => {
 		const key = raw_document_key(raw);
@@ -1710,16 +1725,6 @@ function list_plugin_documents(
 			throw new Error("Unexpected response from the document list");
 		}
 		return parsed.data;
-	});
-}
-
-function read_plugin_document(client: BonoboUiFrontendClient, collection: string, key: string) {
-	return client.fetchJson("/api/v1/plugin-data/read", { body: { collection, key } }).then((raw: unknown) => {
-		const parsed = chat_plugin_data_read_response_schema.safeParse(raw);
-		if (!parsed.success) {
-			throw new Error("Unexpected response from the document read");
-		}
-		return parsed.data.document;
 	});
 }
 
@@ -1874,6 +1879,10 @@ export function ChannelView(props: ChannelView_Props) {
 		reactions: false,
 		replies: false,
 	});
+	const companionAutoRetryUsedRef = useRef<{ reactions: boolean; replies: boolean }>({
+		reactions: false,
+		replies: false,
+	});
 	const feedsStartedRef = useRef(false);
 	const channelBodyRef = useRef<HTMLDivElement | null>(null);
 	const channelNameRef = useRef(channel.value.name);
@@ -1893,15 +1902,6 @@ export function ChannelView(props: ChannelView_Props) {
 		channelNameRef.current = channel.value.name;
 	}, [channel.value.name]);
 
-	const apply_reaction_docs = (docs: unknown[]) => {
-		const store = reactionsStoreRef.current;
-		if (store === null) {
-			return;
-		}
-		store.apply_window(docs);
-		setReactionDocs(store.get_sorted());
-	};
-
 	const apply_reply_docs = (docs: unknown[]) => {
 		const store = repliesStoreRef.current;
 		if (store === null) {
@@ -1919,28 +1919,6 @@ export function ChannelView(props: ChannelView_Props) {
 		const applied = store.apply_window(docs);
 		setMessages(store.get_sorted());
 		return applied;
-	};
-
-	const reread_failed_feed_docs = (
-		collection: "messages" | "replies" | "reactions",
-		mine: unknown[],
-		appliedKeys: Set<string>,
-		apply: (docs: unknown[]) => void,
-	) => {
-		for (const raw of mine) {
-			const key = raw_document_key(raw);
-			if (key === null || appliedKeys.has(key)) {
-				continue;
-			}
-			read_plugin_document(client, collection, key)
-				.then((document) => {
-					if (document === null) {
-						return;
-					}
-					apply([document]);
-				})
-				.catch(() => {});
-		}
 	};
 
 	const set_companion_coverage = (
@@ -1962,19 +1940,33 @@ export function ChannelView(props: ChannelView_Props) {
 				(collection === "reactions" ? reactionsCoverageRef.current?.deepestRoot : repliesCoverageRef.current?.deepestRoot) ??
 				null,
 			incomplete,
-			death: null,
+			// Keep a dead feed dead. An HTTP list that was already in flight must not wipe the
+			// death flag, or chips look live again while later hearts never arrive.
+			death:
+				(collection === "reactions" ? reactionsCoverageRef.current?.death : repliesCoverageRef.current?.death) ??
+				null,
 		};
 		if (collection === "reactions") {
 			reactionsCoverageRef.current = next;
 			setReactionCoverage(next);
+			if (!incomplete) {
+				companionAutoRetryUsedRef.current.reactions = false;
+			}
 		} else {
 			repliesCoverageRef.current = next;
 			setReplyCoverage(next);
+			if (!incomplete) {
+				companionAutoRetryUsedRef.current.replies = false;
+			}
 		}
 	};
 
 	const list_companion = (collection: "reactions" | "replies") => {
 		if (companionInflightRef.current[collection]) {
+			return;
+		}
+		const coverage = collection === "reactions" ? reactionsCoverageRef.current : repliesCoverageRef.current;
+		if (coverage?.death != null) {
 			return;
 		}
 		companionInflightRef.current[collection] = true;
@@ -2009,7 +2001,23 @@ export function ChannelView(props: ChannelView_Props) {
 			.catch(() => {
 				companionInflightRef.current[collection] = false;
 				set_companion_coverage(collection, [], true, true);
+				// Retry this episode once without waiting for a feed. The SDK can deliver a cached
+				// snapshot before this list fails, and then the feed will not fire again.
+				if (!companionAutoRetryUsedRef.current[collection]) {
+					companionAutoRetryUsedRef.current[collection] = true;
+					queueMicrotask(() => {
+						list_companion(collection);
+					});
+				}
 			});
+	};
+
+	const retry_incomplete_companion = (collection: "reactions" | "replies") => {
+		const coverage = collection === "reactions" ? reactionsCoverageRef.current : repliesCoverageRef.current;
+		if (coverage === null || !coverage.incomplete || coverage.death !== null) {
+			return;
+		}
+		list_companion(collection);
 	};
 
 	// Companion catch-up: reactions and replies key by TARGET, not by time, so their HTTP
@@ -2044,6 +2052,9 @@ export function ChannelView(props: ChannelView_Props) {
 			return;
 		}
 		feedsStartedRef.current = true;
+		// One fence for all three feeds: the newest messages-window updatedAt. Companion lists
+		// do not pick their own. A lower fence only over-delivers, and the merge already dedups.
+		// The query is inclusive, so subscribe at this value as-is — not plus one.
 		setMessagesSince(fence);
 		setRepliesSince(fence);
 		setReactionsSince(fence);
@@ -2060,6 +2071,7 @@ export function ChannelView(props: ChannelView_Props) {
 		feedsStartedRef.current = false;
 		companionHttpFenceRef.current = { reactions: null, replies: null };
 		companionInflightRef.current = { reactions: false, replies: false };
+		companionAutoRetryUsedRef.current = { reactions: false, replies: false };
 		reactionsCoverageRef.current = null;
 		repliesCoverageRef.current = null;
 		setMessagesSince(null);
@@ -2151,14 +2163,8 @@ export function ChannelView(props: ChannelView_Props) {
 					return;
 				}
 				const mine = docs_in_prefix(update.docs, channelPrefix);
-				const applied = store.apply_window(mine);
+				store.apply_window(mine);
 				setMessages(store.get_sorted());
-				reread_failed_feed_docs(
-					"messages",
-					mine,
-					new Set(applied.map((doc) => doc.key)),
-					(docs) => apply_message_docs(docs),
-				);
 				if (update.truncated && windowOldestKeyRef.current !== null) {
 					list_plugin_documents(client, {
 						collection: "messages",
@@ -2172,8 +2178,13 @@ export function ChannelView(props: ChannelView_Props) {
 						.catch(() => {});
 				}
 				const newest = newest_raw_updated_at(update.docs);
-				if (newest !== null && newest > messagesSince) {
-					setMessagesSince(newest);
+				const nextSince = next_feed_since({
+					current: messagesSince,
+					newest,
+					truncated: update.truncated,
+				});
+				if (nextSince !== null) {
+					setMessagesSince(nextSince);
 				}
 			},
 		);
@@ -2188,7 +2199,15 @@ export function ChannelView(props: ChannelView_Props) {
 			{ collection: "replies", limit: 100, updatedSince: repliesSince, ...feed_scope_args },
 			(update, info) => {
 				if (update === null) {
-					setReplyCoverage((previous) => ({ ...previous, death: { reason: info?.reason } }));
+					const previous = repliesCoverageRef.current ?? {
+						hasMore: false,
+						deepestRoot: null,
+						incomplete: false,
+						death: null,
+					};
+					const next = { ...previous, incomplete: false, death: { reason: info?.reason } };
+					repliesCoverageRef.current = next;
+					setReplyCoverage(next);
 					return;
 				}
 				const store = repliesStoreRef.current;
@@ -2196,12 +2215,17 @@ export function ChannelView(props: ChannelView_Props) {
 					return;
 				}
 				const mine = docs_in_prefix(update.docs, channelPrefix);
-				const applied = store.apply_window(mine);
+				store.apply_window(mine);
 				setChannelReplies(store.get_sorted());
-				reread_failed_feed_docs("replies", mine, new Set(applied.map((doc) => doc.key)), apply_reply_docs);
+				retry_incomplete_companion("replies");
 				const newest = newest_raw_updated_at(update.docs);
-				if (newest !== null && newest > repliesSince) {
-					setRepliesSince(newest);
+				const nextSince = next_feed_since({
+					current: repliesSince,
+					newest,
+					truncated: update.truncated,
+				});
+				if (nextSince !== null) {
+					setRepliesSince(nextSince);
 				}
 			},
 		);
@@ -2216,7 +2240,15 @@ export function ChannelView(props: ChannelView_Props) {
 			{ collection: "reactions", limit: 100, updatedSince: reactionsSince, ...feed_scope_args },
 			(update, info) => {
 				if (update === null) {
-					setReactionCoverage((previous) => ({ ...previous, death: { reason: info?.reason } }));
+					const previous = reactionsCoverageRef.current ?? {
+						hasMore: false,
+						deepestRoot: null,
+						incomplete: false,
+						death: null,
+					};
+					const next = { ...previous, incomplete: false, death: { reason: info?.reason } };
+					reactionsCoverageRef.current = next;
+					setReactionCoverage(next);
 					return;
 				}
 				const store = reactionsStoreRef.current;
@@ -2224,17 +2256,34 @@ export function ChannelView(props: ChannelView_Props) {
 					return;
 				}
 				const mine = docs_in_prefix(update.docs, channelPrefix);
-				const applied = store.apply_window(mine);
+				store.apply_window(mine);
 				setReactionDocs(store.get_sorted());
-				reread_failed_feed_docs("reactions", mine, new Set(applied.map((doc) => doc.key)), apply_reaction_docs);
+				retry_incomplete_companion("reactions");
 				const newest = newest_raw_updated_at(update.docs);
-				if (newest !== null && newest > reactionsSince) {
-					setReactionsSince(newest);
+				const nextSince = next_feed_since({
+					current: reactionsSince,
+					newest,
+					truncated: update.truncated,
+				});
+				if (nextSince !== null) {
+					setReactionsSince(nextSince);
 				}
 			},
 		);
 		return unsubscribe;
 	}, [client, channel.key, reactionsSince, privateScopeId, channelPrefix]);
+
+	useEffect(() => {
+		const on_visibility = () => {
+			if (document.visibilityState !== "visible") {
+				return;
+			}
+			retry_incomplete_companion("reactions");
+			retry_incomplete_companion("replies");
+		};
+		document.addEventListener("visibilitychange", on_visibility);
+		return () => document.removeEventListener("visibilitychange", on_visibility);
+	}, [client, channel.key]);
 
 	useEffect(() => {
 		if (threadRootKey === null) {

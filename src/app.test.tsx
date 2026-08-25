@@ -1564,6 +1564,126 @@ test("an incomplete companion list is reported to the member", async () => {
 	expect(notice.getAttribute("role")).toBe("alert");
 });
 
+test("a failed companion list retries once without waiting for a feed", async () => {
+	const h = make_harness();
+	await boot(h);
+	const root = message_doc(2_000, { rand: "newr", text: "new root" });
+	const heart = reaction_doc(root.key, "heart", "user_other");
+	let reactionLists = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			reactionLists += 1;
+			if (reactionLists === 1) {
+				throw new Error("companion list failed");
+			}
+			return http_page([heart], true);
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+	await screen.findByText("new root");
+	const row = row_of("new root");
+	expect(await within(row).findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+	expect(within(row).queryByText("Reactions unavailable")).toBeNull();
+	expect(list_calls(h, "reactions")).toHaveLength(2);
+});
+
+test("a twice-failed companion list retries when that collection's feed delivers", async () => {
+	const h = make_harness();
+	await boot(h);
+	const root = message_doc(2_000, { rand: "newr", text: "new root" });
+	const heart = reaction_doc(root.key, "heart", "user_other");
+	let reactionLists = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			reactionLists += 1;
+			if (reactionLists <= 2) {
+				throw new Error("companion list failed");
+			}
+			return http_page([heart], true);
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+	await screen.findByText("new root");
+	const row = row_of("new root");
+	expect(await within(row).findByText("Reactions unavailable")).toBeTruthy();
+	await wait_for_feeds(h);
+	await waitFor(() => expect(list_calls(h, "reactions")).toHaveLength(2));
+
+	h.find_changes("reactions")!.onUpdate(watch_update([]));
+	expect(await within(row).findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+	expect(within(row).queryByText("Reactions unavailable")).toBeNull();
+	expect(list_calls(h, "reactions")).toHaveLength(3);
+});
+
+test("a dead incomplete companion list does not retry when the tab becomes visible", async () => {
+	const h = make_harness();
+	await boot(h);
+	const root = message_doc(2_000, { rand: "newr", text: "new root" });
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			throw new Error("companion list failed");
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+	await screen.findByText("new root");
+	await wait_for_feeds(h);
+	await waitFor(() => expect(list_calls(h, "reactions").length).toBeGreaterThanOrEqual(2));
+	h.find_changes("reactions")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	expect(await within(row_of("new root")).findByText("Reactions unavailable")).toBeTruthy();
+	expect(screen.queryByText("Some reactions and replies in this range could not be loaded.")).toBeNull();
+
+	const listsAfterDeath = list_calls(h, "reactions").length;
+	document.dispatchEvent(new Event("visibilitychange"));
+	expect(list_calls(h, "reactions")).toHaveLength(listsAfterDeath);
+});
+
+test("a companion list that finishes after the feed dies does not clear death", async () => {
+	const h = make_harness();
+	await boot(h);
+	const root = message_doc(2_000, { rand: "newr", text: "new root" });
+	const heart = reaction_doc(root.key, "heart", "user_other");
+	const pendingReactions = deferred<unknown>();
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			return pendingReactions.promise;
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+	await screen.findByText("new root");
+	const row = row_of("new root");
+	await wait_for_feeds(h);
+	h.find_changes("reactions")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	expect(await within(row).findByText("Reactions unavailable")).toBeTruthy();
+
+	pendingReactions.resolve(http_page([heart], true));
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(within(row).queryByRole("button", { name: "Heart, 1 reaction" })).toBeNull();
+	expect(
+		screen.getByText("Chitchat can no longer read reactions in this channel. Reload the page to try again."),
+	).toBeTruthy();
+	expect(within(row).getByText("Reactions unavailable")).toBeTruthy();
+});
+
 test("the action cluster renders only button classes the stylesheet's reveal rules name", async () => {
 	const h = make_harness();
 	await boot(h);
@@ -2100,6 +2220,86 @@ test("a frozen HTTP-loaded row updates when the messages change feed delivers a 
 	);
 	expect(await screen.findByText("edited older")).toBeTruthy();
 	expect(screen.queryByText("older one")).toBeNull();
+});
+
+test("a feed document that fails validation is dropped and is not re-read", async () => {
+	const h = make_harness();
+	await boot(h);
+	const live = message_doc(1_000, { rand: "m1", text: "live one" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([live]));
+	await screen.findByText("live one");
+	await wait_for_feeds(h);
+	const invalid = {
+		...message_doc(900, { rand: "bad1", text: "should not render" }),
+		value: { notAMessage: true },
+	};
+	h.find_changes("messages")!.onUpdate(watch_update([invalid]));
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(0);
+	expect(screen.queryByText("should not render")).toBeNull();
+});
+
+test("the change feeds fence at the newest loaded updatedAt", async () => {
+	const h = make_harness();
+	await boot(h);
+	const newest = message_doc(2_000, { rand: "newr", text: "new root" });
+	const older = message_doc(1_000, { rand: "oldr", text: "old root" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([newest, older]));
+	await screen.findByText("old root");
+	await wait_for_feeds(h);
+	expect(h.find_changes("messages")!.opts.updatedSince).toBe(2_000);
+	expect(h.find_changes("replies")!.opts.updatedSince).toBe(2_000);
+	expect(h.find_changes("reactions")!.opts.updatedSince).toBe(2_000);
+});
+
+test("a change-feed delivery advances the cursor to the newest updatedAt", async () => {
+	const h = make_harness();
+	await boot(h);
+	const live = message_doc(1_000, { rand: "m1", text: "live one" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([live]));
+	await screen.findByText("live one");
+	await wait_for_feeds(h);
+	const fence = h.find_changes("messages")!.opts.updatedSince;
+	expect(fence).toBe(1_000);
+	h.find_changes("messages")!.onUpdate(
+		watch_update([
+			{
+				...live,
+				value: { ...live.value, text: "edited live", editedAt: 1_050 },
+				revision: 2,
+				updatedAt: 1_050,
+			},
+		]),
+	);
+	await waitFor(() => expect(h.find_changes("messages")!.opts.updatedSince).toBe(1_050));
+	expect(await screen.findByText("edited live")).toBeTruthy();
+});
+
+test("a truncated change-feed page tied to the fence millisecond advances past that millisecond", async () => {
+	const h = make_harness();
+	await boot(h);
+	const live = message_doc(1_000, { rand: "m1", text: "live one" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([live]));
+	await screen.findByText("live one");
+	await wait_for_feeds(h);
+	expect(h.find_changes("messages")!.opts.updatedSince).toBe(1_000);
+	h.find_changes("messages")!.onUpdate(watch_update([{ ...live, revision: 2, updatedAt: 1_000 }], true));
+	await waitFor(() => expect(h.find_changes("messages")!.opts.updatedSince).toBe(1_001));
+});
+
+test("a truncated messages feed HTTP-lists the frozen window range", async () => {
+	const h = make_harness();
+	const newest = await boot_at_capacity(h);
+	await wait_for_feeds(h);
+	const messageListsBefore = list_calls(h, "messages").length;
+	h.find_changes("messages")!.onUpdate(watch_update([{ ...newest, revision: 2, updatedAt: newest.updatedAt + 50 }], true));
+	await waitFor(() => expect(list_calls(h, "messages").length).toBe(messageListsBefore + 1));
+	expect(list_calls(h, "messages").at(-1)?.[1]?.body).toEqual({
+		collection: "messages",
+		keyPrefix: `${CH1_KEY}:`,
+		keyStartExclusive: newest.key,
+		limit: 100,
+	});
 });
 
 test("a page in flight disables the control, and rows below the reactions frontier stay uncovered", async () => {
