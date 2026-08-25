@@ -172,6 +172,25 @@ describe("chat_group_reactions", () => {
 		]);
 	});
 
+	test("a removed marker does not count, and a higher revision replaces a live reaction", () => {
+		const store = chat_create_accumulating_store(chat_validate_reaction_doc);
+		const target = message_key(2_000);
+		store.apply_window([reaction_doc(target, "heart", "user_a")]);
+		expect(chat_group_reactions(store.get_sorted(), "user_a").get(target)).toEqual([
+			{ token: "heart", count: 1, reactedByMe: true },
+		]);
+
+		store.apply_window([{ ...reaction_doc(target, "heart", "user_a"), revision: 2, value: { removed: true } }]);
+		expect(store.get_sorted()).toHaveLength(1);
+		expect(store.get_sorted()[0]?.removed).toBe(true);
+		expect(chat_group_reactions(store.get_sorted(), "user_a").has(target)).toBe(false);
+
+		store.apply_window([{ ...reaction_doc(target, "heart", "user_a"), revision: 3, value: {} }]);
+		expect(chat_group_reactions(store.get_sorted(), "user_a").get(target)).toEqual([
+			{ token: "heart", count: 1, reactedByMe: true },
+		]);
+	});
+
 	test("a forged doc whose key tail names another user counts under createdBy", () => {
 		const target = message_key(2_000);
 		// user_b smuggled user_a's id into the caller key part; the server stamped createdBy user_b.

@@ -834,7 +834,7 @@ function channels_death_message(reason: string | undefined): string {
 		return "Chitchat cannot reach its data right now. Nothing will update until the connection returns.";
 	}
 	if (reason === "capacity") {
-		return "Chitchat has too many live views open. Close a thread, or reload the page.";
+		return "Chitchat has too many live views open. Reload the page.";
 	}
 	return "Chitchat stopped reading its data. Reload the page to try again.";
 }
@@ -845,9 +845,9 @@ function theme_property_name(token: string) {
 }
 
 /**
- * How many private scopes this page watches. Worst-case slot spend with a channel and a thread
- * open: channels 1 + scope list 1 + N scope reads + cursors 1 + recent feed 1 + three channel
- * windows + one thread watch = 8 + N, and the SDK allows 16 — so N is 8. The sidebar says when
+ * How many private scopes this page watches. Worst-case slot spend with a channel open:
+ * channels 1 + scope list 1 + N scope reads + cursors 1 + recent feed 1 + one messages window
+ * + three change feeds = 8 + N, and the SDK allows 16 — so N is 8. The sidebar says when
  * scopes past this line exist instead of silently hiding them.
  */
 const MAX_WATCHED_SCOPES = 8;

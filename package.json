@@ -14,7 +14,7 @@
 	"packageManager": "pnpm@10.33.0",
 	"dependencies": {
 		"@ariakit/react": "0.4.20",
-		"bonobo-plugin-sdk": "github:raythurnvoid/bonobo-plugin-sdk#7d208bcf626499dfeebe0e9dbd10a11a94674234",
+		"bonobo-plugin-sdk": "github:raythurnvoid/bonobo-plugin-sdk#eeb091e83d1a4e4fa4a177b2b5145111b2ca52de",
 		"lucide-react": "^0.544.0",
 		"react": "^19.2.7",
 		"react-dom": "^19.2.7",

@@ -19,12 +19,14 @@ import {
 	chat_mention_roster_refusal_copy,
 	chat_message_key_prefix,
 	chat_plugin_data_list_response_schema,
+	chat_plugin_data_read_response_schema,
 	chat_PRIVATE_CHANNEL_DISCLOSURE,
 	chat_reaction_caller_key,
 	chat_REACTION_EMOJI,
 	chat_REACTION_LABELS,
 	chat_REACTION_TOKENS,
 	chat_reply_key_prefix,
+	chat_reply_root_key,
 	chat_validate_message_doc,
 	chat_validate_reaction_doc,
 	type chat_Attachment,
@@ -38,7 +40,6 @@ import {
 import {
 	chat_count_replies,
 	chat_create_accumulating_store,
-	chat_create_window_store,
 	chat_format_reply_count,
 	chat_group_reactions,
 	type chat_AccumulatingStore,
@@ -1036,23 +1037,25 @@ type MessageRow_Props = {
 	isContinuation: boolean;
 	authorName: string | null | undefined;
 	/**
-	 * "unknown" = the reactions window does not cover this row, so the app cannot say which
+	 * "unknown" = the reactions list does not cover this row, so the app cannot say which
 	 * reactions it has. An empty array here would render as "nobody reacted", which is a different
 	 * statement and a false one. The row shows an uncovered state instead, and the toggle refuses.
 	 */
 	reactionGroups: chat_ReactionGroup[] | "unknown";
 	/**
 	 * null = this row offers no thread affordance (rows inside a thread panel).
-	 * "unknown" = the replies window does not reach this root yet, so no count is claimed.
+	 * "unknown" = the replies list does not reach this root yet, so no count is claimed.
 	 */
 	replyCount: number | "unknown" | null;
-	/** Newest reply time the window holds for this root, or null when it holds no reply for it. */
+	/** Newest reply time the page holds for this root, or null when it holds no reply for it. */
 	replyLatestAt: number | null;
-	/** True while the replies window says more replies exist below it — gates the "99+" cap. */
+	/** True while the replies list says more replies exist below it — gates the "99+" cap. */
 	repliesHasMore: boolean;
 	onOpenThread: ((doc: chat_Doc<chat_MessageValue>) => void) | null;
 	replyTriggerRef: ((el: HTMLButtonElement | null) => void) | null;
 	onApplyLocal: (doc: chat_Doc<chat_MessageValue>) => void;
+	/** Merge a reaction the member just wrote, including a removed marker. */
+	onApplyReaction: (doc: chat_ReactionDoc) => void;
 	/** See `use_send_queue`: a full store is the channel's state, not this row's error. */
 	onStorageFull: (message: string) => void;
 };
@@ -1132,20 +1135,21 @@ export function MessageRow(props: MessageRow_Props) {
 
 	const handle_toggle_reaction = (token: chat_ReactionToken, currentlyPressed: boolean) => {
 		setRowError(null);
-		// The reactions window does not cover this row, so nothing here knows what this member
+		// The reactions list does not cover this row, so nothing here knows what this member
 		// already holds. The remove path is hidden rather than refused — no chips render, and the
-		// row says why — while the add path stays live: `putOwned` writes the member's own key with
-		// the same empty value whether or not it is already there, so it is correct either way.
-		// Refusing both would stop reactions on every message older than the coverage frontier,
-		// which in a busy channel is a couple of days back.
+		// row says why — while the add path stays live: `putOwned` writes the member's own key
+		// whether or not a chip is on screen, so it is correct either way.
 		if (props.reactionGroups === "unknown" && currentlyPressed) {
 			setRowError("Reactions on this message could not be loaded, so they can't be removed right now.");
 			return;
 		}
-		const request = currentlyPressed
-			? client.data.removeOwned({ collection: "reactions", key: chat_reaction_caller_key(doc.key, token) })
-			: client.data.putOwned({ collection: "reactions", key: chat_reaction_caller_key(doc.key, token), value: {} });
-		request
+		const removed = currentlyPressed;
+		client.data
+			.putOwned({
+				collection: "reactions",
+				key: chat_reaction_caller_key(doc.key, token),
+				value: removed ? { removed: true } : {},
+			})
 			.then((result) => {
 				if ("_nay" in result) {
 					if (result._nay.name === "storage_full") {
@@ -1153,7 +1157,17 @@ export function MessageRow(props: MessageRow_Props) {
 						return;
 					}
 					setRowError(result._nay.message);
+					return;
 				}
+				props.onApplyReaction({
+					key: result._yay.key,
+					targetKey: doc.key,
+					token,
+					createdBy: props.selfUserId,
+					revision: result._yay.revision,
+					updatedAt: Date.now(),
+					removed,
+				});
 			})
 			.catch((error: unknown) => {
 				setRowError(chat_get_error_message(error));
@@ -1397,7 +1411,7 @@ function watch_death_message(reason: string | undefined, subject: string) {
 		return `Chitchat cannot reach ${subject} right now. Nothing here will update until the connection returns.`;
 	}
 	if (reason === "capacity") {
-		return `Chitchat has too many live views open, so ${subject} stopped updating. Close a thread, or reload the page.`;
+		return `Chitchat has too many live views open, so ${subject} stopped updating. Reload the page.`;
 	}
 
 	return `Chitchat stopped reading ${subject}. Reload the page to try again.`;
@@ -1407,6 +1421,10 @@ type ThreadPanel_Props = {
 	client: BonoboUiFrontendClient;
 	userId: string;
 	root: chat_Doc<chat_MessageValue>;
+	replies: chat_Doc<chat_MessageValue>[];
+	repliesLoaded: boolean;
+	repliesTruncated: boolean;
+	repliesError: string | null;
 	reactionGroupsByTarget: Map<string, chat_ReactionGroup[]>;
 	memberNames: chat_MemberNamesApi;
 	/** Below 720px the panel covers the whole frame, so its way out reads as "back", not "close". */
@@ -1414,16 +1432,13 @@ type ThreadPanel_Props = {
 	storageFull: string | null;
 	onStorageFull: (message: string) => void;
 	onApplyLocalRoot: (doc: chat_Doc<chat_MessageValue>) => void;
+	onApplyLocalReply: (doc: chat_Doc<chat_MessageValue>) => void;
+	onApplyReaction: (doc: chat_ReactionDoc) => void;
 	onClose: () => void;
 };
 
 export function ThreadPanel(props: ThreadPanel_Props) {
-	const { client, userId, root, memberNames } = props;
-	const [replies, setReplies] = useState<chat_Doc<chat_MessageValue>[]>([]);
-	const [repliesLoaded, setRepliesLoaded] = useState(false);
-	const [repliesTruncated, setRepliesTruncated] = useState(false);
-	const [repliesDeath, setRepliesDeath] = useState<{ reason?: string } | null>(null);
-	const storeRef = useRef<chat_AccumulatingStore<chat_MessageValue> | null>(null);
+	const { client, userId, root, memberNames, replies, repliesLoaded } = props;
 	const closeButtonRef = useRef<HTMLButtonElement | null>(null);
 
 	// Move focus into the panel when it opens; the parent focuses the trigger on close.
@@ -1431,41 +1446,13 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 		closeButtonRef.current?.focus();
 	}, []);
 
-	useEffect(() => {
-		const store = chat_create_accumulating_store(chat_validate_message_doc);
-		storeRef.current = store;
-		const unsubscribe = client.data.watch(
-			{ collection: "replies", keyPrefix: chat_reply_key_prefix(root.key), limit: 100 },
-			(update, info) => {
-				// A dead watch must not leave the panel on "Loading replies…" forever, and after a
-				// first delivery it must not leave the list looking live while it silently freezes.
-				if (update === null) {
-					setRepliesDeath({ reason: info?.reason });
-					setRepliesLoaded(true);
-					return;
-				}
-				setRepliesDeath(null);
-				store.apply_window(update.docs);
-				setReplies(store.get_sorted());
-				setRepliesLoaded(true);
-				// A plain watch reads the newest 100 replies and cannot reach past that. The panel
-				// has no "load older" because `watch` exposes none, and a fourth window would put
-				// the frame over its 24-subscription budget. So say the list is cut instead of
-				// showing 100 replies under a "99+" count as if that were all of them.
-				setRepliesTruncated(update.truncated);
-			},
-		);
-		return unsubscribe;
-	}, [client, root.key]);
-
 	const queue = use_send_queue({
 		client,
 		collection: "replies",
 		keyPrefix: chat_reply_key_prefix(root.key),
 		userId,
 		onDelivered: (doc) => {
-			storeRef.current?.apply_local(doc);
-			setReplies(storeRef.current?.get_sorted() ?? []);
+			props.onApplyLocalReply(doc);
 		},
 		onStorageFull: props.onStorageFull,
 	});
@@ -1521,15 +1508,16 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 					onOpenThread={null}
 					replyTriggerRef={null}
 					onApplyLocal={props.onApplyLocalRoot}
+					onApplyReaction={props.onApplyReaction}
 					onStorageFull={props.onStorageFull}
 				/>
 			</ul>
-			{repliesDeath !== null ? (
+			{props.repliesError !== null ? (
 				<div className="channel-status is-error" role="alert">
-					{watch_death_message(repliesDeath.reason, "the replies in this thread")}
+					{props.repliesError}
 				</div>
 			) : null}
-			{repliesTruncated ? (
+			{props.repliesTruncated ? (
 				<div className="channel-status" role="status">
 					Only the newest 100 replies are shown.
 				</div>
@@ -1565,10 +1553,8 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 								repliesHasMore={false}
 								onOpenThread={null}
 								replyTriggerRef={null}
-								onApplyLocal={(updated) => {
-									storeRef.current?.apply_local(updated);
-									setReplies(storeRef.current?.get_sorted() ?? []);
-								}}
+								onApplyLocal={props.onApplyLocalReply}
+								onApplyReaction={props.onApplyReaction}
 								onStorageFull={props.onStorageFull}
 							/>
 						),
@@ -1587,7 +1573,7 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 				client={client}
 				label="Reply in thread"
 				busy={queue.busy}
-				disabled={props.storageFull !== null || repliesDeath !== null}
+				disabled={props.storageFull !== null || props.repliesError !== null}
 				onSend={queue.send}
 			/>
 		</section>
@@ -1635,22 +1621,9 @@ const PRIVATE_STAMP_DEBOUNCE_MS = 15_000;
 /** The loadOlder/unsubscribe handle `client.data.watchWindow` returns. */
 type WindowHandle = ReturnType<BonoboUiFrontendClient["data"]["watchWindow"]>;
 
-/** What the catch-up loop needs to know about a companion window's coverage. */
-type CompanionCoverage = {
-	hasMore: boolean;
-	atCapacity: boolean;
-	/** Root message key (first 55 chars) of the deepest validated doc, or null when empty. */
-	deepestRoot: string | null;
-	/**
-	 * The window lost documents in the middle of its range and cannot re-read them. It does not
-	 * say which ones, so no row can be called covered while this is true.
-	 */
-	incomplete: boolean;
-};
-
 /**
- * The part of a companion's coverage the render reads. The refs above feed the catch-up loop,
- * which runs inside a delivery callback and must see the value that just arrived; this state
+ * The part of a companion's coverage the render reads. The refs feed the catch-up loop,
+ * which runs inside a list callback and must see the value that just arrived; this state
  * feeds the rows and the notices, which need a render.
  */
 type CompanionCoverageState = {
@@ -1665,10 +1638,10 @@ type CompanionCoverageState = {
 };
 
 /**
- * Whether a companion window can speak for one row. A window with nothing older left covers
- * everything; otherwise it covers only roots strictly newer than the deepest root it delivered.
- * An incomplete window covers nothing, because the gap could be anywhere inside its range, and a
- * dead one covers nothing, because it stopped hearing about changes anywhere in its range.
+ * Whether a companion HTTP list can speak for one row. A finished list covers everything;
+ * otherwise it covers only roots strictly newer than the deepest root it delivered.
+ * An incomplete list covers nothing, because the gap could be anywhere inside its range, and a
+ * dead feed covers nothing, because it stopped hearing about changes anywhere in its range.
  */
 function companion_covers_root(coverage: CompanionCoverageState, rootKey: string) {
 	if (coverage.incomplete || coverage.death !== null) {
@@ -1687,6 +1660,105 @@ const ROOT_KEY_LENGTH = 55;
 
 /** How many documents one deep-history page asks for. The route's own ceiling is 100. */
 const DEEP_HISTORY_PAGE_SIZE = 100;
+
+function newest_updated_at(docs: { updatedAt: number }[]): number | null {
+	let newest: number | null = null;
+	for (const doc of docs) {
+		if (newest === null || doc.updatedAt > newest) {
+			newest = doc.updatedAt;
+		}
+	}
+	return newest;
+}
+
+function raw_document_key(raw: unknown): string | null {
+	if (typeof raw !== "object" || raw === null) {
+		return null;
+	}
+	const key = (raw as { key?: unknown }).key;
+	return typeof key === "string" ? key : null;
+}
+
+function newest_raw_updated_at(docs: unknown[]): number | null {
+	let newest: number | null = null;
+	for (const raw of docs) {
+		if (typeof raw !== "object" || raw === null) {
+			continue;
+		}
+		const updatedAt = (raw as { updatedAt?: unknown }).updatedAt;
+		if (typeof updatedAt === "number" && Number.isFinite(updatedAt) && (newest === null || updatedAt > newest)) {
+			newest = updatedAt;
+		}
+	}
+	return newest;
+}
+
+function docs_in_prefix(docs: unknown[], prefix: string) {
+	return docs.filter((raw) => {
+		const key = raw_document_key(raw);
+		return key !== null && key.startsWith(prefix);
+	});
+}
+
+function list_plugin_documents(
+	client: BonoboUiFrontendClient,
+	body: { collection: string; keyPrefix: string; keyStartExclusive?: string; limit: number },
+) {
+	return client.fetchJson("/api/v1/plugin-data/list", { body }).then((raw: unknown) => {
+		const parsed = chat_plugin_data_list_response_schema.safeParse(raw);
+		if (!parsed.success) {
+			throw new Error("Unexpected response from the document list");
+		}
+		return parsed.data;
+	});
+}
+
+function read_plugin_document(client: BonoboUiFrontendClient, collection: string, key: string) {
+	return client.fetchJson("/api/v1/plugin-data/read", { body: { collection, key } }).then((raw: unknown) => {
+		const parsed = chat_plugin_data_read_response_schema.safeParse(raw);
+		if (!parsed.success) {
+			throw new Error("Unexpected response from the document read");
+		}
+		return parsed.data.document;
+	});
+}
+
+function reaction_groups_for_row(
+	coverage: CompanionCoverageState,
+	groupsByTarget: Map<string, chat_ReactionGroup[]>,
+	key: string,
+): chat_ReactionGroup[] | "unknown" {
+	// A dead or gapped list cannot speak for any row, even one we already grouped.
+	if (coverage.incomplete || coverage.death !== null) {
+		return "unknown";
+	}
+	const groups = groupsByTarget.get(key);
+	if (groups !== undefined && groups.length > 0) {
+		return groups;
+	}
+	if (companion_covers_root(coverage, key.slice(0, ROOT_KEY_LENGTH))) {
+		return groups ?? [];
+	}
+	return "unknown";
+}
+
+function reply_count_for_row(
+	coverage: CompanionCoverageState,
+	counts: Map<string, { count: number; latestAt: number }>,
+	key: string,
+): number | "unknown" {
+	if (coverage.incomplete || coverage.death !== null) {
+		return "unknown";
+	}
+	const entry = counts.get(key);
+	if (entry !== undefined && entry.count > 0) {
+		return entry.count;
+	}
+	if (companion_covers_root(coverage, key.slice(0, ROOT_KEY_LENGTH))) {
+		return entry?.count ?? 0;
+	}
+	return "unknown";
+}
 
 /** §5's floors: the log never goes under 420px, and the thread panel never under 244px. */
 const MIN_LOG_WIDTH = 420;
@@ -1775,12 +1847,18 @@ export function ChannelView(props: ChannelView_Props) {
 	const [deepHistory, setDeepHistory] = useState<DeepHistoryState>({ kind: "idle" });
 	const [threadWidth, setThreadWidth] = useState(DEFAULT_THREAD_WIDTH);
 	const [bodyWidth, setBodyWidth] = useState(0);
-	const messagesStoreRef = useRef<chat_AccumulatingStore<chat_MessageValue> | null>(null);
+	const [messagesSince, setMessagesSince] = useState<number | null>(null);
+	const [repliesSince, setRepliesSince] = useState<number | null>(null);
+	const [reactionsSince, setReactionsSince] = useState<number | null>(null);
+	const [threadRepliesLoaded, setThreadRepliesLoaded] = useState(false);
+	const [threadRepliesTruncated, setThreadRepliesTruncated] = useState(false);
+	const [threadRepliesError, setThreadRepliesError] = useState<string | null>(null);
+	const messagesStoreRef = useRef<chat_AccumulatingStore<chat_Doc<chat_MessageValue>> | null>(null);
+	const repliesStoreRef = useRef<chat_AccumulatingStore<chat_Doc<chat_MessageValue>> | null>(null);
+	const reactionsStoreRef = useRef<chat_AccumulatingStore<chat_ReactionDoc> | null>(null);
 	const messagesWindowRef = useRef<WindowHandle | null>(null);
-	const reactionsWindowRef = useRef<WindowHandle | null>(null);
-	const repliesWindowRef = useRef<WindowHandle | null>(null);
-	const reactionsCoverageRef = useRef<CompanionCoverage | null>(null);
-	const repliesCoverageRef = useRef<CompanionCoverage | null>(null);
+	const reactionsCoverageRef = useRef<CompanionCoverageState | null>(null);
+	const repliesCoverageRef = useRef<CompanionCoverageState | null>(null);
 	const oldestRootRef = useRef<string | null>(null);
 	// The oldest key the reactive WINDOW itself delivered, kept apart from the merged store. An
 	// HTTP page merges older keys into that store forever, and reading the fencepost back off it
@@ -1788,6 +1866,15 @@ export function ChannelView(props: ChannelView_Props) {
 	const windowOldestKeyRef = useRef<string | null>(null);
 	/** The last key the previous HTTP page returned. The next page continues strictly after it. */
 	const httpOldestKeyRef = useRef<string | null>(null);
+	const companionHttpFenceRef = useRef<{ reactions: string | null; replies: string | null }>({
+		reactions: null,
+		replies: null,
+	});
+	const companionInflightRef = useRef<{ reactions: boolean; replies: boolean }>({
+		reactions: false,
+		replies: false,
+	});
+	const feedsStartedRef = useRef(false);
 	const channelBodyRef = useRef<HTMLDivElement | null>(null);
 	const channelNameRef = useRef(channel.value.name);
 	const seenKeysRef = useRef<Set<string> | null>(null);
@@ -1795,6 +1882,8 @@ export function ChannelView(props: ChannelView_Props) {
 	const logRef = useRef<HTMLDivElement | null>(null);
 	const newestKeyRef = useRef<string | null>(null);
 	const pendingCountRef = useRef(0);
+	const channelPrefix = chat_message_key_prefix(channel.key);
+	const privateScopeId = chat_channel_is_private(channel.key) ? channel.key : undefined;
 
 	// The announcer reads the channel name through this ref so a rename does not sit in the
 	// messages effect's dependencies: any member renaming the channel in a loop would
@@ -1804,29 +1893,160 @@ export function ChannelView(props: ChannelView_Props) {
 		channelNameRef.current = channel.value.name;
 	}, [channel.value.name]);
 
-	// Companion catch-up: reactions and replies key by TARGET, not by time, so their windows
-	// can lag behind the rendered message range. After every window delivery, extend a
-	// companion one page while it still has older docs and its deepest covered root is newer
-	// than the oldest rendered message. Plain JS `<` works here because every key chitchat
-	// itself mints is ASCII by construction (client UUID prefix, server digit-and-hex tail) —
-	// validation does NOT enforce ASCII, so a foreign writer's non-ASCII key could skew this
-	// catch-up coverage for that key. Accepted: it never affects message delivery.
+	const apply_reaction_docs = (docs: unknown[]) => {
+		const store = reactionsStoreRef.current;
+		if (store === null) {
+			return;
+		}
+		store.apply_window(docs);
+		setReactionDocs(store.get_sorted());
+	};
+
+	const apply_reply_docs = (docs: unknown[]) => {
+		const store = repliesStoreRef.current;
+		if (store === null) {
+			return;
+		}
+		store.apply_window(docs);
+		setChannelReplies(store.get_sorted());
+	};
+
+	const apply_message_docs = (docs: unknown[]) => {
+		const store = messagesStoreRef.current;
+		if (store === null) {
+			return [];
+		}
+		const applied = store.apply_window(docs);
+		setMessages(store.get_sorted());
+		return applied;
+	};
+
+	const reread_failed_feed_docs = (
+		collection: "messages" | "replies" | "reactions",
+		mine: unknown[],
+		appliedKeys: Set<string>,
+		apply: (docs: unknown[]) => void,
+	) => {
+		for (const raw of mine) {
+			const key = raw_document_key(raw);
+			if (key === null || appliedKeys.has(key)) {
+				continue;
+			}
+			read_plugin_document(client, collection, key)
+				.then((document) => {
+					if (document === null) {
+						return;
+					}
+					apply([document]);
+				})
+				.catch(() => {});
+		}
+	};
+
+	const set_companion_coverage = (
+		collection: "reactions" | "replies",
+		pageDocs: { key: string }[],
+		isDone: boolean,
+		incomplete: boolean,
+	) => {
+		const deepestRoot =
+			pageDocs.length > 0 ? pageDocs[pageDocs.length - 1]!.key.slice(0, ROOT_KEY_LENGTH) : null;
+		if (pageDocs.length > 0) {
+			companionHttpFenceRef.current[collection] = pageDocs[pageDocs.length - 1]!.key;
+		}
+		const next: CompanionCoverageState = {
+			// An empty page with isDone still false would otherwise re-request the same range forever.
+			hasMore: pageDocs.length === 0 ? false : !isDone,
+			deepestRoot:
+				deepestRoot ??
+				(collection === "reactions" ? reactionsCoverageRef.current?.deepestRoot : repliesCoverageRef.current?.deepestRoot) ??
+				null,
+			incomplete,
+			death: null,
+		};
+		if (collection === "reactions") {
+			reactionsCoverageRef.current = next;
+			setReactionCoverage(next);
+		} else {
+			repliesCoverageRef.current = next;
+			setReplyCoverage(next);
+		}
+	};
+
+	const list_companion = (collection: "reactions" | "replies") => {
+		if (companionInflightRef.current[collection]) {
+			return;
+		}
+		companionInflightRef.current[collection] = true;
+		const fence = companionHttpFenceRef.current[collection];
+		list_plugin_documents(client, {
+			collection,
+			keyPrefix: channelPrefix,
+			...(fence === null ? {} : { keyStartExclusive: fence }),
+			limit: DEEP_HISTORY_PAGE_SIZE,
+		})
+			.then((page) => {
+				companionInflightRef.current[collection] = false;
+				if (collection === "reactions") {
+					const store = reactionsStoreRef.current;
+					if (store === null) {
+						return;
+					}
+					const validated = store.apply_window(page.documents);
+					setReactionDocs(store.get_sorted());
+					set_companion_coverage("reactions", validated, page.isDone, false);
+				} else {
+					const store = repliesStoreRef.current;
+					if (store === null) {
+						return;
+					}
+					const validated = store.apply_window(page.documents);
+					setChannelReplies(store.get_sorted());
+					set_companion_coverage("replies", validated, page.isDone, false);
+				}
+				evaluate_companion_catch_up();
+			})
+			.catch(() => {
+				companionInflightRef.current[collection] = false;
+				set_companion_coverage(collection, [], true, true);
+			});
+	};
+
+	// Companion catch-up: reactions and replies key by TARGET, not by time, so their HTTP
+	// lists can lag behind the rendered message range. After every window delivery, fetch
+	// another companion page while it still has older docs and its deepest covered root is
+	// newer than the oldest WINDOW message. Plain JS `<` works here because every key
+	// chitchat itself mints is ASCII by construction (client UUID prefix, server digit-and-hex
+	// tail) — validation does NOT enforce ASCII, so a foreign writer's non-ASCII key could
+	// skew this catch-up coverage for that key. Accepted: it never affects message delivery.
 	const evaluate_companion_catch_up = () => {
 		const oldestRoot = oldestRootRef.current;
 		if (oldestRoot === null) {
 			return;
 		}
-		for (const companion of [
-			{ coverage: reactionsCoverageRef.current, windowHandle: reactionsWindowRef.current },
-			{ coverage: repliesCoverageRef.current, windowHandle: repliesWindowRef.current },
-		]) {
-			if (companion.coverage === null || !companion.coverage.hasMore || companion.coverage.atCapacity) {
+		for (const collection of ["reactions", "replies"] as const) {
+			const coverage = collection === "reactions" ? reactionsCoverageRef.current : repliesCoverageRef.current;
+			if (coverage === null || !coverage.hasMore || coverage.incomplete || coverage.death !== null) {
 				continue;
 			}
-			if (companion.coverage.deepestRoot === null || companion.coverage.deepestRoot < oldestRoot) {
-				companion.windowHandle?.loadOlder();
+			if (coverage.deepestRoot === null || coverage.deepestRoot < oldestRoot) {
+				list_companion(collection);
 			}
 		}
+	};
+
+	const start_feeds_if_needed = (windowDocs: { updatedAt: number }[]) => {
+		if (feedsStartedRef.current) {
+			return;
+		}
+		const fence = newest_updated_at(windowDocs);
+		if (fence === null) {
+			return;
+		}
+		feedsStartedRef.current = true;
+		setMessagesSince(fence);
+		setRepliesSince(fence);
+		setReactionsSince(fence);
 	};
 
 	// Messages window: the host retains loaded history, so each update is the whole window.
@@ -1835,6 +2055,16 @@ export function ChannelView(props: ChannelView_Props) {
 	useEffect(() => {
 		const store = chat_create_accumulating_store(chat_validate_message_doc);
 		messagesStoreRef.current = store;
+		repliesStoreRef.current = chat_create_accumulating_store(chat_validate_message_doc);
+		reactionsStoreRef.current = chat_create_accumulating_store(chat_validate_reaction_doc);
+		feedsStartedRef.current = false;
+		companionHttpFenceRef.current = { reactions: null, replies: null };
+		companionInflightRef.current = { reactions: false, replies: false };
+		reactionsCoverageRef.current = null;
+		repliesCoverageRef.current = null;
+		setMessagesSince(null);
+		setRepliesSince(null);
+		setReactionsSince(null);
 		const watchWindow = client.data.watchWindow(
 			{ collection: "messages", keyPrefix: chat_message_key_prefix(channel.key), pageSize: 100 },
 			(update, info) => {
@@ -1854,6 +2084,13 @@ export function ChannelView(props: ChannelView_Props) {
 				);
 				windowOldestKeyRef.current = windowOldestKey;
 				oldestRootRef.current = windowOldestKey === null ? null : windowOldestKey.slice(0, ROOT_KEY_LENGTH);
+				start_feeds_if_needed(windowDocs);
+				if (reactionsCoverageRef.current === null && !companionInflightRef.current.reactions) {
+					list_companion("reactions");
+				}
+				if (repliesCoverageRef.current === null && !companionInflightRef.current.replies) {
+					list_companion("replies");
+				}
 				evaluate_companion_catch_up();
 
 				const seen = seenKeysRef.current;
@@ -1896,78 +2133,144 @@ export function ChannelView(props: ChannelView_Props) {
 		};
 	}, [client, channel.key, userId, memberNames, announce]);
 
-	// Reactions window: replace-from-window (a reaction removed by removeOwned must
-	// disappear). The channel prefix also covers reply reactions, because reply keys extend
-	// their root message key.
+	const feed_scope_args = privateScopeId === undefined ? {} : { scopeId: privateScopeId };
+
 	useEffect(() => {
-		const store = chat_create_window_store(chat_validate_reaction_doc);
-		const watchWindow = client.data.watchWindow(
-			{ collection: "reactions", keyPrefix: chat_message_key_prefix(channel.key), pageSize: 100 },
+		if (messagesSince === null) {
+			return;
+		}
+		const unsubscribe = client.data.watchChanges(
+			{ collection: "messages", limit: 100, updatedSince: messagesSince, ...feed_scope_args },
 			(update, info) => {
-				// A ref alone cannot drive a render. Without the state the chips freeze at their
-				// last delivered values and go on looking live while nothing reaches them again.
 				if (update === null) {
-					reactionsCoverageRef.current = null;
-					setReactionCoverage((previous) => ({ ...previous, death: { reason: info?.reason } }));
+					setMessagesDeath({ reason: info?.reason });
 					return;
 				}
-				const validated = store.apply_window(update.docs);
-				setReactionDocs(validated);
-				const deepestRoot =
-					validated.length > 0 ? validated[validated.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null;
-				reactionsCoverageRef.current = {
-					hasMore: update.hasMore,
-					atCapacity: update.atCapacity,
-					deepestRoot,
-					incomplete: update.incomplete,
-				};
-				setReactionCoverage({ hasMore: update.hasMore, deepestRoot, incomplete: update.incomplete, death: null });
-				evaluate_companion_catch_up();
+				const store = messagesStoreRef.current;
+				if (store === null) {
+					return;
+				}
+				const mine = docs_in_prefix(update.docs, channelPrefix);
+				const applied = store.apply_window(mine);
+				setMessages(store.get_sorted());
+				reread_failed_feed_docs(
+					"messages",
+					mine,
+					new Set(applied.map((doc) => doc.key)),
+					(docs) => apply_message_docs(docs),
+				);
+				if (update.truncated && windowOldestKeyRef.current !== null) {
+					list_plugin_documents(client, {
+						collection: "messages",
+						keyPrefix: channelPrefix,
+						keyStartExclusive: windowOldestKeyRef.current,
+						limit: DEEP_HISTORY_PAGE_SIZE,
+					})
+						.then((page) => {
+							apply_message_docs(page.documents);
+						})
+						.catch(() => {});
+				}
+				const newest = newest_raw_updated_at(update.docs);
+				if (newest !== null && newest > messagesSince) {
+					setMessagesSince(newest);
+				}
 			},
 		);
-		reactionsWindowRef.current = watchWindow;
-		return () => {
-			reactionsWindowRef.current = null;
-			reactionsCoverageRef.current = null;
-			watchWindow.unsubscribe();
-		};
-	}, [client, channel.key]);
+		return unsubscribe;
+	}, [client, channel.key, messagesSince, privateScopeId, channelPrefix]);
 
-	// Channel-wide replies window: feeds the per-root reply counts. Counts are exact for
-	// covered roots; the catch-up loop drives coverage down to the oldest rendered message.
 	useEffect(() => {
-		const store = chat_create_window_store(chat_validate_message_doc);
-		const watchWindow = client.data.watchWindow(
-			{ collection: "replies", keyPrefix: chat_message_key_prefix(channel.key), pageSize: 100 },
+		if (repliesSince === null) {
+			return;
+		}
+		const unsubscribe = client.data.watchChanges(
+			{ collection: "replies", limit: 100, updatedSince: repliesSince, ...feed_scope_args },
 			(update, info) => {
-				// Same as the reactions window: a dead counter that keeps rendering an exact number
-				// is the most confident and the stalest thing on the row.
 				if (update === null) {
-					repliesCoverageRef.current = null;
 					setReplyCoverage((previous) => ({ ...previous, death: { reason: info?.reason } }));
 					return;
 				}
-				const validated = store.apply_window(update.docs);
-				setChannelReplies(validated);
-				const deepestRoot =
-					validated.length > 0 ? validated[validated.length - 1].key.slice(0, ROOT_KEY_LENGTH) : null;
-				repliesCoverageRef.current = {
-					hasMore: update.hasMore,
-					atCapacity: update.atCapacity,
-					deepestRoot,
-					incomplete: update.incomplete,
-				};
-				setReplyCoverage({ hasMore: update.hasMore, deepestRoot, incomplete: update.incomplete, death: null });
-				evaluate_companion_catch_up();
+				const store = repliesStoreRef.current;
+				if (store === null) {
+					return;
+				}
+				const mine = docs_in_prefix(update.docs, channelPrefix);
+				const applied = store.apply_window(mine);
+				setChannelReplies(store.get_sorted());
+				reread_failed_feed_docs("replies", mine, new Set(applied.map((doc) => doc.key)), apply_reply_docs);
+				const newest = newest_raw_updated_at(update.docs);
+				if (newest !== null && newest > repliesSince) {
+					setRepliesSince(newest);
+				}
 			},
 		);
-		repliesWindowRef.current = watchWindow;
+		return unsubscribe;
+	}, [client, channel.key, repliesSince, privateScopeId, channelPrefix]);
+
+	useEffect(() => {
+		if (reactionsSince === null) {
+			return;
+		}
+		const unsubscribe = client.data.watchChanges(
+			{ collection: "reactions", limit: 100, updatedSince: reactionsSince, ...feed_scope_args },
+			(update, info) => {
+				if (update === null) {
+					setReactionCoverage((previous) => ({ ...previous, death: { reason: info?.reason } }));
+					return;
+				}
+				const store = reactionsStoreRef.current;
+				if (store === null) {
+					return;
+				}
+				const mine = docs_in_prefix(update.docs, channelPrefix);
+				const applied = store.apply_window(mine);
+				setReactionDocs(store.get_sorted());
+				reread_failed_feed_docs("reactions", mine, new Set(applied.map((doc) => doc.key)), apply_reaction_docs);
+				const newest = newest_raw_updated_at(update.docs);
+				if (newest !== null && newest > reactionsSince) {
+					setReactionsSince(newest);
+				}
+			},
+		);
+		return unsubscribe;
+	}, [client, channel.key, reactionsSince, privateScopeId, channelPrefix]);
+
+	useEffect(() => {
+		if (threadRootKey === null) {
+			setThreadRepliesLoaded(true);
+			setThreadRepliesTruncated(false);
+			setThreadRepliesError(null);
+			return;
+		}
+		let cancelled = false;
+		setThreadRepliesLoaded(false);
+		setThreadRepliesTruncated(false);
+		setThreadRepliesError(null);
+		list_plugin_documents(client, {
+			collection: "replies",
+			keyPrefix: chat_reply_key_prefix(threadRootKey),
+			limit: DEEP_HISTORY_PAGE_SIZE,
+		})
+			.then((page) => {
+				if (cancelled) {
+					return;
+				}
+				apply_reply_docs(page.documents);
+				setThreadRepliesTruncated(!page.isDone);
+				setThreadRepliesLoaded(true);
+			})
+			.catch((error: unknown) => {
+				if (cancelled) {
+					return;
+				}
+				setThreadRepliesError(chat_get_error_message(error));
+				setThreadRepliesLoaded(true);
+			});
 		return () => {
-			repliesWindowRef.current = null;
-			repliesCoverageRef.current = null;
-			watchWindow.unsubscribe();
+			cancelled = true;
 		};
-	}, [client, channel.key]);
+	}, [client, threadRootKey]);
 
 	/**
 	 * §7.4's private-channel mitigation: after a successful append in a private channel the
@@ -2230,6 +2533,21 @@ export function ChannelView(props: ChannelView_Props) {
 		setMessages(messagesStoreRef.current?.get_sorted() ?? []);
 	};
 
+	const apply_local_reply = (doc: chat_Doc<chat_MessageValue>) => {
+		repliesStoreRef.current?.apply_local(doc);
+		setChannelReplies(repliesStoreRef.current?.get_sorted() ?? []);
+	};
+
+	const apply_local_reaction = (doc: chat_ReactionDoc) => {
+		reactionsStoreRef.current?.apply_local(doc);
+		setReactionDocs(reactionsStoreRef.current?.get_sorted() ?? []);
+	};
+
+	const threadReplies =
+		threadRootKey === null
+			? []
+			: channelReplies.filter((doc) => chat_reply_root_key(doc.key) === threadRootKey);
+
 	const handle_close_thread = () => {
 		const key = threadRootKey;
 		setThreadRootKey(null);
@@ -2379,22 +2697,14 @@ export function ChannelView(props: ChannelView_Props) {
 										memberNames={memberNames}
 										isContinuation={entry.isContinuation}
 										authorName={memberNames.get(entry.doc.createdBy)}
-										// Reactions are claimed only for rows the reactions window covers. An
-										// empty list on an uncovered row would read as "nobody reacted".
-										reactionGroups={
-											companion_covers_root(reactionCoverage, entry.doc.key.slice(0, ROOT_KEY_LENGTH))
-												? (reactionGroupsByTarget.get(entry.doc.key) ?? [])
-												: "unknown"
-										}
-										// A count is claimed only for roots the replies window covers: every
-										// root while nothing more exists below, else only roots strictly newer
-										// than the deepest covered root (that one may still have replies below
-										// the window).
-										replyCount={
-											companion_covers_root(replyCoverage, entry.doc.key.slice(0, ROOT_KEY_LENGTH))
-												? (replyCounts.get(entry.doc.key)?.count ?? 0)
-												: "unknown"
-										}
+										// Known groups still render even when the HTTP list has not reached
+										// this row yet. Empty + uncovered still reads as unknown.
+										reactionGroups={reaction_groups_for_row(
+											reactionCoverage,
+											reactionGroupsByTarget,
+											entry.doc.key,
+										)}
+										replyCount={reply_count_for_row(replyCoverage, replyCounts, entry.doc.key)}
 										replyLatestAt={replyCounts.get(entry.doc.key)?.latestAt ?? null}
 										repliesHasMore={replyCoverage.hasMore}
 										onOpenThread={(root) => setThreadRootKey(root.key)}
@@ -2406,6 +2716,7 @@ export function ChannelView(props: ChannelView_Props) {
 											}
 										}}
 										onApplyLocal={apply_local_message}
+										onApplyReaction={apply_local_reaction}
 										onStorageFull={setStorageFull}
 									/>
 								),
@@ -2444,12 +2755,18 @@ export function ChannelView(props: ChannelView_Props) {
 						client={client}
 						userId={userId}
 						root={threadRoot}
+						replies={threadReplies}
+						repliesLoaded={threadRepliesLoaded}
+						repliesTruncated={threadRepliesTruncated}
+						repliesError={threadRepliesError}
 						reactionGroupsByTarget={reactionGroupsByTarget}
 						memberNames={memberNames}
 						isNarrow={isNarrow}
 						storageFull={storageFull}
 						onStorageFull={setStorageFull}
 						onApplyLocalRoot={apply_local_message}
+						onApplyLocalReply={apply_local_reply}
+						onApplyReaction={apply_local_reaction}
 						onClose={handle_close_thread}
 					/>
 				) : null}

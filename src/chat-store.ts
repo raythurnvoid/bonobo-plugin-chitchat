@@ -13,35 +13,36 @@ function warn_dropped(raw: unknown) {
 	}
 }
 
-export type chat_AccumulatingStore<V> = {
+export type chat_AccumulatingStore<T extends { key: string; revision: number }> = {
 	/**
-	 * Merges one watch or window update into the store and returns the update's validated
-	 * docs (callers use them for arrival detection). Never removes anything: a doc that
-	 * fell out of a plain watch's newest-100 window stays.
+	 * Merges one watch, window, feed, or HTTP page into the store and returns the update's
+	 * validated docs (callers use them for arrival detection). Never removes anything: a
+	 * doc that fell out of a plain watch's newest-100 window stays.
 	 */
-	apply_window(docs: unknown[]): chat_Doc<V>[];
+	apply_window(docs: unknown[]): T[];
 	/** Merges one locally synthesized doc (an acked own send, edit, or delete). */
-	apply_local(doc: chat_Doc<V>): void;
+	apply_local(doc: T): void;
 	/** All docs sorted ascending by key — with inverted-ms keys that is newest first. */
-	get_sorted(): chat_Doc<V>[];
+	get_sorted(): T[];
 	/** How many raw docs failed validation and were dropped. */
 	dropped_count(): number;
 };
 
 /**
- * The accumulate-by-key seam store for messages and thread replies. Every update merges
- * into one map keyed by document key: keys are never reused, deletes are value
- * tombstones (`deletedAt`), and a doc only advances forward (a lower revision never
- * overwrites a higher one). The revision-forward merge is also what lets an optimistic
- * local echo coexist with the server's later delivery of the same key.
+ * The accumulate-by-key seam store for messages, replies, and reactions. Every update
+ * merges into one map keyed by document key: keys are never reused, a doc only advances
+ * forward (a lower revision never overwrites a higher one), and the same merge lets an
+ * optimistic local echo coexist with the server's later delivery of the same key.
+ * Message deletes are value tombstones (`deletedAt`). Reaction deletes are `{ removed: true }`
+ * on the same owned key, so they stay in the map and the change feed can see them.
  */
-export function chat_create_accumulating_store<V>(
-	validate: (raw: unknown) => chat_Doc<V> | null,
-): chat_AccumulatingStore<V> {
-	const byKey = new Map<string, chat_Doc<V>>();
+export function chat_create_accumulating_store<T extends { key: string; revision: number }>(
+	validate: (raw: unknown) => T | null,
+): chat_AccumulatingStore<T> {
+	const byKey = new Map<string, T>();
 	let dropped = 0;
 
-	const merge_one = (doc: chat_Doc<V>) => {
+	const merge_one = (doc: T) => {
 		const existing = byKey.get(doc.key);
 		if (existing === undefined || doc.revision >= existing.revision) {
 			byKey.set(doc.key, doc);
@@ -49,7 +50,7 @@ export function chat_create_accumulating_store<V>(
 	};
 
 	const merge_raw = (docs: unknown[]) => {
-		const valid: chat_Doc<V>[] = [];
+		const valid: T[] = [];
 		for (const raw of docs) {
 			const doc = validate(raw);
 			if (doc === null) {
@@ -81,9 +82,9 @@ export type chat_WindowStore<T> = {
 };
 
 /**
- * The replace-from-window seam store for reactions (and channels). Each watch update
- * replaces the whole content — a reaction physically removed by removeOwned must
- * disappear, so reactions never accumulate across updates.
+ * The replace-from-window seam store for channels and the public recent-messages feed.
+ * Each watch update replaces the whole content. Reactions no longer use this: a removal
+ * is an in-place marker, so they accumulate like messages.
  */
 export function chat_create_window_store<T>(validate: (raw: unknown) => T | null): chat_WindowStore<T> {
 	let items: T[] = [];
@@ -122,6 +123,10 @@ export type chat_ReactionGroup = {
 export function chat_group_reactions(docs: chat_ReactionDoc[], myUserId: string): Map<string, chat_ReactionGroup[]> {
 	const reactorsByTarget = new Map<string, Map<chat_ReactionToken, Set<string>>>();
 	for (const doc of docs) {
+		// A removed marker keeps the slot and the key, but it is not a live reaction.
+		if (doc.removed) {
+			continue;
+		}
 		let byToken = reactorsByTarget.get(doc.targetKey);
 		if (byToken === undefined) {
 			byToken = new Map();
@@ -151,7 +156,7 @@ export function chat_group_reactions(docs: chat_ReactionDoc[], myUserId: string)
 }
 
 /**
- * Replies per root message key, counted from the bounded channel-wide replies watch.
+ * Replies per root message key, counted from the accumulated channel-wide replies.
  *
  * `latestAt` is the newest reply time the window holds for that root. The summary line shows it as
  * "Last reply …", and it is only honest for a root the window already covers. A root it does not

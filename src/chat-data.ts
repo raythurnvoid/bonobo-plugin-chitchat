@@ -123,9 +123,10 @@ export function chat_reply_key_prefix(rootMessageKey: string) {
 }
 
 /**
- * The caller key for putOwned/removeOwned on a reaction. The server appends `:<userId>`,
+ * The caller key for putOwned on a reaction. The server appends `:<userId>`,
  * so the stored key is `<messageKey>:<token>:<userId>` and nobody can forge another
- * member's reaction key through this op.
+ * member's reaction key through this op. A removal writes `{ removed: true }` on the
+ * same key instead of deleting it, so the change feed can see the removal.
  */
 export function chat_reaction_caller_key(messageKey: string, token: chat_ReactionToken) {
 	return `${messageKey}:${token}`;
@@ -438,13 +439,24 @@ export function chat_validate_message_doc(raw: unknown): chat_Doc<chat_MessageVa
 	return validate_keyed_doc(raw, chat_message_value_schema);
 }
 
-/** A validated reaction document with its parsed key parts. The value carries nothing. */
+/**
+ * A live reaction is `{}`. A removal is `{ removed: true }` on the same owned key, so the
+ * change feed can see it. Extra fields are refused: the store is multi-writer and a stray
+ * property must not turn a marker into a live chip or the other way around.
+ */
+export const chat_reaction_value_schema = z.object({
+	removed: z.literal(true).optional(),
+});
+
+/** A validated reaction document with its parsed key parts. */
 export type chat_ReactionDoc = {
 	key: string;
 	targetKey: string;
 	token: chat_ReactionToken;
 	createdBy: string;
 	revision: number;
+	updatedAt: number;
+	removed: boolean;
 };
 
 export function chat_validate_reaction_doc(raw: unknown): chat_ReactionDoc | null {
@@ -456,12 +468,18 @@ export function chat_validate_reaction_doc(raw: unknown): chat_ReactionDoc | nul
 	if (parsed === null) {
 		return null;
 	}
+	const value = chat_reaction_value_schema.safeParse(envelope.data.value);
+	if (!value.success) {
+		return null;
+	}
 	return {
 		key: envelope.data.key,
 		targetKey: parsed.targetKey,
 		token: parsed.token,
 		createdBy: envelope.data.createdBy,
 		revision: envelope.data.revision,
+		updatedAt: envelope.data.updatedAt,
+		removed: value.data.removed === true,
 	};
 }
 
@@ -641,6 +659,14 @@ export const chat_plugin_data_list_response_schema = z.object({
 	documents: z.array(z.unknown()),
 	cursor: z.string().nullable(),
 	isDone: z.boolean(),
+});
+
+/**
+ * Response of `POST /api/v1/plugin-data/read`. `document` is null when the key is absent.
+ * A plugin token must omit `installationId` on this route; sending it is a 400.
+ */
+export const chat_plugin_data_read_response_schema = z.object({
+	document: z.unknown().nullable(),
 });
 
 /** Response of `POST /api/v1/files/download-urls`. */

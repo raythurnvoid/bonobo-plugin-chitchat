@@ -133,6 +133,12 @@ type RecentSub = {
 	unsubscribed: boolean;
 };
 
+type ChangesSub = {
+	opts: { collection: string; limit: number; updatedSince?: number; scopeId?: string };
+	onUpdate: (update: WatchUpdate | null, info?: WatchDeathInfo) => void;
+	unsubscribed: boolean;
+};
+
 type WindowUpdate = { docs: unknown[]; hasMore: boolean; atCapacity: boolean; incomplete: boolean };
 
 type WindowSub = {
@@ -164,6 +170,7 @@ function make_harness() {
 	const watches: WatchSub[] = [];
 	const recents: RecentSub[] = [];
 	const windows: WindowSub[] = [];
+	const changes: ChangesSub[] = [];
 	const themeListeners: ((theme: BonoboUiTheme) => void)[] = [];
 	const names: Record<string, string | null> = { user_me: "Me", user_other: "Bob", user_third: "Cleo" };
 	/**
@@ -189,7 +196,12 @@ function make_harness() {
 		apiOrigin: "https://api.example",
 		getToken: vi.fn(async () => "tok"),
 		refreshToken: vi.fn(async () => "tok"),
-		fetchJson: vi.fn<(path: string, init?: FetchInit) => Promise<unknown>>(async () => {
+		fetchJson: vi.fn<(path: string, init?: FetchInit) => Promise<unknown>>(async (path: string) => {
+			// Companion HTTP lists run after the first messages-window delivery. An empty finished
+			// page covers every rendered row, which is the ordinary test default.
+			if (path === "/api/v1/plugin-data/list") {
+				return { documents: [], cursor: null, isDone: true };
+			}
 			throw new Error("fetchJson not stubbed");
 		}),
 		data: {
@@ -217,6 +229,13 @@ function make_harness() {
 					unsubscribe: () => {
 						sub.unsubscribed = true;
 					},
+				};
+			}),
+			watchChanges: vi.fn((opts: ChangesSub["opts"], onUpdate: ChangesSub["onUpdate"]) => {
+				const sub: ChangesSub = { opts, onUpdate, unsubscribed: false };
+				changes.push(sub);
+				return () => {
+					sub.unsubscribed = true;
 				};
 			}),
 			append: vi.fn<(opts: AppendOpts) => Promise<WriteResult>>(async () => ({
@@ -319,6 +338,12 @@ function make_harness() {
 		);
 		return matches[matches.length - 1];
 	};
+	const find_changes = (collection: string, scopeId?: string) => {
+		const matches = changes.filter(
+			(sub) => !sub.unsubscribed && sub.opts.collection === collection && sub.opts.scopeId === scopeId,
+		);
+		return matches[matches.length - 1];
+	};
 	/** Delivers a theme the way the host does after the member switches the app's theme. */
 	const send_theme = (theme: BonoboUiTheme) => {
 		for (const listener of [...themeListeners]) {
@@ -337,9 +362,11 @@ function make_harness() {
 		watches,
 		recents,
 		windows,
+		changes,
 		find_watch,
 		find_recent,
 		find_window,
+		find_changes,
 		send_theme,
 		send_scopes,
 		calls,
@@ -365,6 +392,41 @@ async function boot(h: ReturnType<typeof make_harness>, channels: unknown[] = [c
 		await waitFor(() => expect(h.find_window("messages", `${CH1_KEY}:`)).toBeTruthy());
 	}
 	return utils;
+}
+
+function list_calls(h: ReturnType<typeof make_harness>, collection?: string) {
+	return h.raw.fetchJson.mock.calls.filter(([path, init]) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			return false;
+		}
+		if (collection === undefined) {
+			return true;
+		}
+		return (init?.body as { collection?: string } | undefined)?.collection === collection;
+	});
+}
+
+function http_page(documents: unknown[], isDone: boolean) {
+	return { documents, cursor: null, isDone };
+}
+
+function file_calls(h: ReturnType<typeof make_harness>, path: string) {
+	return h.raw.fetchJson.mock.calls.filter(([called]) => called === path);
+}
+
+async function wait_for_companion_lists(h: ReturnType<typeof make_harness>) {
+	await waitFor(() => {
+		expect(list_calls(h, "reactions").length).toBeGreaterThanOrEqual(1);
+		expect(list_calls(h, "replies").length).toBeGreaterThanOrEqual(1);
+	});
+}
+
+async function wait_for_feeds(h: ReturnType<typeof make_harness>, scopeId?: string) {
+	await waitFor(() => {
+		expect(h.find_changes("messages", scopeId)).toBeTruthy();
+		expect(h.find_changes("replies", scopeId)).toBeTruthy();
+		expect(h.find_changes("reactions", scopeId)).toBeTruthy();
+	});
 }
 
 function composer_box(name: string) {
@@ -1295,14 +1357,15 @@ test("a second edit compares against the revision the first write stored, and a 
 
 // #region reactions
 
-test("reaction chips group by createdBy, expose aria-pressed, and toggle putOwned/removeOwned", async () => {
+test("reaction chips group by createdBy, expose aria-pressed, and toggle putOwned with a removed marker", async () => {
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "m1", text: "react to me" });
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 	await screen.findByText("react to me");
-	h.find_window("reactions", `${CH1_KEY}:`)!.onUpdate(
-		window_update([
+	await wait_for_feeds(h);
+	h.find_changes("reactions")!.onUpdate(
+		watch_update([
 			reaction_doc(doc.key, "heart", "user_me"),
 			reaction_doc(doc.key, "heart", "user_other"),
 			reaction_doc(doc.key, "party", "user_other"),
@@ -1314,15 +1377,20 @@ test("reaction chips group by createdBy, expose aria-pressed, and toggle putOwne
 	const otherChip = screen.getByRole("button", { name: "Party, 1 reaction" });
 	expect(otherChip.getAttribute("aria-pressed")).toBe("false");
 
-	// Toggling my own reaction off removes my owned doc.
+	// Toggling my own reaction off writes a removed marker on the same owned key.
 	fireEvent.click(mineChip);
-	await waitFor(() => expect(h.raw.data.removeOwned).toHaveBeenCalledTimes(1));
-	expect(h.raw.data.removeOwned.mock.calls[0][0]).toEqual({ collection: "reactions", key: `${doc.key}:heart` });
+	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
+	expect(h.raw.data.putOwned.mock.calls[0][0]).toEqual({
+		collection: "reactions",
+		key: `${doc.key}:heart`,
+		value: { removed: true },
+	});
+	expect(h.raw.data.removeOwned).not.toHaveBeenCalled();
 
 	// Toggling a reaction I do not hold adds my owned doc.
 	fireEvent.click(otherChip);
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
-	expect(h.raw.data.putOwned.mock.calls[0][0]).toEqual({ collection: "reactions", key: `${doc.key}:party`, value: {} });
+	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2));
+	expect(h.raw.data.putOwned.mock.calls[1][0]).toEqual({ collection: "reactions", key: `${doc.key}:party`, value: {} });
 });
 
 test("a forged reaction doc with a mismatched key tail counts under createdBy", async () => {
@@ -1331,9 +1399,10 @@ test("a forged reaction doc with a mismatched key tail counts under createdBy", 
 	const doc = message_doc(1_000, { rand: "m1", text: "target" });
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 	await screen.findByText("target");
+	await wait_for_feeds(h);
 	// user_other smuggled user_me's id into the caller key; createdBy is stamped user_other.
-	h.find_window("reactions", `${CH1_KEY}:`)!.onUpdate(
-		window_update([
+	h.find_changes("reactions")!.onUpdate(
+		watch_update([
 			reaction_doc(doc.key, "heart", "user_other", "user_me"),
 			reaction_doc(doc.key, "heart", "user_other"),
 		]),
@@ -1363,12 +1432,43 @@ test("the add-reaction palette opens, picks a token, and returns focus to the op
 });
 
 /** Renders two roots and returns the older one's row, which sits outside a lagging companion. */
-async function boot_two_roots(h: ReturnType<typeof make_harness>) {
+async function boot_two_roots(
+	h: ReturnType<typeof make_harness>,
+	companion: {
+		reactions?: unknown[];
+		replies?: unknown[];
+		reactionsDone?: boolean;
+		repliesDone?: boolean;
+	} = {},
+) {
 	await boot(h);
 	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
 	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const body = init?.body as { collection?: string; keyStartExclusive?: string } | undefined;
+		const collection = body?.collection;
+		// A lagging first page would otherwise catch up immediately. Hold later pages so the
+		// frontier stays where the test put it.
+		if (body?.keyStartExclusive !== undefined && collection === "reactions" && companion.reactionsDone === false) {
+			return new Promise(() => {});
+		}
+		if (body?.keyStartExclusive !== undefined && collection === "replies" && companion.repliesDone === false) {
+			return new Promise(() => {});
+		}
+		if (collection === "reactions") {
+			return http_page(companion.reactions ?? [], companion.reactionsDone ?? true);
+		}
+		if (collection === "replies") {
+			return http_page(companion.replies ?? [], companion.repliesDone ?? true);
+		}
+		return http_page([], true);
+	});
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([rootNew, rootOld]));
 	await screen.findByText("old root");
+	await wait_for_companion_lists(h);
 	return { rootNew, rootOld };
 }
 
@@ -1386,16 +1486,13 @@ async function pick_reaction(row: HTMLElement, name: string) {
 	fireEvent.click(within(palette).getByRole("button", { name }));
 }
 
-test("a row the reactions window cannot reach says so instead of showing no reactions", async () => {
+test("a row the reactions list cannot reach says so instead of showing no reactions", async () => {
 	const h = make_harness();
-	const { rootNew } = await boot_two_roots(h);
-
-	// The window holds one reaction on the newest root and cannot grow: every older row is
-	// outside its range. An empty reaction list there would read as "nobody reacted", and a
-	// click would take the add branch and rewrite a reaction the member may already hold.
-	h.find_window("reactions", `${CH1_KEY}:`)!.onUpdate(
-		window_update([reaction_doc(rootNew.key, "heart", "user_me")], { hasMore: true, atCapacity: true }),
-	);
+	const newestRoot = message_doc(2_000, { rand: "newr", text: "new root" });
+	await boot_two_roots(h, {
+		reactions: [reaction_doc(newestRoot.key, "heart", "user_me")],
+		reactionsDone: false,
+	});
 
 	const oldRow = row_of("old root");
 	expect(await within(oldRow).findByText("Reactions unavailable")).toBeTruthy();
@@ -1411,49 +1508,58 @@ test("a row the reactions window cannot reach says so instead of showing no reac
 	expect(h.raw.data.removeOwned).not.toHaveBeenCalled();
 });
 
-test("a row the reactions window does reach still writes the reaction", async () => {
+test("a row the reactions list does reach still writes the reaction", async () => {
 	const h = make_harness();
 	await boot_two_roots(h);
-
-	// Nothing older is left, so the window speaks for every rendered row. The refusal above must
-	// not become a blanket one: this is the ordinary path and it has to keep working.
-	h.find_window("reactions", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
 	await pick_reaction(row_of("old root"), "Heart");
 	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
 });
 
-test("an incomplete companion window makes every row uncovered, however deep it reached", async () => {
+test("an incomplete companion list makes every row uncovered, however deep it reached", async () => {
 	const h = make_harness();
-	const { rootNew } = await boot_two_roots(h);
-
-	// Both windows say they reached the end, so the depth test alone calls every row covered.
-	// `incomplete` says documents went missing somewhere inside the range and names none of
-	// them, so no row can be trusted — not the counts, and not the reactions.
-	h.find_window("reactions", `${CH1_KEY}:`)!.onUpdate(
-		window_update([reaction_doc(rootNew.key, "heart", "user_me")], { incomplete: true }),
-	);
-	h.find_window("replies", `${CH1_KEY}:`)!.onUpdate(window_update([], { incomplete: true }));
+	await boot(h);
+	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
+	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions" || collection === "replies") {
+			throw new Error("companion list failed");
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([rootNew, rootOld]));
+	await screen.findByText("old root");
 
 	const newRow = row_of("new root");
 	expect(await within(newRow).findByText("Reactions unavailable")).toBeTruthy();
 	expect(within(newRow).getByRole("button", { name: "View thread" })).toBeTruthy();
 
-	// Uncovered hides the chips, so a token the member already holds cannot be un-reacted here.
-	// A token they do not hold still writes: the add path is correct whatever the coverage says.
 	await pick_reaction(newRow, "Heart");
 	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
 	expect(h.raw.data.removeOwned).not.toHaveBeenCalled();
 });
 
-test("an incomplete companion window is reported to the member", async () => {
+test("an incomplete companion list is reported to the member", async () => {
 	const h = make_harness();
-	await boot_two_roots(h);
+	await boot(h);
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			throw new Error("companion list failed");
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
+		window_update([message_doc(2_000, { rand: "newr", text: "new root" }), message_doc(1_000, { rand: "oldr", text: "old root" })]),
+	);
 
-	h.find_window("reactions", `${CH1_KEY}:`)!.onUpdate(window_update([], { incomplete: true }));
-
-	// Its own sentence, not the messages one: phase 1 rewrites that notice's copy, and this
-	// assertion must not start passing on a different notice.
 	const notice = await screen.findByText("Some reactions and replies in this range could not be loaded.");
 	expect(notice.getAttribute("role")).toBe("alert");
 });
@@ -1484,17 +1590,16 @@ test("the action cluster renders only button classes the stylesheet's reveal rul
 	}
 });
 
-test("a dead reactions window makes the chips uncovered instead of freezing them", async () => {
+test("a dead reactions feed makes the chips uncovered instead of freezing them", async () => {
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "m1", text: "reacted" });
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
-	const reactions = h.find_window("reactions", `${CH1_KEY}:`)!;
-	reactions.onUpdate(window_update([reaction_doc(doc.key, "heart", "user_other")]));
+	await wait_for_feeds(h);
+	const reactions = h.find_changes("reactions")!;
+	reactions.onUpdate(watch_update([reaction_doc(doc.key, "heart", "user_other")]));
 	expect(await screen.findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
 
-	// A ref alone cannot drive a render. Without the coverage state the chips stay exactly as they
-	// were and go on looking live while nothing will ever reach them again.
 	reactions.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
 	expect(await screen.findByText("Reactions unavailable")).toBeTruthy();
 	expect(screen.queryByRole("button", { name: "Heart, 1 reaction" })).toBeNull();
@@ -1504,47 +1609,61 @@ test("a dead reactions window makes the chips uncovered instead of freezing them
 
 // #region threads
 
-test("reply counts follow the replies window: covered roots get counts, the deepest partially-covered root does not, and 99+ follows hasMore", async () => {
+test("reply counts follow the replies list: covered roots get counts, the deepest partially-covered root does not, and 99+ follows hasMore", async () => {
 	const h = make_harness();
 	await boot(h);
 	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
 	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([rootNew, rootOld]));
-	await screen.findByText("old root");
-
-	const replies = h.find_window("replies", `${CH1_KEY}:`)!;
-	replies.onUpdate(
-		window_update(
-			Array.from({ length: 3 }, (_, index) => ({
-				...message_doc(1_000, {}),
-				collection: "replies",
-				key: `${rootNew.key}:${inv(2_000 + index)}:r${index}`,
-			})),
-		),
-	);
-	expect(await screen.findByRole("button", { name: /^3 replies/ })).toBeTruthy();
-
-	// While more replies exist below the window, rootNew is fully covered (the window
-	// reaches the older rootOld), so its big count shows — capped at 99+. rootOld is the
-	// deepest partially-covered root: its count would be a lower bound, so no count is
-	// claimed for it.
 	const hundredOnNew = Array.from({ length: 100 }, (_, index) => ({
 		...message_doc(1_000, {}),
 		collection: "replies",
 		key: `${rootNew.key}:${inv(2_000 + index)}:r${index}`,
 	}));
-	const oneOnOld = {
-		...message_doc(1_000, {}),
-		collection: "replies",
-		key: `${rootOld.key}:${inv(2_000)}:ro00`,
-	};
-	replies.onUpdate(window_update([...hundredOnNew, oneOnOld], { hasMore: true }));
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const body = init?.body as { collection?: string; keyStartExclusive?: string } | undefined;
+		if (body?.collection === "replies") {
+			if (body.keyStartExclusive !== undefined) {
+				return new Promise(() => {});
+			}
+			return http_page(hundredOnNew, false);
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([rootNew, rootOld]));
 	expect(await screen.findByRole("button", { name: /^99\+ replies/ })).toBeTruthy();
 	expect(screen.getByRole("button", { name: "View thread" })).toBeTruthy();
+});
 
-	// Once nothing more exists below, every count is exact and prints uncapped.
-	replies.onUpdate(window_update([...hundredOnNew, oneOnOld]));
-	expect(await screen.findByRole("button", { name: /^100 replies/ })).toBeTruthy();
+test("a finished replies list claims an exact count on every rendered root", async () => {
+	const h = make_harness();
+	await boot(h);
+	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
+	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "replies") {
+			return http_page(
+				[
+					...Array.from({ length: 3 }, (_, index) => ({
+						...message_doc(1_000, {}),
+						collection: "replies",
+						key: `${rootNew.key}:${inv(2_000 + index)}:r${index}`,
+					})),
+					{ ...message_doc(1_000, {}), collection: "replies", key: `${rootOld.key}:${inv(2_000)}:ro00` },
+				],
+				true,
+			);
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([rootNew, rootOld]));
+	expect(await screen.findByRole("button", { name: /^3 replies/ })).toBeTruthy();
 	expect(screen.getByRole("button", { name: /^1 reply/ })).toBeTruthy();
 	expect(screen.queryByRole("button", { name: "View thread" })).toBeNull();
 });
@@ -1561,10 +1680,6 @@ test("the thread panel opens with focus inside, replies append under the root, c
 	const panel = await screen.findByRole("region", { name: "Thread" });
 	const closeButton = within(panel).getByRole("button", { name: "Close thread" });
 	await waitFor(() => expect(document.activeElement).toBe(closeButton));
-
-	// The thread opens its own bounded replies watch on the root key.
-	await waitFor(() => expect(h.find_watch("replies", `${doc.key}:`)).toBeTruthy());
-	h.find_watch("replies", `${doc.key}:`)!.onUpdate(watch_update([]));
 
 	const replyBox = within(panel).getByRole("combobox", { name: "Reply in thread" });
 	fireEvent.input(replyBox, { target: { value: "a reply" } });
@@ -1594,8 +1709,23 @@ test("switching the open thread to another root resets replies, loading state, a
 	const rowA = screen.getByText("root a").closest("[data-key]") as HTMLElement;
 	fireEvent.click(within(rowA).getByRole("button", { name: "Reply in thread" }));
 	const panel = await screen.findByRole("region", { name: "Thread" });
-	await waitFor(() => expect(h.find_watch("replies", `${rootA.key}:`)).toBeTruthy());
-	h.find_watch("replies", `${rootA.key}:`)!.onUpdate(
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
+		if (body?.collection === "replies" && body.keyPrefix === `${rootA.key}:`) {
+			return http_page(
+				[{ ...message_doc(3_000, { text: "reply on a" }), collection: "replies", key: `${rootA.key}:${inv(3_000)}:ra01` }],
+				true,
+			);
+		}
+		return http_page([], true);
+	});
+	// Re-open is already done; the panel listed on open. Drive the same prefix list by toggling
+	// would remount. Apply the reply through the channel replies feed instead.
+	await wait_for_feeds(h);
+	h.find_changes("replies")!.onUpdate(
 		watch_update([
 			{ ...message_doc(3_000, { text: "reply on a" }), collection: "replies", key: `${rootA.key}:${inv(3_000)}:ra01` },
 		]),
@@ -1610,55 +1740,60 @@ test("switching the open thread to another root resets replies, loading state, a
 	// replies, no surviving pending send whose retry would write under B's prefix.
 	const rowB = screen.getByText("root b").closest("[data-key]") as HTMLElement;
 	fireEvent.click(within(rowB).getByRole("button", { name: "Reply in thread" }));
-	await waitFor(() => expect(h.find_watch("replies", `${rootB.key}:`)).toBeTruthy());
 	const freshPanel = await screen.findByRole("region", { name: "Thread" });
-	expect(await within(freshPanel).findByText("Loading replies…")).toBeTruthy();
+	expect(await within(freshPanel).findByText("No replies yet")).toBeTruthy();
 	expect(screen.queryByText("reply on a")).toBeNull();
 	expect(screen.queryByText("Sending…")).toBeNull();
 });
 
-test("a thread whose replies read hit its limit says so in the panel", async () => {
+test("a thread whose replies list is cut says so in the panel", async () => {
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "root", text: "root row" });
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 	await screen.findByText("root row");
+	await wait_for_companion_lists(h);
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
+		if (body?.collection === "replies" && body.keyPrefix === `${doc.key}:`) {
+			return http_page(
+				Array.from({ length: 100 }, (_, index) => ({
+					...message_doc(1_000, {}),
+					collection: "replies",
+					key: `${doc.key}:${inv(2_000 + index)}:r${index}`,
+				})),
+				false,
+			);
+		}
+		return http_page([], true);
+	});
 	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
 	const panel = await screen.findByRole("region", { name: "Thread" });
-	await waitFor(() => expect(h.find_watch("replies", `${doc.key}:`)).toBeTruthy());
-
-	// The thread has more replies than the read's limit. The panel has no "load older" because a
-	// plain watch offers none, so without this notice it shows 100 replies as if that were all
-	// of them — under a root row whose own count says there are more.
-	h.find_watch("replies", `${doc.key}:`)!.onUpdate(
-		watch_update(
-			Array.from({ length: 100 }, (_, index) => ({
-				...message_doc(1_000, {}),
-				collection: "replies",
-				key: `${doc.key}:${inv(2_000 + index)}:r${index}`,
-			})),
-			true,
-		),
-	);
-
 	const notice = await within(panel).findByText("Only the newest 100 replies are shown.");
 	expect(notice.getAttribute("role")).toBe("status");
 });
 
-test("a dead replies window makes an exact count read unknown", async () => {
+test("a dead replies feed makes an exact count read unknown", async () => {
 	const h = make_harness();
 	await boot(h);
 	const root = message_doc(1_000, { rand: "root", text: "counted root" });
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "replies") {
+			return http_page([{ ...message_doc(900, {}), collection: "replies", key: `${root.key}:${inv(900)}:r0` }], true);
+		}
+		return http_page([], true);
+	});
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
-	const replies = h.find_window("replies", `${CH1_KEY}:`)!;
-	replies.onUpdate(
-		window_update([{ ...message_doc(900, {}), collection: "replies", key: `${root.key}:${inv(900)}:r0` }]),
-	);
 	expect(await screen.findByRole("button", { name: /^1 reply/ })).toBeTruthy();
-
-	// hasMore was false, so the count was exact. A dead window keeps that number on the row while
-	// replies go on arriving: the most confident thing on the row becomes the stalest.
-	replies.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	await wait_for_feeds(h);
+	h.find_changes("replies")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
 	expect(await screen.findByRole("button", { name: "View thread" })).toBeTruthy();
 	expect(screen.queryByRole("button", { name: /^1 reply/ })).toBeNull();
 });
@@ -1667,17 +1802,24 @@ test("the thread summary is body content on a root with replies, outside the hov
 	const h = make_harness();
 	await boot(h);
 	const root = message_doc(1_000, { rand: "root", text: "summarised root" });
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "replies") {
+			return http_page(
+				[
+					{ ...message_doc(900, {}), collection: "replies", key: `${root.key}:${inv(900)}:r0` },
+					{ ...message_doc(800, {}), collection: "replies", key: `${root.key}:${inv(800)}:r1` },
+				],
+				true,
+			);
+		}
+		return http_page([], true);
+	});
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
-	h.find_window("replies", `${CH1_KEY}:`)!.onUpdate(
-		window_update([
-			{ ...message_doc(900, {}), collection: "replies", key: `${root.key}:${inv(900)}:r0` },
-			{ ...message_doc(800, {}), collection: "replies", key: `${root.key}:${inv(800)}:r1` },
-		]),
-	);
 
-	// The cluster is an opacity: 0 overlay revealed on hover and focus, so a summary inside it is
-	// invisible until somebody points at the row — the "easy to miss" finding this move answers.
-	// Assert containment, not presence: presence alone was already true before the move.
 	const summary = await screen.findByRole("button", { name: /^2 replies/ });
 	expect(summary.closest(".message-actions")).toBeNull();
 	expect(summary.classList.contains("message-thread-summary")).toBe(true);
@@ -1687,46 +1829,40 @@ test("the thread summary is body content on a root with replies, outside the hov
 
 test("an uncovered root shows no reply time and keeps its affordance in the cluster", async () => {
 	const h = make_harness();
-	await boot(h);
 	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
-	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([rootNew, rootOld]));
-	h.find_window("replies", `${CH1_KEY}:`)!.onUpdate(
-		window_update([{ ...message_doc(900, {}), collection: "replies", key: `${rootNew.key}:${inv(900)}:r0` }], {
-			hasMore: true,
-		}),
-	);
+	await boot_two_roots(h, {
+		replies: [{ ...message_doc(900, {}), collection: "replies", key: `${rootNew.key}:${inv(900)}:r0` }],
+		repliesDone: false,
+	});
 
-	// "Last reply" needs a per-root newest-reply time that nothing produces, and on an uncovered
-	// root it would print a plausible time beside a count that honestly says it does not know.
-	await screen.findByText("old root");
 	const oldRow = row_of("old root");
 	expect(within(oldRow).getByRole("button", { name: "View thread" })).toBeTruthy();
 	expect(within(oldRow).queryByText(/ago|Last reply/)).toBeNull();
 	expect(oldRow.querySelector(".message-thread-summary")).toBeNull();
 });
 
-test("a dead thread replies watch is reported and does not sit on Loading replies", async () => {
-	for (const [reason, contains] of [
-		["denied", "can no longer read"],
-		["session_expired", "session expired"],
-	] as const) {
-		const h = make_harness();
-		await boot(h);
-		const doc = message_doc(1_000, { rand: "root", text: "thread root" });
-		h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
-		await screen.findByText("thread root");
-		fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
-		await screen.findByRole("region", { name: "Thread" });
-
-		// A bare return leaves the panel on "Loading replies…" for the life of the frame, with the
-		// reply composer still enabled, which is the dishonest-degradation shape this phase removes.
-		h.find_watch("replies", `${doc.key}:`)!.onUpdate(null, { reason } satisfies WatchDeathInfo);
-		const alert = await screen.findByRole("alert");
-		expect(alert.textContent?.toLowerCase()).toContain(contains);
-		expect(screen.queryByText("Loading replies…")).toBeNull();
-		cleanup();
-	}
+test("a failed thread replies list is reported and does not sit on Loading replies", async () => {
+	const h = make_harness();
+	await boot(h);
+	const doc = message_doc(1_000, { rand: "root", text: "thread root" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
+	await screen.findByText("thread root");
+	await wait_for_companion_lists(h);
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
+		if (body?.collection === "replies" && body.keyPrefix === `${doc.key}:`) {
+			throw new Error("thread list failed");
+		}
+		return http_page([], true);
+	});
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+	await screen.findByRole("region", { name: "Thread" });
+	const alert = await screen.findByRole("alert");
+	expect(alert.textContent).toContain("thread list failed");
+	expect(screen.queryByText("Loading replies…")).toBeNull();
 });
 
 test("the thread separator is a keyboard-operable splitter that respects both floors", async () => {
@@ -1842,7 +1978,7 @@ test("below capacity Load older extends the window and issues no HTTP request", 
 	await screen.findByText("live one");
 	fireEvent.click(screen.getByRole("button", { name: "Load older" }));
 	expect(messages.loadOlderCalls).toBe(1);
-	expect(h.raw.fetchJson).not.toHaveBeenCalled();
+	expect(list_calls(h, "messages")).toHaveLength(0);
 
 	// The extended window arrives as a normal update; nothing more below hides the button.
 	messages.onUpdate(
@@ -1907,11 +2043,8 @@ async function boot_at_capacity(h: ReturnType<typeof make_harness>, newest = mes
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([newest], { hasMore: true, atCapacity: true }));
 	await screen.findByText("window newest");
+	await wait_for_companion_lists(h);
 	return newest;
-}
-
-function http_page(documents: unknown[], isDone: boolean) {
-	return { documents, cursor: null, isDone };
 }
 
 test("at capacity the control pages older history over HTTP with a fencepost and no cursor", async () => {
@@ -1928,7 +2061,7 @@ test("at capacity the control pages older history over HTTP with a fencepost and
 	// changed range is refused instead of being reinterpreted inside it. A fencepost carries no such
 	// binding: it is the last key of the page, and the first press continues from the window's own
 	// oldest key.
-	const [path, init] = h.raw.fetchJson.mock.calls[0];
+	const [path, init] = list_calls(h, "messages")[0]!;
 	expect(path).toBe("/api/v1/plugin-data/list");
 	expect(init?.body).toEqual({
 		collection: "messages",
@@ -1942,32 +2075,66 @@ test("at capacity the control pages older history over HTTP with a fencepost and
 	h.raw.fetchJson.mockResolvedValueOnce(http_page([message_doc(300, { rand: "old3", text: "third page one" })], false));
 	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
 	await screen.findByText("third page one");
-	expect(h.raw.fetchJson.mock.calls[1][1]?.body).toMatchObject({ keyStartExclusive: oldest.key });
+	expect(list_calls(h, "messages")[1]?.[1]?.body).toMatchObject({ keyStartExclusive: oldest.key });
 	expect(screen.getAllByText("older one").length).toBe(1);
 	expect(screen.getByText("window newest")).toBeTruthy();
 });
 
-test("a page in flight disables the control, and rows below the reactions frontier stay uncovered", async () => {
+test("a frozen HTTP-loaded row updates when the messages change feed delivers a newer revision", async () => {
 	const h = make_harness();
 	await boot_at_capacity(h);
-	// The reactions window covers only what it delivered, so HTTP rows sit below its frontier.
-	h.find_window("reactions", `${CH1_KEY}:`)!.onUpdate(window_update([], { hasMore: true, atCapacity: true }));
+	const older = message_doc(500, { rand: "old1", text: "older one" });
+	h.raw.fetchJson.mockResolvedValueOnce(http_page([older], true));
+	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+	await screen.findByText("older one");
+	await wait_for_feeds(h);
+	h.find_changes("messages")!.onUpdate(
+		watch_update([
+			{
+				...older,
+				value: { ...older.value, text: "edited older", editedAt: 2_000 },
+				revision: 2,
+				updatedAt: older.updatedAt + 50,
+			},
+		]),
+	);
+	expect(await screen.findByText("edited older")).toBeTruthy();
+	expect(screen.queryByText("older one")).toBeNull();
+});
 
-	const page = deferred<unknown>();
-	h.raw.fetchJson.mockReturnValueOnce(page.promise);
+test("a page in flight disables the control, and rows below the reactions frontier stay uncovered", async () => {
+	const h = make_harness();
+	await boot(h);
+	const newest = message_doc(1_000, { rand: "m1", text: "window newest" });
+	const pendingMessagesPage = deferred<unknown>();
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			return http_page([reaction_doc(newest.key, "heart", "user_other")], false);
+		}
+		if (collection === "messages") {
+			return pendingMessagesPage.promise;
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([newest], { hasMore: true, atCapacity: true }));
+	await screen.findByText("window newest");
+	await wait_for_companion_lists(h);
+
 	const control = screen.getByRole("button", { name: "Load older messages" });
+	const messageCallsBefore = list_calls(h, "messages").length;
 	fireEvent.click(control);
 
-	// A slow page must not invite a second press: every press spends a rate-limit token.
 	await waitFor(() => expect((control as HTMLButtonElement).disabled).toBe(true));
 	expect(screen.getAllByRole("status").some((element) => element.textContent === "Loading older messages…")).toBe(true);
 	fireEvent.click(control);
-	expect(h.raw.fetchJson).toHaveBeenCalledTimes(1);
+	expect(list_calls(h, "messages")).toHaveLength(messageCallsBefore + 1);
 
-	page.resolve(http_page([message_doc(500, { rand: "old1", text: "fetched row" })], false));
+	pendingMessagesPage.resolve(http_page([message_doc(500, { rand: "old1", text: "fetched row" })], false));
 	await screen.findByText("fetched row");
-	// A row with no matching reaction doc renders identically to one nobody reacted to, and a
-	// click on it would take the add branch. Phase 1 says so instead of paging reactions.
 	expect(within(row_of("fetched row")).getByText("Reactions unavailable")).toBeTruthy();
 });
 
@@ -1977,14 +2144,11 @@ test("isDone replaces the control with static text and a further interaction iss
 	h.raw.fetchJson.mockResolvedValueOnce(http_page(Array.from({ length: 100 }, (_, index) => message_doc(500 - index, { rand: `o${index}` })), true));
 
 	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
-	// `isDone` is the route's own exhaustion signal. A last page that happens to be exactly full
-	// would fool a `documents.length < limit` test, and each further press would spend a token —
-	// charged before the body is even read — on an empty page.
 	await screen.findByText("You have reached the start of #general.");
 	expect(screen.queryByRole("button", { name: "Load older messages" })).toBeNull();
 
 	fireEvent.click(screen.getByText("You have reached the start of #general."));
-	expect(h.raw.fetchJson).toHaveBeenCalledTimes(1);
+	expect(list_calls(h, "messages")).toHaveLength(1);
 });
 
 test("a 429 names a wait, retries nothing by itself, and returns to idle when the wait passes", async () => {
@@ -2001,7 +2165,7 @@ test("a 429 names a wait, retries nothing by itself, and returns to idle when th
 	const alert = await screen.findByRole("alert");
 	expect(alert.textContent).toContain("too quickly");
 	expect((screen.getByRole("button", { name: "Load older messages" }) as HTMLButtonElement).disabled).toBe(true);
-	expect(h.raw.fetchJson).toHaveBeenCalledTimes(1);
+	expect(list_calls(h, "messages")).toHaveLength(1);
 
 	// The bucket refills at two tokens a second, so the throttle clears on its own. Staying dead
 	// for the life of the frame is the failure mode the wait exists to prevent — and the control
@@ -2009,7 +2173,7 @@ test("a 429 names a wait, retries nothing by itself, and returns to idle when th
 	await waitFor(() =>
 		expect((screen.getByRole("button", { name: "Load older messages" }) as HTMLButtonElement).disabled).toBe(false),
 	);
-	expect(h.raw.fetchJson).toHaveBeenCalledTimes(1);
+	expect(list_calls(h, "messages")).toHaveLength(1);
 });
 
 test("a non-429 failure reads differently and hands the control straight back", async () => {
@@ -2030,76 +2194,62 @@ test("a non-429 failure reads differently and hands the control straight back", 
 	);
 });
 
-test("an HTTP page does not drag the companion windows into paging history", async () => {
+test("an HTTP page does not drag the companion lists into paging history", async () => {
 	const h = make_harness();
 	const newest = await boot_at_capacity(h);
-	const reactions = h.find_window("reactions", `${CH1_KEY}:`)!;
-	const replies = h.find_window("replies", `${CH1_KEY}:`)!;
-	// Both companions now reach exactly the oldest row the WINDOW rendered, so the catch-up loop
-	// is quiet: it only calls loadOlder while a companion's deepest root is newer than that row.
-	reactions.onUpdate(window_update([reaction_doc(newest.key, "heart", "user_other")], { hasMore: true }));
-	replies.onUpdate(
-		window_update([{ ...message_doc(900, {}), collection: "replies", key: `${newest.key}:${inv(900)}:r0` }], {
-			hasMore: true,
-		}),
-	);
-	const reactionCalls = reactions.loadOlderCalls;
-	const replyCalls = replies.loadOlderCalls;
+	const reactionCalls = list_calls(h, "reactions").length;
+	const replyCalls = list_calls(h, "replies").length;
 
 	h.raw.fetchJson.mockResolvedValueOnce(http_page([message_doc(500, { rand: "old1", text: "deep row" })], false));
 	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
 	await screen.findByText("deep row");
 
-	// The frontier must stay on the window's own oldest key. Recomputed from the merged store —
-	// which keeps every HTTP row forever — one page sends both companions after history the window
-	// never asked for, spending interval slots this frame has almost none of.
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([newest], { hasMore: true, atCapacity: true }));
 	await waitFor(() => expect(screen.getByText("deep row")).toBeTruthy());
-	expect(reactions.loadOlderCalls).toBe(reactionCalls);
-	expect(replies.loadOlderCalls).toBe(replyCalls);
+	expect(list_calls(h, "reactions")).toHaveLength(reactionCalls);
+	expect(list_calls(h, "replies")).toHaveLength(replyCalls);
 });
 
 // #endregion load older
 
 // #region companion catch-up
 
-test("the catch-up loop extends a lagging companion window after every delivery", async () => {
+test("the catch-up loop lists another companion page after every delivery", async () => {
 	const h = make_harness();
 	await boot(h);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
-	const reactions = h.find_window("reactions", `${CH1_KEY}:`)!;
-	const replies = h.find_window("replies", `${CH1_KEY}:`)!;
-
 	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
 	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
+	const rootOldest = message_doc(500, { rand: "olds", text: "oldest root" });
+	let reactionPages = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			reactionPages += 1;
+			if (reactionPages === 1) {
+				return http_page([reaction_doc(rootNew.key, "heart", "user_other")], false);
+			}
+			if (reactionPages === 2) {
+				return http_page([reaction_doc(rootOld.key, "party", "user_other")], false);
+			}
+			return http_page([reaction_doc(rootOldest.key, "wow", "user_other")], true);
+		}
+		return http_page([], true);
+	});
 	messages.onUpdate(window_update([rootNew, rootOld]));
 	await screen.findByText("old root");
+	await waitFor(() => expect(list_calls(h, "reactions").length).toBe(2));
 
-	// Reactions cover only the newest root while more exist below: extend one page.
-	reactions.onUpdate(window_update([reaction_doc(rootNew.key, "heart", "user_other")], { hasMore: true }));
-	expect(reactions.loadOlderCalls).toBe(1);
+	const reactionCallsAfterCatchUp = list_calls(h, "reactions").length;
+	expect(list_calls(h, "replies").length).toBe(1);
 
-	// The extension reaches the oldest rendered root: caught up, no further command.
-	reactions.onUpdate(
-		window_update([reaction_doc(rootNew.key, "heart", "user_other"), reaction_doc(rootOld.key, "party", "user_other")], {
-			hasMore: true,
-		}),
-	);
-	expect(reactions.loadOlderCalls).toBe(1);
-
-	// hasMore false never triggers a command, and at capacity the loop stops honestly
-	// instead of spamming commands the host would refuse.
-	replies.onUpdate(window_update([]));
-	expect(replies.loadOlderCalls).toBe(0);
-	replies.onUpdate(window_update([], { hasMore: true, atCapacity: true }));
-	expect(replies.loadOlderCalls).toBe(0);
-
-	// A deeper messages delivery re-evaluates the companions: reactions lag again.
-	const rootOldest = message_doc(500, { rand: "olds", text: "oldest root" });
 	messages.onUpdate(window_update([rootNew, rootOld, rootOldest]));
 	await screen.findByText("oldest root");
-	expect(reactions.loadOlderCalls).toBe(2);
-	expect(replies.loadOlderCalls).toBe(0);
+	await waitFor(() => expect(list_calls(h, "reactions").length).toBe(reactionCallsAfterCatchUp + 1));
+	expect(list_calls(h, "replies").length).toBe(1);
 });
 
 // #endregion companion catch-up
@@ -2108,10 +2258,18 @@ test("the catch-up loop extends a lagging companion window after every delivery"
 
 test("one click resolves the whole message in a single request; a per-file error renders inline", async () => {
 	const h = make_harness();
-	h.raw.fetchJson.mockResolvedValueOnce({
-		items: [{ fileNodeId: "n1", url: "https://signed.example/n1", expiresAt: Date.now() + 600_000 }],
-		errors: [{ fileNodeId: "n2", message: "Permission denied" }],
-		truncated: false,
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/list") {
+			return http_page([], true);
+		}
+		if (path === "/api/v1/files/download-urls") {
+			return {
+				items: [{ fileNodeId: "n1", url: "https://signed.example/n1", expiresAt: Date.now() + 600_000 }],
+				errors: [{ fileNodeId: "n2", message: "Permission denied" }],
+				truncated: false,
+			};
+		}
+		throw new Error("fetchJson not stubbed");
 	});
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
@@ -2121,16 +2279,14 @@ test("one click resolves the whole message in a single request; a per-file error
 		]),
 	);
 
-	// A batch costs the same rate-limit budget as the same number of single calls, so one click
-	// resolves this message's whole list and buys the round trips back.
 	await screen.findByText("with files");
 	fireEvent.click(screen.getByRole("button", { name: "spec.pdf" }));
 	const link = await screen.findByRole("link", { name: "spec.pdf" });
 	expect(link.getAttribute("href")).toBe("https://signed.example/n1");
-	expect(h.raw.fetchJson).toHaveBeenCalledTimes(1);
-	expect(h.raw.fetchJson.mock.calls[0][1]?.body).toEqual({ fileNodeIds: ["n1", "n2"] });
+	const downloadCalls = file_calls(h, "/api/v1/files/download-urls");
+	expect(downloadCalls).toHaveLength(1);
+	expect(downloadCalls[0]?.[1]?.body).toEqual({ fileNodeIds: ["n1", "n2"] });
 
-	// The other message was never clicked, so nothing was spent on it.
 	expect(screen.getByRole("button", { name: "untouched.pdf" })).toBeTruthy();
 
 	const alert = await screen.findByRole("alert");
@@ -2143,19 +2299,20 @@ test("a message with 21 attachments issues a second request carrying the 21st id
 		fileNodeId: `n${index + 1}`,
 		name: `file-${index + 1}.pdf`,
 	}));
-	// `truncated` is false on both, which is what the real route answers for a body already capped
-	// at 20. Driving the tail off it would drop every attachment past the 20th.
-	h.raw.fetchJson
-		.mockResolvedValueOnce({
-			items: attachments.slice(0, 20).map((a) => ({ fileNodeId: a.fileNodeId, url: `https://s/${a.fileNodeId}`, expiresAt: 1 })),
-			errors: [],
-			truncated: false,
-		})
-		.mockResolvedValueOnce({
-			items: [{ fileNodeId: "n21", url: "https://s/n21", expiresAt: 1 }],
-			errors: [],
-			truncated: false,
-		});
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path === "/api/v1/plugin-data/list") {
+			return http_page([], true);
+		}
+		if (path === "/api/v1/files/download-urls") {
+			const ids = ((init?.body as { fileNodeIds?: string[] } | undefined)?.fileNodeIds ?? []) as string[];
+			return {
+				items: ids.map((fileNodeId) => ({ fileNodeId, url: `https://s/${fileNodeId}`, expiresAt: 1 })),
+				errors: [],
+				truncated: false,
+			};
+		}
+		throw new Error("fetchJson not stubbed");
+	});
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
 		window_update([message_doc(1_000, { rand: "m1", text: "many files", attachments })]),
@@ -2165,27 +2322,37 @@ test("a message with 21 attachments issues a second request carrying the 21st id
 	fireEvent.click(screen.getByRole("button", { name: "file-1.pdf" }));
 	await screen.findByRole("link", { name: "file-21.pdf" });
 
-	expect(h.raw.fetchJson).toHaveBeenCalledTimes(2);
-	expect(h.raw.fetchJson.mock.calls[0][1]?.body).toEqual({ fileNodeIds: attachments.slice(0, 20).map((a) => a.fileNodeId) });
-	expect(h.raw.fetchJson.mock.calls[1][1]?.body).toEqual({ fileNodeIds: ["n21"] });
+	const downloadCalls = file_calls(h, "/api/v1/files/download-urls");
+	expect(downloadCalls).toHaveLength(2);
+	expect(downloadCalls[0]?.[1]?.body).toEqual({ fileNodeIds: attachments.slice(0, 20).map((a) => a.fileNodeId) });
+	expect(downloadCalls[1]?.[1]?.body).toEqual({ fileNodeIds: ["n21"] });
 });
 
 test("the picker lists workspace files and a picked file rides the next send", async () => {
 	const h = make_harness();
-	h.raw.fetchJson.mockResolvedValueOnce({
-		items: [
-			{ path: "/docs/spec.pdf", name: "spec.pdf", kind: "file", nodeId: "n1", contentType: "application/pdf", updatedAt: 1 },
-		],
-		cursor: null,
-		isDone: true,
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/list") {
+			return http_page([], true);
+		}
+		if (path === "/api/v1/files/list") {
+			return {
+				items: [
+					{ path: "/docs/spec.pdf", name: "spec.pdf", kind: "file", nodeId: "n1", contentType: "application/pdf", updatedAt: 1 },
+				],
+				cursor: null,
+				isDone: true,
+			};
+		}
+		throw new Error("fetchJson not stubbed");
 	});
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
 	fireEvent.click(await screen.findByRole("button", { name: "Attach file" }));
 	const dialog = await screen.findByRole("dialog");
-	expect(h.raw.fetchJson.mock.calls[0][0]).toBe("/api/v1/files/list");
-	const listBody = h.raw.fetchJson.mock.calls[0][1]?.body;
+	const fileListCalls = file_calls(h, "/api/v1/files/list");
+	expect(fileListCalls).toHaveLength(1);
+	const listBody = fileListCalls[0]?.[1]?.body;
 	expect(listBody?.kind).toBe("file");
 	expect(listBody?.contentTypePrefixes).toContain("image/");
 
@@ -2376,13 +2543,21 @@ test("a two-person direct message renders through the same component and store p
 
 	// And the same store path: the same three collections, each keyed off the channel's own key.
 	await waitFor(() => expect(h.find_window("messages", `${PRIVATE_DM_KEY}:`)).toBeTruthy());
-	expect(h.find_window("reactions", `${PRIVATE_DM_KEY}:`)).toBeTruthy();
-	expect(h.find_window("replies", `${PRIVATE_DM_KEY}:`)).toBeTruthy();
+	h.find_window("messages", `${PRIVATE_DM_KEY}:`)!.onUpdate(window_update([message_doc(1_000, { channelKey: PRIVATE_DM_KEY, rand: "dm1", text: "hi" })]));
+	await wait_for_feeds(h, PRIVATE_DM_KEY);
+	expect(h.find_changes("messages", PRIVATE_DM_KEY)?.opts.scopeId).toBe(PRIVATE_DM_KEY);
+	expect(h.find_changes("replies", PRIVATE_DM_KEY)?.opts.scopeId).toBe(PRIVATE_DM_KEY);
+	expect(h.find_changes("reactions", PRIVATE_DM_KEY)?.opts.scopeId).toBe(PRIVATE_DM_KEY);
+	expect(h.find_window("reactions", `${PRIVATE_DM_KEY}:`)).toBeUndefined();
+	expect(h.find_window("replies", `${PRIVATE_DM_KEY}:`)).toBeUndefined();
 
 	fireEvent.click(screen.getByRole("button", { name: "#secret-plans (private)" }));
 	await waitFor(() => expect(h.find_window("messages", `${PRIVATE_KEY}:`)).toBeTruthy());
-	expect(h.find_window("reactions", `${PRIVATE_KEY}:`)).toBeTruthy();
-	expect(h.find_window("replies", `${PRIVATE_KEY}:`)).toBeTruthy();
+	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "p1", text: "secret" })]));
+	await wait_for_feeds(h, PRIVATE_KEY);
+	expect(h.find_changes("messages", PRIVATE_KEY)?.opts.scopeId).toBe(PRIVATE_KEY);
+	expect(h.find_window("reactions", `${PRIVATE_KEY}:`)).toBeUndefined();
+	expect(h.find_window("replies", `${PRIVATE_KEY}:`)).toBeUndefined();
 });
 
 test("a private channel names the organization owner as a reader, and a public one says nothing of the sort", async () => {

@@ -244,8 +244,19 @@ describe("document validation", () => {
 			token: "party",
 			createdBy: "user_b",
 			revision: 1,
+			updatedAt: 2_000,
+			removed: false,
 		});
 		expect(chat_validate_reaction_doc(doc_envelope({ key: `${messageKey}:sparkles:user_b`, value: {} }))).toBeNull();
+		const marker = chat_validate_reaction_doc(
+			doc_envelope({
+				collection: "reactions",
+				key: `${messageKey}:party:user_b`,
+				value: { removed: true },
+				createdBy: "user_b",
+			}),
+		);
+		expect(marker?.removed).toBe(true);
 	});
 });
 
