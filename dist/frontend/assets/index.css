@@ -1397,25 +1397,29 @@ body {
 	gap: 4px;
 	padding: 8px 16px 10px;
 	border-top: 1px solid var(--cc-border);
-
-	/* The @-menu is absolutely positioned against the composer. */
-	position: relative;
 }
 
-/* The @-menu floats above the text box; the caret stays in the textarea while it is open. */
+/* Portalled by Ariakit, so it is not positioned against the composer. The caret stays in the
+   textarea (virtual focus). */
 .mention-menu {
-	position: absolute;
-	bottom: calc(100% - 6px);
-	left: 16px;
-	z-index: 20;
+	display: flex;
+	flex-direction: column;
+	z-index: 40;
 	margin: 0;
 	padding: 4px;
-	list-style: none;
 	min-width: 220px;
 	background: var(--cc-surface-raised);
 	border: 1px solid var(--cc-border-strong);
 	border-radius: 10px;
-	box-shadow: 0 8px 30px var(--cc-shadow-popover);
+	box-shadow: 0 8px 24px var(--cc-shadow-popover);
+}
+
+.mention-menu-status {
+	padding: 8px 10px;
+	max-width: 260px;
+	color: var(--cc-text-muted);
+	font-size: 13px;
+	line-height: 1.35;
 }
 
 .mention-option {
@@ -1424,8 +1428,8 @@ body {
 	cursor: pointer;
 }
 
-.mention-option.is-active,
-.mention-option:hover {
+/* Ariakit moves this with the keyboard as well as the pointer, so it is the one hover-ish state. */
+.mention-option[data-active-item] {
 	background: var(--cc-surface-hover);
 }
 

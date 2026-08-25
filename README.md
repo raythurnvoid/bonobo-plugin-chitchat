@@ -7,7 +7,7 @@ Team chat for a workspace, built entirely on the generic plugin surfaces: channe
 All documents live in the plugin document store, one installation per workspace:
 
 - `channels` — created through `put` with a client-generated key (UUID); value `{ name, archivedAt }`. Rename/archive/unarchive go through `put` too.
-- `messages` — appended under `<channelKey>:`; value `{ text, attachments: [{ fileNodeId, name }], editedAt, deletedAt }`. Deleting a message writes a `deletedAt` tombstone (the key is never reused); the page renders "Message deleted".
+- `messages` — appended under `<channelKey>:`; value `{ text, attachments: [{ fileNodeId, name }], editedAt, deletedAt, mentions? }`. Deleting a message writes a `deletedAt` tombstone (the key is never reused); the page renders "Message deleted". `mentions` is the list of user ids the author picked with `@Name` in `text`. Only ids whose `@Name` is still in the text at send time are stored, so deleting the name from the composer deletes the mention. A rename does not retarget old messages: the log highlights `@Name` only where it still matches the member's current display name.
 - `replies` — appended under `<rootMessageKey>:`; same value shape. Threads are one level deep: the UI offers a thread only on root messages.
 - `reactions` — `putOwned`/`removeOwned` with caller key `<messageKey>:<token>`; the server appends `:<userId>`. The palette is fixed to 8 tokens: thumbs_up, heart, laugh, wow, sad, party, rocket, eyes.
 
@@ -29,6 +29,8 @@ Server-appended message and reply keys end with `<invertedPaddedMs>:<rand4>`, so
 - **Reactions are shown only for covered rows.** The reactions window catches up towards the oldest rendered message, but it holds at most six pages: on a busy channel the oldest rendered rows stay outside it. Those rows say reactions are unavailable instead of showing none.
 - Channel documents are shared: any member with content write access can rename or archive a channel. Channel and message writes are compare-and-set on the stored revision, so a concurrent edit answers a conflict instead of overwriting silently.
 - Attachment links are resolved through `/api/v1/files/download-urls` at click time and never stored, so file permissions are rechecked per member and per click.
+- The `@-menu` and the private-channel people picker need `workspace.members.read`. Until an admin accepts that capability, `members.list` answers `not_consented`. The composer stays usable: the menu shows a short explanation instead of an empty list, and sending still works as plain text with no `mentions` field.
+- The roster is loaded on the first `@`, paged through the cursor, and cached for the page session. Paging stops after 1,000 names. Members with no profile name appear as "Someone with no name yet", the same label the people picker uses. A sent mention still stores their id, but the log can only highlight `@Name` where `members.resolve` currently has a display name, so an anonymous insert will not light up.
 
 ## UI stack: real React and Ariakit, and why the bundle is minified
 
@@ -53,7 +55,7 @@ A published plugin file may not exceed **900,000 bytes**. Measured on this bundl
 | ---------------------------------- | --------- |
 | React, no minification             | 947,309   |
 | Identifier names preserved         | 908,086   |
-| Full esbuild minify, then prettier | ~730,000  |
+| Full esbuild minify, then prettier | 749,095  |
 
 So the readable build does not fit and identifier names have to go. `vite.config.ts` minifies the
 JavaScript, and the build script then reformats it with prettier, which puts it back on ~25,800 lines

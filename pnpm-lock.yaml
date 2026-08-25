@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       '@ariakit/react':
-        specifier: ^0.4.20
+        specifier: 0.4.20
         version: 0.4.20(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       bonobo-plugin-sdk:
         specifier: github:raythurnvoid/bonobo-plugin-sdk#7d208bcf626499dfeebe0e9dbd10a11a94674234

@@ -1,14 +1,22 @@
 import type { BonoboUiFrontendClient, BonoboUiMember } from "bonobo-plugin-sdk/frontend";
-import type { CSSProperties, KeyboardEvent, PointerEvent } from "react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import type { CSSProperties, ChangeEvent, KeyboardEvent, PointerEvent } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Paperclip } from "lucide-react";
+// The `@ariakit/react` barrel drags in Tab, Menu, Select, Form and the rest, and the published
+// bundle has a hard 900,000-byte ceiling. The combobox subpath carries only what this file uses.
+import * as Ariakit from "@ariakit/react/combobox";
 import {
 	chat_channel_is_private,
 	chat_download_urls_response_schema,
 	chat_files_list_response_schema,
+	chat_filter_mention_members,
 	chat_format_recency,
 	chat_get_error_message,
+	chat_insert_mention,
 	chat_key_timestamp,
+	chat_mention_ids_still_in_text,
+	chat_mention_query_at,
+	chat_mention_roster_refusal_copy,
 	chat_message_key_prefix,
 	chat_plugin_data_list_response_schema,
 	chat_PRIVATE_CHANNEL_DISCLOSURE,
@@ -430,73 +438,141 @@ type Composer_Props = {
 /** How many people the @-menu offers at once — a menu a person scans, not a roster. */
 const MENTION_MENU_SIZE = 8;
 
+/** One `members.list` page. The SDK refuses anything outside 1..100. */
+const MENTION_ROSTER_PAGE_SIZE = 100;
+
+/**
+ * Stop paging after this many pages even if the cursor continues. A 10,000-member workspace
+ * must not spend the first "@" walking the whole list.
+ */
+const MENTION_ROSTER_MAX_PAGES = 10;
+
+type MentionRoster =
+	| { status: "ready"; members: BonoboUiMember[] }
+	| { status: "refused"; name: string };
+
+const mention_roster_cache = new WeakMap<BonoboUiFrontendClient, MentionRoster>();
+const mention_roster_inflight = new WeakMap<BonoboUiFrontendClient, Promise<MentionRoster>>();
+
+/**
+ * Loads the workspace roster once per client for the life of the page. The first "@" starts
+ * it; later keystrokes and the thread composer reuse the same answer.
+ */
+function load_mention_roster(client: BonoboUiFrontendClient): Promise<MentionRoster> {
+	const cached = mention_roster_cache.get(client);
+	if (cached !== undefined) {
+		return Promise.resolve(cached);
+	}
+	const inflight = mention_roster_inflight.get(client);
+	if (inflight !== undefined) {
+		return inflight;
+	}
+	const pending = fetch_mention_roster(client).then((roster) => {
+		// Cache only answers. A transient refusal (a connection blip on the first "@") must not
+		// disable mentions for the rest of the page's life; the composer that saw it keeps it in
+		// its own state, and the next composer mount asks again.
+		if (roster.status === "ready") {
+			mention_roster_cache.set(client, roster);
+		}
+		mention_roster_inflight.delete(client);
+		return roster;
+	});
+	mention_roster_inflight.set(client, pending);
+	return pending;
+}
+
+async function fetch_mention_roster(client: BonoboUiFrontendClient): Promise<MentionRoster> {
+	const members: BonoboUiMember[] = [];
+	let cursor: string | undefined;
+	for (let page = 0; page < MENTION_ROSTER_MAX_PAGES; page += 1) {
+		const result = await client.members.list({
+			limit: MENTION_ROSTER_PAGE_SIZE,
+			...(cursor === undefined ? {} : { cursor }),
+		});
+		if ("_nay" in result) {
+			// Keep names from earlier pages. A first-page refusal must not look like an empty
+			// workspace, because the SDK never answers that way.
+			if (members.length > 0) {
+				return { status: "ready", members };
+			}
+			return { status: "refused", name: result._nay.name };
+		}
+		members.push(...result._yay.members);
+		if (result._yay.cursor === null) {
+			return { status: "ready", members };
+		}
+		cursor = result._yay.cursor;
+	}
+	return { status: "ready", members };
+}
+
+function mention_item_id(userId: string) {
+	return `mention:${userId}`;
+}
+
 function Composer(props: Composer_Props) {
 	const hintId = useId();
 	const [text, setText] = useState("");
 	const [attachments, setAttachments] = useState<chat_Attachment[]>([]);
 	const [pickerOpen, setPickerOpen] = useState(false);
-	/** null = never asked; "failed" = the roster was refused, so @ degrades to plain text. */
-	const [mentionRoster, setMentionRoster] = useState<BonoboUiMember[] | "failed" | null>(null);
+	/** null = never asked; "loading" = first "@" in flight. */
+	const [mentionRoster, setMentionRoster] = useState<MentionRoster | "loading" | null>(null);
 	/** The `@word` under the caret: where the `@` sits and what follows it. */
 	const [mentionQuery, setMentionQuery] = useState<{ start: number; query: string } | null>(null);
-	const [mentionIndex, setMentionIndex] = useState(0);
 	/** userId → the display name that was inserted for it. Send keeps only names still in the text. */
 	const chosenMentionsRef = useRef(new Map<string, string>());
 	const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-	const rosterRequestedRef = useRef(false);
-
-	// The roster is read on the first "@", not on mount — most sends never mention anybody.
-	// A refusal degrades to plain text, mirroring the people dialog: the member can still type
-	// "@Ana" as ordinary words.
-	const update_mention_query = (value: string, caret: number) => {
-		const match = /(?:^|\s)@([^\s@]*)$/.exec(value.slice(0, caret));
-		if (match === null) {
-			setMentionQuery(null);
-			return;
-		}
-		setMentionQuery({ start: caret - match[1].length - 1, query: match[1] });
-		setMentionIndex(0);
-		if (!rosterRequestedRef.current) {
-			rosterRequestedRef.current = true;
-			// `members.list` resolves every refusal and never rejects.
-			props.client.members.list({ limit: 100 }).then((result) => {
-				setMentionRoster("_nay" in result ? "failed" : result._yay.members);
-			});
-		}
-	};
+	const pendingCaretRef = useRef<number | null>(null);
+	// The layout effect below pushes `mentionOpen` into the store; `setOpen` mirrors the other
+	// direction. When Ariakit dismisses on its own — outside press, focus leaving, or our
+	// `combobox.hide()` calls — the query must clear with it, or the store closes while
+	// `mentionQuery` stays set and Enter picks from a menu that is no longer on screen.
+	const combobox = Ariakit.useComboboxStore({
+		placement: "top-start",
+		resetValueOnHide: false,
+		setOpen: (open) => {
+			if (!open) {
+				setMentionQuery(null);
+			}
+		},
+	});
 
 	const selfUserId = props.client.context.userId;
 	const mentionCandidates =
-		mentionQuery !== null && Array.isArray(mentionRoster)
-			? mentionRoster
-					.filter(
-						(member): member is BonoboUiMember & { displayName: string } =>
-							typeof member.displayName === "string" &&
-							member.displayName !== "" &&
-							member.userId !== selfUserId &&
-							member.displayName.toLowerCase().startsWith(mentionQuery.query.toLowerCase()),
-					)
-					.slice(0, MENTION_MENU_SIZE)
+		mentionQuery !== null && mentionRoster !== null && mentionRoster !== "loading" && mentionRoster.status === "ready"
+			? chat_filter_mention_members(mentionRoster.members, mentionQuery.query, selfUserId).slice(0, MENTION_MENU_SIZE)
 			: [];
+	const mentionOpen =
+		mentionQuery !== null &&
+		(mentionRoster === "loading" ||
+			(mentionRoster !== null && mentionRoster.status === "refused") ||
+			mentionCandidates.length > 0);
 
-	const pick_mention = (member: BonoboUiMember & { displayName: string }) => {
+	const start_roster = () => {
+		if (mentionRoster !== null) {
+			return;
+		}
+		const cached = mention_roster_cache.get(props.client);
+		if (cached !== undefined) {
+			setMentionRoster(cached);
+			return;
+		}
+		setMentionRoster("loading");
+		load_mention_roster(props.client).then(setMentionRoster);
+	};
+
+	const pick_mention = (member: { userId: string; label: string }) => {
 		if (mentionQuery === null) {
 			return;
 		}
 		const caret = textareaRef.current?.selectionStart ?? text.length;
-		const next = `${text.slice(0, mentionQuery.start)}@${member.displayName} ${text.slice(caret)}`;
-		chosenMentionsRef.current.set(member.userId, member.displayName);
-		setText(next);
+		const inserted = chat_insert_mention(text, mentionQuery.start, caret, member.label);
+		chosenMentionsRef.current.set(member.userId, member.label);
+		setText(inserted.text);
 		setMentionQuery(null);
-		// Put the caret after the inserted "@Name " so typing continues past it.
-		const newCaret = mentionQuery.start + member.displayName.length + 2;
-		queueMicrotask(() => {
-			const element = textareaRef.current;
-			if (element !== null) {
-				element.focus();
-				element.setSelectionRange(newCaret, newCaret);
-			}
-		});
+		pendingCaretRef.current = inserted.caret;
+		combobox.hide();
+		combobox.setValue("");
 	};
 
 	const handle_send = () => {
@@ -508,41 +584,50 @@ function Composer(props: Composer_Props) {
 		if (trimmed === "" && attachments.length === 0) {
 			return;
 		}
-		// Store only ids whose "@Name" still stands in the sent text — deleting the name from the
-		// text deletes the mention.
-		const mentions = [...chosenMentionsRef.current.entries()]
-			.filter(([, name]) => trimmed.includes(`@${name}`))
-			.map(([id]) => id);
+		const mentions = chat_mention_ids_still_in_text(chosenMentionsRef.current, trimmed);
 		props.onSend(trimmed, attachments, mentions);
 		setText("");
 		setAttachments([]);
 		setMentionQuery(null);
 		chosenMentionsRef.current.clear();
+		combobox.hide();
+	};
+
+	const handle_change = (event: ChangeEvent<HTMLTextAreaElement>) => {
+		const value = event.currentTarget.value;
+		const caret = event.currentTarget.selectionStart ?? value.length;
+		setText(value);
+		const query = chat_mention_query_at(value, caret);
+		setMentionQuery(query);
+		combobox.setValue(query?.query ?? "");
+		if (query === null) {
+			combobox.hide();
+			return;
+		}
+		start_roster();
 	};
 
 	const handle_key_down = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-		// While the mention menu is open it owns these keys; Enter picks, it does not send.
-		if (mentionQuery !== null && mentionCandidates.length > 0) {
-			if (event.key === "ArrowDown") {
-				event.preventDefault();
-				setMentionIndex((index) => (index + 1) % mentionCandidates.length);
-				return;
-			}
-			if (event.key === "ArrowUp") {
-				event.preventDefault();
-				setMentionIndex((index) => (index - 1 + mentionCandidates.length) % mentionCandidates.length);
-				return;
-			}
-			if (event.key === "Enter" || event.key === "Tab") {
-				event.preventDefault();
-				pick_mention(mentionCandidates[mentionIndex]);
+		if (mentionOpen) {
+			// The caret is leaving the "@word". Close like the Ariakit example does, so a later
+			// Enter cannot insert at a position the user already left. The caret still moves.
+			if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+				combobox.hide();
 				return;
 			}
 			if (event.key === "Escape") {
-				// Stop it here or the thread panel reads the same press as "close the thread".
 				event.preventDefault();
 				event.stopPropagation();
 				setMentionQuery(null);
+				combobox.hide();
+				return;
+			}
+			if ((event.key === "Enter" || event.key === "Tab") && !event.shiftKey && mentionCandidates.length > 0) {
+				event.preventDefault();
+				const activeId = combobox.getState().activeId;
+				const picked =
+					mentionCandidates.find((member) => mention_item_id(member.userId) === activeId) ?? mentionCandidates[0];
+				pick_mention(picked);
 				return;
 			}
 		}
@@ -551,6 +636,27 @@ function Composer(props: Composer_Props) {
 			handle_send();
 		}
 	};
+
+	useLayoutEffect(() => {
+		combobox.setOpen(mentionOpen);
+	}, [combobox, mentionOpen]);
+
+	useLayoutEffect(() => {
+		const caret = pendingCaretRef.current;
+		if (caret === null) {
+			return;
+		}
+		pendingCaretRef.current = null;
+		const element = textareaRef.current;
+		if (element !== null) {
+			element.focus();
+			element.setSelectionRange(caret, caret);
+		}
+	}, [text]);
+
+	useEffect(() => {
+		combobox.render();
+	}, [combobox, text]);
 
 	return (
 		<div className="composer">
@@ -576,20 +682,30 @@ function Composer(props: Composer_Props) {
 			{/* One bar, not a tall box above a button row: the composer used to cost ~130px of a
 			    900px frame and read heavier than the log it serves. */}
 			<div className="composer-bar">
-				<textarea
-					ref={textareaRef}
-					className="composer-input"
-					aria-label={props.label}
-					aria-describedby={hintId}
-					placeholder={props.label}
-					rows={1}
+				<Ariakit.Combobox
+					store={combobox}
+					autoSelect
 					value={text}
-					onInput={(event) => {
-						const value = event.currentTarget.value;
-						setText(value);
-						update_mention_query(value, event.currentTarget.selectionStart ?? value.length);
-					}}
-					onKeyDown={handle_key_down}
+					showOnClick={false}
+					showOnChange={false}
+					showOnKeyPress={false}
+					setValueOnChange={false}
+					render={
+						<textarea
+							ref={textareaRef}
+							className="composer-input"
+							aria-label={props.label}
+							aria-describedby={hintId}
+							placeholder={props.label}
+							rows={1}
+							onChange={handle_change}
+							onKeyDown={handle_key_down}
+							// A pointer press moves the caret, so the menu closes with it, like the
+							// Ariakit combobox-textarea example.
+							onPointerDown={combobox.hide}
+							onScroll={combobox.render}
+						/>
+					}
 				/>
 				{/* Icon-only, like the reference composer. The label moves to `aria-label`, so the control
 				    keeps the same accessible name it had as a text button. */}
@@ -612,32 +728,50 @@ function Composer(props: Composer_Props) {
 					<ArrowUp size={18} aria-hidden="true" />
 				</button>
 			</div>
-			{mentionQuery !== null && mentionCandidates.length > 0 ? (
-				<>
-					<ul className="mention-menu" role="listbox" aria-label="Mention somebody">
-						{mentionCandidates.map((member, index) => (
-							<li
-								key={member.userId}
-								role="option"
-								aria-selected={index === mentionIndex}
-								className={index === mentionIndex ? "mention-option is-active" : "mention-option"}
-								// Mousedown, not click: a click would blur the textarea first.
-								onMouseDown={(event) => {
-									event.preventDefault();
-									pick_mention(member);
-								}}
-							>
-								{member.displayName}
-							</li>
-						))}
-					</ul>
-					{/* Speak the active option. The textarea keeps focus, so without this a keyboard
-					    user hears nothing while arrowing through the menu. */}
-					<span className="visually-hidden" role="status">
-						{`${mentionCandidates[mentionIndex]?.displayName ?? ""}, ${mentionIndex + 1} of ${mentionCandidates.length}`}
-					</span>
-				</>
-			) : null}
+			<Ariakit.ComboboxPopover
+				store={combobox}
+				portal
+				unmountOnHide
+				gutter={4}
+				fitViewport
+				hidden={!mentionOpen}
+				getAnchorRect={() => {
+					const element = textareaRef.current;
+					if (element === null) {
+						return null;
+					}
+					return element.getBoundingClientRect();
+				}}
+				className="mention-menu"
+				aria-label="Mention somebody"
+			>
+				{mentionRoster === "loading" ? (
+					<div className="mention-menu-status" role="status">
+						Loading people…
+					</div>
+				) : null}
+				{mentionRoster !== null && mentionRoster !== "loading" && mentionRoster.status === "refused" ? (
+					<div className="mention-menu-status" role="status">
+						{chat_mention_roster_refusal_copy(mentionRoster.name)}
+					</div>
+				) : null}
+				{mentionCandidates.map((member) => (
+					<Ariakit.ComboboxItem
+						key={member.userId}
+						id={mention_item_id(member.userId)}
+						value={member.label}
+						setValueOnClick={false}
+						focusOnHover
+						className="mention-option"
+						onMouseDown={(event) => {
+							event.preventDefault();
+						}}
+						onClick={() => pick_mention(member)}
+					>
+						{member.label}
+					</Ariakit.ComboboxItem>
+				))}
+			</Ariakit.ComboboxPopover>
 			<span id={hintId} className="composer-hint">
 				Enter sends · Shift+Enter for a new line
 			</span>

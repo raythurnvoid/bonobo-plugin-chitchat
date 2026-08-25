@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import type { BonoboUiFrontendClient, BonoboUiTheme } from "bonobo-plugin-sdk/frontend";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App } from "./app";
-import { chat_PRIVATE_CHANNEL_COLLECTIONS } from "./chat-data";
+import { chat_ANONYMOUS_MEMBER_LABEL, chat_mention_roster_refusal_copy, chat_PRIVATE_CHANNEL_COLLECTIONS } from "./chat-data";
 
 function inv(epochMs: number): string {
 	return String(9_999_999_999_999 - epochMs).padStart(13, "0");
@@ -154,8 +154,8 @@ type AppendOpts = { collection: string; keyPrefix?: string; value: Record<string
 type PutOpts = { collection: string; key: string; value: Record<string, unknown>; expectedRevision?: number };
 type KeyOpts = { collection: string; key: string };
 type MembersListResult =
-	| { _yay: { members: { userId: string; displayName: string | null }[]; cursor: null } }
-	| { _nay: { message: string } };
+	| { _yay: { members: { userId: string; displayName: string | null }[]; cursor: string | null } }
+	| { _nay: { name: string; message: string } };
 type FetchInit = { method?: string; headers?: Record<string, string>; body?: Record<string, unknown> };
 type ScopeEntry = { scopeId: string; keyPrefix: string; collections: string[]; level: "member" | "manage" };
 
@@ -235,7 +235,7 @@ function make_harness() {
 		},
 		members: {
 			resolve: vi.fn(async (ids: string[]) => Object.fromEntries(ids.map((id) => [id, names[id] ?? null]))),
-			list: vi.fn<() => Promise<MembersListResult>>(async () => ({
+			list: vi.fn<(opts: { limit: number; cursor?: string | null }) => Promise<MembersListResult>>(async () => ({
 				_yay: {
 					members: Object.entries(names).map(([userId, displayName]) => ({ userId, displayName })),
 					cursor: null,
@@ -365,6 +365,18 @@ async function boot(h: ReturnType<typeof make_harness>, channels: unknown[] = [c
 		await waitFor(() => expect(h.find_window("messages", `${CH1_KEY}:`)).toBeTruthy());
 	}
 	return utils;
+}
+
+function composer_box(name: string) {
+	return screen.getByRole("combobox", { name }) as HTMLTextAreaElement;
+}
+
+/**
+ * Types into the composer. The combobox is controlled, so assigning `.value` and firing `input`
+ * is ignored. The caret has to be in the event: `@` is only a mention when it sits under it.
+ */
+function type_in_composer(box: HTMLTextAreaElement, value: string, caret = value.length) {
+	fireEvent.input(box, { target: { value, selectionStart: caret, selectionEnd: caret } });
 }
 
 /**
@@ -992,7 +1004,7 @@ test("Enter sends, Shift+Enter does not, and the send appends under the channel 
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
-	const input = await screen.findByRole("textbox", { name: "Message #general" });
+	const input = await screen.findByRole("combobox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "line one" } });
 	fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
 	expect(h.raw.data.append).not.toHaveBeenCalled();
@@ -1012,7 +1024,7 @@ test("an in-flight send disables Send, shows the pending row, and the ack keeps 
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
-	const input = await screen.findByRole("textbox", { name: "Message #general" });
+	const input = await screen.findByRole("combobox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "hello there" } });
 	fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
@@ -1037,7 +1049,7 @@ test("a failed send surfaces the _nay message and Retry reuses the same clientRe
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
-	const input = await screen.findByRole("textbox", { name: "Message #general" });
+	const input = await screen.findByRole("combobox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "first try" } });
 	fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
@@ -1069,7 +1081,7 @@ test("a storage_full refusal becomes one announced channel state and stops the c
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
-	fireEvent.input(screen.getByRole("textbox", { name: "Message #general" }), { target: { value: "hello" } });
+	fireEvent.input(screen.getByRole("combobox", { name: "Message #general" }), { target: { value: "hello" } });
 	fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
 	// A full store is the channel's state, not this row's error. The server's own message is the
@@ -1101,7 +1113,7 @@ test("a remote arrival announces author and preview; the user's own send never a
 
 	// Own send: the watch echo arrives BEFORE the ack (the common race). Only the
 	// createdBy check keeps it out of the announcer.
-	const input = await screen.findByRole("textbox", { name: "Message #general" });
+	const input = await screen.findByRole("combobox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "my own words" } });
 	fireEvent.click(screen.getByRole("button", { name: "Send" }));
 	const ownKey = `${CH1_KEY}:${inv(9_000)}:sent`;
@@ -1554,7 +1566,7 @@ test("the thread panel opens with focus inside, replies append under the root, c
 	await waitFor(() => expect(h.find_watch("replies", `${doc.key}:`)).toBeTruthy());
 	h.find_watch("replies", `${doc.key}:`)!.onUpdate(watch_update([]));
 
-	const replyBox = within(panel).getByRole("textbox", { name: "Reply in thread" });
+	const replyBox = within(panel).getByRole("combobox", { name: "Reply in thread" });
 	fireEvent.input(replyBox, { target: { value: "a reply" } });
 	fireEvent.keyDown(replyBox, { key: "Enter" });
 	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(1));
@@ -1589,7 +1601,7 @@ test("switching the open thread to another root resets replies, loading state, a
 		]),
 	);
 	await screen.findByText("reply on a");
-	const replyBox = within(panel).getByRole("textbox", { name: "Reply in thread" });
+	const replyBox = within(panel).getByRole("combobox", { name: "Reply in thread" });
 	fireEvent.input(replyBox, { target: { value: "late reply" } });
 	fireEvent.keyDown(replyBox, { key: "Enter" });
 	await screen.findAllByText("Sending…");
@@ -2180,7 +2192,7 @@ test("the picker lists workspace files and a picked file rides the next send", a
 	fireEvent.click(await within(dialog).findByRole("button", { name: /spec\.pdf/ }));
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
-	const input = screen.getByRole("textbox", { name: "Message #general" });
+	const input = screen.getByRole("combobox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "see attached" } });
 	fireEvent.keyDown(input, { key: "Enter" });
 	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(1));
@@ -2812,22 +2824,20 @@ test("the sidebar watches at most 8 private scopes and says how many are hidden"
 test("the composer's @-menu stores the member's id, and Enter picks before it sends", async () => {
 	const h = make_harness();
 	await boot(h);
-	const textarea = screen.getByRole("textbox", { name: "Message #general" }) as HTMLTextAreaElement;
+	const textarea = composer_box("Message #general");
 
 	// Typing "@" asks for the roster (lazily — nothing was fetched on mount) and opens the menu
 	// without this member in it.
 	expect(h.raw.members.list).not.toHaveBeenCalled();
-	textarea.value = "Hi @";
-	textarea.selectionStart = 4;
-	fireEvent.input(textarea);
+	type_in_composer(textarea, "Hi @");
 	await waitFor(() => expect(h.raw.members.list).toHaveBeenCalledTimes(1));
+	expect(h.raw.members.list.mock.calls[0]![0]).toEqual({ limit: 100 });
 	const options = await screen.findAllByRole("option");
 	expect(options.map((option) => option.textContent)).toEqual(["Bob", "Cleo"]);
 
-	textarea.value = "Hi @B";
-	textarea.selectionStart = 5;
-	fireEvent.input(textarea);
+	type_in_composer(textarea, "Hi @ob");
 	await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(1));
+	expect(screen.getByRole("option").textContent).toBe("Bob");
 
 	// Enter while the menu is open picks — it must not send.
 	fireEvent.keyDown(textarea, { key: "Enter" });
@@ -2845,19 +2855,84 @@ test("the composer's @-menu stores the member's id, and Enter picks before it se
 	expect(append.value.mentions).toEqual(["user_other"]);
 });
 
-test("a refused roster degrades the @-menu to plain text, and the send carries no mentions", async () => {
+test("a pointer press in the textarea closes the @-menu, so Enter sends instead of picking", async () => {
 	const h = make_harness();
-	h.raw.members.list.mockResolvedValueOnce({ _nay: { message: "refused" } });
 	await boot(h);
-	const textarea = screen.getByRole("textbox", { name: "Message #general" }) as HTMLTextAreaElement;
+	const textarea = composer_box("Message #general");
 
-	textarea.value = "ping @B";
-	textarea.selectionStart = 7;
-	fireEvent.input(textarea);
+	type_in_composer(textarea, "Hi @ob");
+	await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(1));
+
+	// The press moves the caret away from the "@word". The menu must close with it — the closing
+	// path runs through the store's setOpen, the same path Ariakit's own dismissals use — or the
+	// next Enter would pick from a menu the user already left.
+	fireEvent.pointerDown(textarea);
+	fireEvent.keyDown(textarea, { key: "Enter" });
+	const append = await waitFor(() => {
+		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
+		return h.raw.data.append.mock.calls[0]![0] as AppendOpts;
+	});
+	expect(append.value.text).toBe("Hi @ob");
+	expect(append.value.mentions).toBeUndefined();
+});
+
+test("moving the caret with an arrow key closes the @-menu, so Enter sends instead of picking", async () => {
+	const h = make_harness();
+	await boot(h);
+	const textarea = composer_box("Message #general");
+
+	type_in_composer(textarea, "Hi @ob");
+	await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(1));
+
+	fireEvent.keyDown(textarea, { key: "ArrowLeft" });
+	fireEvent.keyDown(textarea, { key: "Enter" });
+	const append = await waitFor(() => {
+		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
+		return h.raw.data.append.mock.calls[0]![0] as AppendOpts;
+	});
+	expect(append.value.text).toBe("Hi @ob");
+	expect(append.value.mentions).toBeUndefined();
+});
+
+test("a roster refusal is not cached for later composers", async () => {
+	const h = make_harness();
+	h.raw.members.list.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "The member list is unavailable right now" },
+	});
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const textarea = composer_box("Message #general");
+
+	// The first "@" hits the transient refusal and shows the generic copy.
+	type_in_composer(textarea, "@");
 	await waitFor(() => expect(h.raw.members.list).toHaveBeenCalledTimes(1));
-	// No menu, no error surface — the member keeps typing plain words.
-	expect(screen.queryAllByRole("option")).toHaveLength(0);
+	const menu = await screen.findByRole("listbox", { name: "Mention somebody" });
+	expect(within(menu).getByRole("status").textContent).toBe(chat_mention_roster_refusal_copy("unavailable"));
 
+	// ChannelView remounts on a switch, so #random gets a fresh composer. It must ask again
+	// instead of reusing one transient refusal for the page's whole life.
+	fireEvent.click(screen.getByRole("button", { name: "#random" }));
+	const reopened = composer_box("Message #random");
+	type_in_composer(reopened, "@");
+	await waitFor(() => expect(h.raw.members.list).toHaveBeenCalledTimes(2));
+	expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual(["Bob", "Cleo"]);
+});
+
+test("the @-menu shows a short explanation when the roster is not_consented, and the send carries no mentions", async () => {
+	const h = make_harness();
+	h.raw.members.list.mockResolvedValueOnce({
+		_nay: { name: "not_consented", message: "This workspace has not granted this plugin the member list" },
+	});
+	await boot(h);
+	const textarea = composer_box("Message #general");
+
+	type_in_composer(textarea, "ping @B");
+	await waitFor(() => expect(h.raw.members.list).toHaveBeenCalledTimes(1));
+	const menu = await screen.findByRole("listbox", { name: "Mention somebody" });
+	expect(within(menu).queryAllByRole("option")).toHaveLength(0);
+	expect(within(menu).getByRole("status").textContent).toBe(chat_mention_roster_refusal_copy("not_consented"));
+
+	// Escape closes the explanation; the next Enter sends the typed words as plain text.
+	fireEvent.keyDown(textarea, { key: "Escape" });
 	fireEvent.keyDown(textarea, { key: "Enter" });
 	const append = await waitFor(() => {
 		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
@@ -2865,6 +2940,56 @@ test("a refused roster degrades the @-menu to plain text, and the send carries n
 	});
 	expect(append.value.text).toBe("ping @B");
 	expect(append.value.mentions).toBeUndefined();
+});
+
+test("a member with no display name is offered under the anonymous fallback, and send stores their id", async () => {
+	const h = make_harness();
+	h.raw.members.list.mockResolvedValueOnce({
+		_yay: {
+			members: [
+				{ userId: "user_me", displayName: "Me" },
+				{ userId: "user_anon", displayName: null },
+			],
+			cursor: null,
+		},
+	});
+	await boot(h);
+	const textarea = composer_box("Message #general");
+
+	type_in_composer(textarea, "@");
+	expect((await screen.findByRole("option")).textContent).toBe(chat_ANONYMOUS_MEMBER_LABEL);
+
+	fireEvent.keyDown(textarea, { key: "Enter" });
+	await waitFor(() => expect(textarea.value).toBe(`@${chat_ANONYMOUS_MEMBER_LABEL} `));
+	fireEvent.keyDown(textarea, { key: "Enter" });
+	const append = await waitFor(() => {
+		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
+		return h.raw.data.append.mock.calls[0]![0] as AppendOpts;
+	});
+	expect(append.value.mentions).toEqual(["user_anon"]);
+});
+
+test("the roster is paged once per session and not fetched again on later @ keystrokes", async () => {
+	const h = make_harness();
+	h.raw.members.list
+		.mockResolvedValueOnce({
+			_yay: { members: [{ userId: "user_a", displayName: "Ada" }], cursor: "page_2" },
+		})
+		.mockResolvedValueOnce({
+			_yay: { members: [{ userId: "user_b", displayName: "Bea" }], cursor: null },
+		});
+	await boot(h);
+	const textarea = composer_box("Message #general");
+
+	type_in_composer(textarea, "@");
+	const options = await screen.findAllByRole("option");
+	expect(options.map((option) => option.textContent)).toEqual(["Ada", "Bea"]);
+	expect(h.raw.members.list.mock.calls.map((call) => call[0])).toEqual([{ limit: 100 }, { limit: 100, cursor: "page_2" }]);
+
+	fireEvent.keyDown(textarea, { key: "Escape" });
+	type_in_composer(textarea, "later @");
+	await screen.findAllByRole("option");
+	expect(h.raw.members.list).toHaveBeenCalledTimes(2);
 });
 
 test("a mention renders as a span, and a mention of this member takes the amber emphasis", async () => {
@@ -2901,9 +3026,8 @@ test("sending in a private channel stamps lastMessageAt on the channel doc, debo
 	h.raw.data.append.mockResolvedValueOnce({
 		_yay: { key: `${PRIVATE_KEY}:${inv(50_000)}:sent`, revision: 1 },
 	});
-	const textarea = screen.getByRole("textbox", { name: "Message #secret-plans" }) as HTMLTextAreaElement;
-	textarea.value = "psst";
-	fireEvent.input(textarea);
+	const textarea = screen.getByRole("combobox", { name: "Message #secret-plans" }) as HTMLTextAreaElement;
+	type_in_composer(textarea, "psst");
 	fireEvent.keyDown(textarea, { key: "Enter" });
 
 	// The sender stamps the channel doc so members with the channel closed can see unread state —
@@ -2927,8 +3051,7 @@ test("sending in a private channel stamps lastMessageAt on the channel doc, debo
 	h.raw.data.append.mockResolvedValueOnce({
 		_yay: { key: `${PRIVATE_KEY}:${inv(51_000)}:sen2`, revision: 1 },
 	});
-	textarea.value = "again";
-	fireEvent.input(textarea);
+	type_in_composer(textarea, "again");
 	fireEvent.keyDown(textarea, { key: "Enter" });
 	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(2));
 	const stamps = (h.raw.data.put.mock.calls as [PutOpts][])

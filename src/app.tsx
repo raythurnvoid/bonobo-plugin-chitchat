@@ -17,6 +17,8 @@ import {
 	chat_fold_public_unreads,
 	chat_format_recency,
 	chat_get_error_message,
+	chat_member_label,
+	chat_mention_roster_refusal_copy,
 	chat_merge_cursor_maps,
 	chat_message_channel_key,
 	chat_parse_private_cursor_key,
@@ -125,7 +127,7 @@ function use_roster(client: BonoboUiFrontendClient): Roster | null {
 				return;
 			}
 			if ("_nay" in result) {
-				setRoster({ members: [], error: result._nay.message, truncated: false });
+				setRoster({ members: [], error: chat_mention_roster_refusal_copy(result._nay.name), truncated: false });
 				return;
 			}
 			setRoster({ members: result._yay.members, error: null, truncated: result._yay.cursor !== null });
@@ -175,7 +177,7 @@ function MemberPicker(props: {
 
 	const others = roster.members
 		.filter((member) => member.userId !== props.selfUserId)
-		.sort((a, b) => (a.displayName ?? "").localeCompare(b.displayName ?? ""));
+		.sort((a, b) => chat_member_label(a.displayName).localeCompare(chat_member_label(b.displayName)));
 	if (others.length === 0) {
 		return <p className="channel-status">Nobody else is in this workspace yet.</p>;
 	}
@@ -191,7 +193,7 @@ function MemberPicker(props: {
 								checked={props.selected.includes(member.userId)}
 								onChange={(event) => props.onToggle(member.userId, event.currentTarget.checked)}
 							/>
-							{member.displayName ?? "Someone with no name yet"}
+							{chat_member_label(member.displayName)}
 						</label>
 					</li>
 				))}

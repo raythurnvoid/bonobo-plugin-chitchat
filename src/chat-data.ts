@@ -263,6 +263,80 @@ export const chat_message_value_schema = z.object({
 export type chat_MessageValue = z.infer<typeof chat_message_value_schema>;
 
 /**
+ * Label used when a roster row has no profile name. That includes a member who signed in
+ * anonymously. It is not "Former member": that label is only for an id that `members.resolve`
+ * maps to null because the person has left.
+ */
+export const chat_ANONYMOUS_MEMBER_LABEL = "Someone with no name yet";
+
+export function chat_member_label(displayName: string | null): string {
+	return displayName !== null && displayName !== "" ? displayName : chat_ANONYMOUS_MEMBER_LABEL;
+}
+
+/**
+ * The `@word` under the caret, or null when the caret is not in a mention. The `@` must sit at
+ * the start of the text or after whitespace so `hello@x` is not treated as a mention.
+ */
+export function chat_mention_query_at(value: string, caret: number): { start: number; query: string } | null {
+	const match = /(?:^|\s)@([^\s@]*)$/.exec(value.slice(0, caret));
+	if (match === null) {
+		return null;
+	}
+	const query = match[1] ?? "";
+	return { start: caret - query.length - 1, query };
+}
+
+/**
+ * Members the @-menu may offer: everyone except the sender, sorted by the label that will be
+ * inserted, filtered with a case-insensitive substring. A null display name uses
+ * {@link chat_ANONYMOUS_MEMBER_LABEL}.
+ */
+export function chat_filter_mention_members(
+	members: { userId: string; displayName: string | null }[],
+	query: string,
+	selfUserId: string,
+): { userId: string; displayName: string | null; label: string }[] {
+	const needle = query.toLowerCase();
+	return members
+		.filter((member) => member.userId !== selfUserId)
+		.map((member) => ({ ...member, label: chat_member_label(member.displayName) }))
+		.filter((member) => member.label.toLowerCase().includes(needle))
+		.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+export function chat_insert_mention(text: string, start: number, caret: number, label: string) {
+	return {
+		text: `${text.slice(0, start)}@${label} ${text.slice(caret)}`,
+		caret: start + label.length + 2,
+	};
+}
+
+/**
+ * Ids whose inserted `@Name` is still in the sent text. Deleting the name from the composer
+ * deletes the mention, so a rename later cannot retarget a leftover id.
+ */
+export function chat_mention_ids_still_in_text(chosen: Iterable<readonly [string, string]>, text: string): string[] {
+	const ids: string[] = [];
+	for (const [id, name] of chosen) {
+		if (text.includes(`@${name}`)) {
+			ids.push(id);
+		}
+	}
+	return ids;
+}
+
+/**
+ * Copy for a refused `members.list`. `not_consented` is the ordinary state until an admin
+ * accepts `workspace.members.read`; other names share one line so the composer never looks broken.
+ */
+export function chat_mention_roster_refusal_copy(name: string): string {
+	if (name === "not_consented") {
+		return "This workspace has not allowed Chitchat to read the member list yet. An admin can accept the plugin's current permissions.";
+	}
+	return "The member list is not available right now. You can keep typing.";
+}
+
+/**
  * The member's public read cursor map: newest read time per public channel key, epoch ms. One doc
  * per member (`me:<userId>` in `cursors`). Private channel keys must never appear here — a `p/`
  * key in a workspace-readable value discloses the channel's existence. Private read state lives

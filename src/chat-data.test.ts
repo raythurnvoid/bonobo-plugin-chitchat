@@ -1,9 +1,16 @@
 import { describe, expect, test } from "vitest";
 import {
+	chat_ANONYMOUS_MEMBER_LABEL,
 	chat_channel_is_private,
 	chat_channel_value_schema,
 	chat_create_channel_key,
+	chat_filter_mention_members,
+	chat_insert_mention,
 	chat_key_timestamp,
+	chat_member_label,
+	chat_mention_ids_still_in_text,
+	chat_mention_query_at,
+	chat_mention_roster_refusal_copy,
 	chat_message_key_prefix,
 	chat_message_value_schema,
 	chat_parse_reaction_key,
@@ -239,5 +246,68 @@ describe("document validation", () => {
 			revision: 1,
 		});
 		expect(chat_validate_reaction_doc(doc_envelope({ key: `${messageKey}:sparkles:user_b`, value: {} }))).toBeNull();
+	});
+});
+
+describe("chat_mention_query_at", () => {
+	test("opens on an isolated @ and keeps the letters after it as the query", () => {
+		expect(chat_mention_query_at("Hi @Bo", 6)).toEqual({ start: 3, query: "Bo" });
+		expect(chat_mention_query_at("@", 1)).toEqual({ start: 0, query: "" });
+	});
+
+	test("ignores an @ that is stuck to the previous word", () => {
+		expect(chat_mention_query_at("hello@x", 7)).toBeNull();
+		expect(chat_mention_query_at("Hi @Bo there", 12)).toBeNull();
+	});
+});
+
+describe("chat_filter_mention_members", () => {
+	const roster = [
+		{ userId: "user_me", displayName: "Me" },
+		{ userId: "user_bob", displayName: "Bob" },
+		{ userId: "user_cleo", displayName: "Cleo Pane" },
+		{ userId: "user_anon", displayName: null },
+	];
+
+	test("filters by case-insensitive substring, excludes the sender, and sorts by label", () => {
+		expect(chat_filter_mention_members(roster, "o", "user_me").map((member) => member.label)).toEqual([
+			"Bob",
+			"Cleo Pane",
+			chat_ANONYMOUS_MEMBER_LABEL,
+		]);
+		expect(chat_filter_mention_members(roster, "PANE", "user_me").map((member) => member.userId)).toEqual(["user_cleo"]);
+	});
+
+	test("a null display name uses the same anonymous label the people picker uses", () => {
+		expect(chat_member_label(null)).toBe(chat_ANONYMOUS_MEMBER_LABEL);
+		expect(chat_filter_mention_members(roster, "someone", "user_me")).toEqual([
+			{ userId: "user_anon", displayName: null, label: chat_ANONYMOUS_MEMBER_LABEL },
+		]);
+	});
+});
+
+describe("chat_insert_mention", () => {
+	test("replaces the @query with @Name and a trailing space", () => {
+		expect(chat_insert_mention("Hi @B", 3, 5, "Bob")).toEqual({ text: "Hi @Bob ", caret: 8 });
+	});
+
+	test("keeps the ids whose @Name still stands in the sent text", () => {
+		const chosen: Array<readonly [string, string]> = [
+			["user_bob", "Bob"],
+			["user_cleo", "Cleo"],
+		];
+		expect(chat_mention_ids_still_in_text(chosen, "Hi @Bob")).toEqual(["user_bob"]);
+	});
+});
+
+describe("chat_mention_roster_refusal_copy", () => {
+	test("not_consented tells the member an admin must accept the current permissions", () => {
+		expect(chat_mention_roster_refusal_copy("not_consented")).toContain(
+			"has not allowed Chitchat to read the member list",
+		);
+	});
+
+	test("any other refusal keeps the composer usable", () => {
+		expect(chat_mention_roster_refusal_copy("unavailable")).toContain("not available right now");
 	});
 });
