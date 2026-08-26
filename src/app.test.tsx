@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { BonoboUiFrontendClient, BonoboUiTheme } from "bonobo-plugin-sdk/frontend";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App } from "./app";
@@ -1567,6 +1567,8 @@ test("an incomplete companion list is reported to the member", async () => {
 test("a failed companion list retries once without waiting for a feed", async () => {
 	const h = make_harness();
 	await boot(h);
+	vi.useFakeTimers();
+	const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
 	const root = message_doc(2_000, { rand: "newr", text: "new root" });
 	const heart = reaction_doc(root.key, "heart", "user_other");
 	let reactionLists = 0;
@@ -1584,17 +1586,33 @@ test("a failed companion list retries once without waiting for a feed", async ()
 		}
 		return http_page([], true);
 	});
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
-	await screen.findByText("new root");
-	const row = row_of("new root");
-	expect(await within(row).findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
-	expect(within(row).queryByText("Reactions unavailable")).toBeNull();
-	expect(list_calls(h, "reactions")).toHaveLength(2);
+	try {
+		await act(async () => {
+			h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		const row = row_of("new root");
+		expect(within(row).getByText("Reactions unavailable")).toBeTruthy();
+		expect(list_calls(h, "reactions")).toHaveLength(1);
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(1_000);
+		});
+		expect(within(row).getByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+		expect(within(row).queryByText("Reactions unavailable")).toBeNull();
+		expect(list_calls(h, "reactions")).toHaveLength(2);
+	} finally {
+		randomSpy.mockRestore();
+		vi.useRealTimers();
+	}
 });
 
-test("a twice-failed companion list retries when that collection's feed delivers", async () => {
+test("a failed companion list retries with backoff until it succeeds and then stops", async () => {
 	const h = make_harness();
 	await boot(h);
+	vi.useFakeTimers();
+	const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
 	const root = message_doc(2_000, { rand: "newr", text: "new root" });
 	const heart = reaction_doc(root.key, "heart", "user_other");
 	let reactionLists = 0;
@@ -1605,29 +1623,59 @@ test("a twice-failed companion list retries when that collection's feed delivers
 		const collection = (init?.body as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			reactionLists += 1;
-			if (reactionLists <= 2) {
+			if (reactionLists <= 3) {
 				throw new Error("companion list failed");
 			}
 			return http_page([heart], true);
 		}
 		return http_page([], true);
 	});
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
-	await screen.findByText("new root");
-	const row = row_of("new root");
-	expect(await within(row).findByText("Reactions unavailable")).toBeTruthy();
-	await wait_for_feeds(h);
-	await waitFor(() => expect(list_calls(h, "reactions")).toHaveLength(2));
+	try {
+		await act(async () => {
+			h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(screen.getByText("new root")).toBeTruthy();
+		const row = row_of("new root");
+		expect(within(row).getByText("Reactions unavailable")).toBeTruthy();
+		expect(list_calls(h, "reactions")).toHaveLength(1);
 
-	h.find_changes("reactions")!.onUpdate(watch_update([]));
-	expect(await within(row).findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
-	expect(within(row).queryByText("Reactions unavailable")).toBeNull();
-	expect(list_calls(h, "reactions")).toHaveLength(3);
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(1_000);
+		});
+		expect(list_calls(h, "reactions")).toHaveLength(2);
+		expect(within(row).getByText("Reactions unavailable")).toBeTruthy();
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(2_000);
+		});
+		expect(list_calls(h, "reactions")).toHaveLength(3);
+		expect(within(row).getByText("Reactions unavailable")).toBeTruthy();
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(4_000);
+		});
+		expect(within(row).getByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+		expect(within(row).queryByText("Reactions unavailable")).toBeNull();
+		expect(list_calls(h, "reactions")).toHaveLength(4);
+
+		const afterSuccess = list_calls(h, "reactions").length;
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(60_000);
+		});
+		expect(list_calls(h, "reactions")).toHaveLength(afterSuccess);
+	} finally {
+		randomSpy.mockRestore();
+		vi.useRealTimers();
+	}
 });
 
-test("a dead incomplete companion list does not retry when the tab becomes visible", async () => {
+test("a dead incomplete companion list does not keep retrying on the backoff timer", async () => {
 	const h = make_harness();
 	await boot(h);
+	vi.useFakeTimers();
+	const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
 	const root = message_doc(2_000, { rand: "newr", text: "new root" });
 	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
 		if (path !== "/api/v1/plugin-data/list") {
@@ -1639,17 +1687,167 @@ test("a dead incomplete companion list does not retry when the tab becomes visib
 		}
 		return http_page([], true);
 	});
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
-	await screen.findByText("new root");
-	await wait_for_feeds(h);
-	await waitFor(() => expect(list_calls(h, "reactions").length).toBeGreaterThanOrEqual(2));
-	h.find_changes("reactions")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
-	expect(await within(row_of("new root")).findByText("Reactions unavailable")).toBeTruthy();
-	expect(screen.queryByText("Some reactions and replies in this range could not be loaded.")).toBeNull();
+	try {
+		await act(async () => {
+			h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(h.find_changes("reactions")).toBeTruthy();
+		expect(list_calls(h, "reactions")).toHaveLength(1);
 
-	const listsAfterDeath = list_calls(h, "reactions").length;
-	document.dispatchEvent(new Event("visibilitychange"));
-	expect(list_calls(h, "reactions")).toHaveLength(listsAfterDeath);
+		await act(async () => {
+			h.find_changes("reactions")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+		});
+		expect(within(row_of("new root")).getByText("Reactions unavailable")).toBeTruthy();
+
+		const listsAfterDeath = list_calls(h, "reactions").length;
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(60_000);
+		});
+		expect(list_calls(h, "reactions")).toHaveLength(listsAfterDeath);
+	} finally {
+		randomSpy.mockRestore();
+		vi.useRealTimers();
+	}
+});
+
+test("a failed companion list retries when that collection's feed delivers", async () => {
+	const h = make_harness();
+	await boot(h);
+	vi.useFakeTimers();
+	const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
+	const root = message_doc(2_000, { rand: "newr", text: "new root" });
+	const heart = reaction_doc(root.key, "heart", "user_other");
+	let reactionLists = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			reactionLists += 1;
+			if (reactionLists === 1) {
+				throw new Error("companion list failed");
+			}
+			return http_page([heart], true);
+		}
+		return http_page([], true);
+	});
+	try {
+		await act(async () => {
+			h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		const row = row_of("new root");
+		expect(within(row).getByText("Reactions unavailable")).toBeTruthy();
+		expect(h.find_changes("reactions")).toBeTruthy();
+		expect(list_calls(h, "reactions")).toHaveLength(1);
+
+		await act(async () => {
+			h.find_changes("reactions")!.onUpdate(watch_update([]));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(within(row).getByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+		expect(within(row).queryByText("Reactions unavailable")).toBeNull();
+		expect(list_calls(h, "reactions")).toHaveLength(2);
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(60_000);
+		});
+		expect(list_calls(h, "reactions")).toHaveLength(2);
+	} finally {
+		randomSpy.mockRestore();
+		vi.useRealTimers();
+	}
+});
+
+test("a dead incomplete companion list does not retry when the tab becomes visible", async () => {
+	const h = make_harness();
+	await boot(h);
+	vi.useFakeTimers();
+	const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
+	const root = message_doc(2_000, { rand: "newr", text: "new root" });
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			throw new Error("companion list failed");
+		}
+		return http_page([], true);
+	});
+	try {
+		await act(async () => {
+			h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(h.find_changes("reactions")).toBeTruthy();
+		await act(async () => {
+			h.find_changes("reactions")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+		});
+		expect(within(row_of("new root")).getByText("Reactions unavailable")).toBeTruthy();
+		expect(screen.queryByText("Some reactions and replies in this range could not be loaded.")).toBeNull();
+
+		const listsAfterDeath = list_calls(h, "reactions").length;
+		document.dispatchEvent(new Event("visibilitychange"));
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(60_000);
+		});
+		expect(list_calls(h, "reactions")).toHaveLength(listsAfterDeath);
+	} finally {
+		randomSpy.mockRestore();
+		vi.useRealTimers();
+	}
+});
+
+test("an in-flight companion list does not start backoff after a channel switch", async () => {
+	const h = make_harness();
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	vi.useFakeTimers();
+	const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
+	const pendingReactions = deferred<unknown>();
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			return pendingReactions.promise;
+		}
+		return http_page([], true);
+	});
+	const ch1Prefix = `${CH1_KEY}:`;
+	const lists_for_ch1 = () =>
+		list_calls(h, "reactions").filter(([, init]) => (init?.body as { keyPrefix?: string } | undefined)?.keyPrefix === ch1Prefix);
+	try {
+		await act(async () => {
+			h.find_window("messages", ch1Prefix)!.onUpdate(window_update([message_doc(2_000, { rand: "newr", text: "new root" })]));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(lists_for_ch1()).toHaveLength(1);
+
+		await act(async () => {
+			fireEvent.click(screen.getByRole("button", { name: "#random" }));
+		});
+		expect(h.find_window("messages", `${CH2_KEY}:`)).toBeTruthy();
+
+		pendingReactions.reject(new Error("companion list failed"));
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+			await vi.advanceTimersByTimeAsync(60_000);
+		});
+		expect(lists_for_ch1()).toHaveLength(1);
+	} finally {
+		randomSpy.mockRestore();
+		vi.useRealTimers();
+	}
 });
 
 test("a companion list that finishes after the feed dies does not clear death", async () => {

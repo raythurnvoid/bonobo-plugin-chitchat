@@ -1660,6 +1660,10 @@ const ROOT_KEY_LENGTH = 55;
 
 /** How many documents one deep-history page asks for. The route's own ceiling is 100. */
 const DEEP_HISTORY_PAGE_SIZE = 100;
+/** First wait after a failed companion list. Failure recovery, not a refresh poll. */
+const COMPANION_RETRY_INITIAL_MS = 1_000;
+/** Longest wait between companion-list retries. */
+const COMPANION_RETRY_MAX_MS = 30_000;
 
 function newest_updated_at(docs: { updatedAt: number }[]): number | null {
 	let newest: number | null = null;
@@ -1879,10 +1883,16 @@ export function ChannelView(props: ChannelView_Props) {
 		reactions: false,
 		replies: false,
 	});
-	const companionAutoRetryUsedRef = useRef<{ reactions: boolean; replies: boolean }>({
-		reactions: false,
-		replies: false,
+	const companionRetryRef = useRef<{
+		reactions: { delayMs: number; timer: ReturnType<typeof setTimeout> | null };
+		replies: { delayMs: number; timer: ReturnType<typeof setTimeout> | null };
+	}>({
+		reactions: { delayMs: COMPANION_RETRY_INITIAL_MS, timer: null },
+		replies: { delayMs: COMPANION_RETRY_INITIAL_MS, timer: null },
 	});
+	// The window effect owns companion lists. A fetch that fails after a channel switch must
+	// not start backoff on the unmounted instance — that loop would keep listing the old prefix.
+	const companionMountedRef = useRef(false);
 	const feedsStartedRef = useRef(false);
 	const channelBodyRef = useRef<HTMLDivElement | null>(null);
 	const channelNameRef = useRef(channel.value.name);
@@ -1950,15 +1960,46 @@ export function ChannelView(props: ChannelView_Props) {
 			reactionsCoverageRef.current = next;
 			setReactionCoverage(next);
 			if (!incomplete) {
-				companionAutoRetryUsedRef.current.reactions = false;
+				reset_companion_retry("reactions");
 			}
 		} else {
 			repliesCoverageRef.current = next;
 			setReplyCoverage(next);
 			if (!incomplete) {
-				companionAutoRetryUsedRef.current.replies = false;
+				reset_companion_retry("replies");
 			}
 		}
+	};
+
+	const clear_companion_retry = (collection: "reactions" | "replies") => {
+		const slot = companionRetryRef.current[collection];
+		if (slot.timer !== null) {
+			clearTimeout(slot.timer);
+			slot.timer = null;
+		}
+	};
+
+	const reset_companion_retry = (collection: "reactions" | "replies") => {
+		clear_companion_retry(collection);
+		companionRetryRef.current[collection].delayMs = COMPANION_RETRY_INITIAL_MS;
+	};
+
+	const schedule_companion_retry = (collection: "reactions" | "replies") => {
+		const coverage = collection === "reactions" ? reactionsCoverageRef.current : repliesCoverageRef.current;
+		if (coverage?.death != null) {
+			return;
+		}
+		const slot = companionRetryRef.current[collection];
+		if (slot.timer !== null) {
+			return;
+		}
+		const delayMs = slot.delayMs;
+		const waitMs = delayMs * (0.5 + Math.random());
+		slot.timer = setTimeout(() => {
+			slot.timer = null;
+			slot.delayMs = Math.min(delayMs * 2, COMPANION_RETRY_MAX_MS);
+			list_companion(collection);
+		}, waitMs);
 	};
 
 	const list_companion = (collection: "reactions" | "replies") => {
@@ -1979,6 +2020,9 @@ export function ChannelView(props: ChannelView_Props) {
 		})
 			.then((page) => {
 				companionInflightRef.current[collection] = false;
+				if (!companionMountedRef.current) {
+					return;
+				}
 				if (collection === "reactions") {
 					const store = reactionsStoreRef.current;
 					if (store === null) {
@@ -2000,15 +2044,15 @@ export function ChannelView(props: ChannelView_Props) {
 			})
 			.catch(() => {
 				companionInflightRef.current[collection] = false;
-				set_companion_coverage(collection, [], true, true);
-				// Retry this episode once without waiting for a feed. The SDK can deliver a cached
-				// snapshot before this list fails, and then the feed will not fire again.
-				if (!companionAutoRetryUsedRef.current[collection]) {
-					companionAutoRetryUsedRef.current[collection] = true;
-					queueMicrotask(() => {
-						list_companion(collection);
-					});
+				if (!companionMountedRef.current) {
+					return;
 				}
+				set_companion_coverage(collection, [], true, true);
+				// Failure recovery with backoff, not a periodic refresh: one timer, stop on
+				// success, never on a dead feed. The SDK can deliver a cached snapshot before
+				// this list fails, and then the feed will not fire again, so a quiet tab still
+				// needs this timer.
+				schedule_companion_retry(collection);
 			});
 	};
 
@@ -2017,6 +2061,7 @@ export function ChannelView(props: ChannelView_Props) {
 		if (coverage === null || !coverage.incomplete || coverage.death !== null) {
 			return;
 		}
+		clear_companion_retry(collection);
 		list_companion(collection);
 	};
 
@@ -2068,10 +2113,12 @@ export function ChannelView(props: ChannelView_Props) {
 		messagesStoreRef.current = store;
 		repliesStoreRef.current = chat_create_accumulating_store(chat_validate_message_doc);
 		reactionsStoreRef.current = chat_create_accumulating_store(chat_validate_reaction_doc);
+		companionMountedRef.current = true;
 		feedsStartedRef.current = false;
 		companionHttpFenceRef.current = { reactions: null, replies: null };
 		companionInflightRef.current = { reactions: false, replies: false };
-		companionAutoRetryUsedRef.current = { reactions: false, replies: false };
+		reset_companion_retry("reactions");
+		reset_companion_retry("replies");
 		reactionsCoverageRef.current = null;
 		repliesCoverageRef.current = null;
 		setMessagesSince(null);
@@ -2140,6 +2187,9 @@ export function ChannelView(props: ChannelView_Props) {
 		);
 		messagesWindowRef.current = watchWindow;
 		return () => {
+			companionMountedRef.current = false;
+			reset_companion_retry("reactions");
+			reset_companion_retry("replies");
 			messagesWindowRef.current = null;
 			watchWindow.unsubscribe();
 		};
@@ -2199,6 +2249,7 @@ export function ChannelView(props: ChannelView_Props) {
 			{ collection: "replies", limit: 100, updatedSince: repliesSince, ...feed_scope_args },
 			(update, info) => {
 				if (update === null) {
+					clear_companion_retry("replies");
 					const previous = repliesCoverageRef.current ?? {
 						hasMore: false,
 						deepestRoot: null,
@@ -2240,6 +2291,7 @@ export function ChannelView(props: ChannelView_Props) {
 			{ collection: "reactions", limit: 100, updatedSince: reactionsSince, ...feed_scope_args },
 			(update, info) => {
 				if (update === null) {
+					clear_companion_retry("reactions");
 					const previous = reactionsCoverageRef.current ?? {
 						hasMore: false,
 						deepestRoot: null,
