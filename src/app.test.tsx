@@ -1564,7 +1564,7 @@ test("an incomplete companion list is reported to the member", async () => {
 	expect(notice.getAttribute("role")).toBe("alert");
 });
 
-test("a failed companion list retries once without waiting for a feed", async () => {
+test("a failed companion list retries on the backoff timer without a feed", async () => {
 	const h = make_harness();
 	await boot(h);
 	vi.useFakeTimers();
