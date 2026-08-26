@@ -1,7 +1,7 @@
 {
 	"name": "@bonobo/plugin-chitchat",
 	"private": true,
-	"version": "0.5.3",
+	"version": "0.5.4",
 	"type": "module",
 	"scripts": {
 		"build": "vite build && prettier --write dist/frontend/assets/index.js dist/frontend/assets/index.css && node scripts/build-manifest.mjs",
@@ -14,7 +14,7 @@
 	"packageManager": "pnpm@10.33.0",
 	"dependencies": {
 		"@ariakit/react": "0.4.20",
-		"bonobo-plugin-sdk": "github:raythurnvoid/bonobo-plugin-sdk#eeb091e83d1a4e4fa4a177b2b5145111b2ca52de",
+		"bonobo-plugin-sdk": "github:raythurnvoid/bonobo-plugin-sdk#2eed44c39cf7672342f5ad5049717d0b84b81c00",
 		"lucide-react": "^0.544.0",
 		"react": "^19.2.7",
 		"react-dom": "^19.2.7",

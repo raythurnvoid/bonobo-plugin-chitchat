@@ -2589,7 +2589,7 @@ var wE = Object.defineProperty,
 	d0 = 100,
 	h0 = 16,
 	io = 6,
-	m0 = 24;
+	m0 = 100;
 function v0(e) {
 	if (typeof e != "object" || e === null) return null;
 	const n = e;
