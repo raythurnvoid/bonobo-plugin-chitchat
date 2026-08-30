@@ -10,6 +10,11 @@ type Dialog_Props = {
 	children: ReactNode;
 };
 
+function dialog_initial_focus_target(panel: HTMLElement) {
+	const marked = panel.querySelector<HTMLElement>("[data-dialog-initial]");
+	return marked?.matches(FOCUSABLE_SELECTOR) ? marked : (panel.querySelector<HTMLElement>(FOCUSABLE_SELECTOR) ?? panel);
+}
+
 /**
  * Modal dialog: focus is trapped inside, Escape closes, and closing gives focus back to
  * the control that opened it. Content marks the initial-focus control (a non-destructive
@@ -23,8 +28,7 @@ export function Dialog(props: Dialog_Props) {
 	useEffect(() => {
 		const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
 		const panel = panelRef.current;
-		const initial =
-			panel?.querySelector<HTMLElement>("[data-dialog-initial]") ?? panel?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
+		const initial = panel === null ? null : dialog_initial_focus_target(panel);
 		initial?.focus();
 		return () => {
 			opener?.focus();
@@ -51,10 +55,7 @@ export function Dialog(props: Dialog_Props) {
 			if (!panel.isConnected || document.activeElement !== document.body) {
 				return;
 			}
-			const next =
-				panel.querySelector<HTMLElement>("[data-dialog-initial]") ??
-				panel.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
-			next?.focus();
+			dialog_initial_focus_target(panel).focus();
 		};
 
 		// focusout runs while the node is being removed, before the replacement is in place, so the
@@ -79,11 +80,16 @@ export function Dialog(props: Dialog_Props) {
 		}
 		const focusables = [...panel.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)];
 		if (focusables.length === 0) {
+			event.preventDefault();
+			panel.focus();
 			return;
 		}
 		const first = focusables[0];
 		const last = focusables[focusables.length - 1];
-		if (event.shiftKey && document.activeElement === first) {
+		if (document.activeElement === panel) {
+			event.preventDefault();
+			(event.shiftKey ? last : first).focus();
+		} else if (event.shiftKey && document.activeElement === first) {
 			event.preventDefault();
 			last.focus();
 		} else if (!event.shiftKey && document.activeElement === last) {
@@ -98,6 +104,7 @@ export function Dialog(props: Dialog_Props) {
 				ref={panelRef}
 				className="dialog"
 				role="dialog"
+				tabIndex={-1}
 				aria-modal="true"
 				aria-labelledby={props.labelledBy}
 				onKeyDown={handle_key_down}

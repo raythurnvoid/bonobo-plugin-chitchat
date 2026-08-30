@@ -435,8 +435,13 @@ body {
 	display: none;
 }
 
-.channel-link:hover {
+.channel-link:hover:not(:disabled) {
 	background: var(--cc-surface-control);
+}
+
+.channel-link:disabled {
+	opacity: 0.55;
+	cursor: not-allowed;
 }
 
 .channel-link:focus-visible {
@@ -618,6 +623,16 @@ body {
 /* Ariakit moves this with the keyboard as well as the pointer, so it is the one hover-ish state. */
 .ChannelRowMenu-item[data-active-item] {
 	background: var(--cc-surface-hover);
+}
+
+.ChannelRowMenu-item-danger {
+	color: var(--cc-danger-text);
+}
+
+.ChannelRowMenu-separator {
+	height: 1px;
+	margin: 4px 6px;
+	background: var(--cc-border);
 }
 
 /* #endregion channel row menu */
@@ -1195,9 +1210,14 @@ body {
 	color: var(--cc-text-subtle);
 }
 
-.message-thread-summary:hover {
+.message-thread-summary:hover:not(:disabled) {
 	background: var(--cc-surface-control);
 	color: var(--cc-text);
+}
+
+.message-thread-summary:disabled {
+	opacity: 0.55;
+	cursor: not-allowed;
 }
 
 .message-thread-summary:focus-visible {
@@ -1754,7 +1774,7 @@ body {
 	 * it at a higher z-index. The way out of the overlay is the back control in the thread head, so
 	 * the thread head needs no clearance for a button that is not there.
 	 */
-	.chitchat.has-thread .drawer-toggle {
+	.chitchat:has(.thread) .drawer-toggle {
 		display: none;
 	}
 
@@ -1795,18 +1815,18 @@ body {
  * three classes to one.
  */
 @media (min-width: 720px) and (max-width: 903px) {
-	.chitchat.has-thread .sidebar {
+	.chitchat:has(.thread) .sidebar {
 		width: 56px;
 	}
 
 	/* At 56px the button's content box is 12px, so the name is replaced by its initial rather than
 	   clipped to one letter and an ellipsis. */
-	.chitchat.has-thread .channel-link {
+	.chitchat:has(.thread) .channel-link {
 		padding: 10px 4px;
 		text-align: center;
 	}
 
-	.chitchat.has-thread .channel-initial {
+	.chitchat:has(.thread) .channel-initial {
 		display: inline;
 	}
 
@@ -1814,7 +1834,7 @@ body {
 	 * Hidden to the eye, kept in the accessibility tree: this is the button's accessible name, and a
 	 * rail of single letters would otherwise announce single letters.
 	 */
-	.chitchat.has-thread .channel-name {
+	.chitchat:has(.thread) .channel-name {
 		position: absolute;
 		width: 1px;
 		height: 1px;
@@ -1825,21 +1845,21 @@ body {
 
 	/* The wordmark and the create button do not fit in 56px. Left in, they clipped mid-word
 	   ("Chitch", "Crea chan") and gave the rail its own horizontal scrollbar. */
-	.chitchat.has-thread .channel-section-title,
-	.chitchat.has-thread .sidebar-title,
-	.chitchat.has-thread .sidebar-create,
-	.chitchat.has-thread .channel-item-actions {
+	.chitchat:has(.thread) .channel-section-title,
+	.chitchat:has(.thread) .sidebar-title,
+	.chitchat:has(.thread) .sidebar-create,
+	.chitchat:has(.thread) .channel-item-actions {
 		display: none;
 	}
 
 	/* No actions here, so no room to reserve for them: the reserve would push the centred initial
 	   out of a 56px row on hover. */
-	.chitchat.has-thread .channel-item:hover .channel-link,
-	.chitchat.has-thread .channel-item:has(:focus-visible) .channel-link {
+	.chitchat:has(.thread) .channel-item:hover .channel-link,
+	.chitchat:has(.thread) .channel-item:has(:focus-visible) .channel-link {
 		padding-right: 4px;
 	}
 
-	.chitchat.has-thread .sidebar-expand {
+	.chitchat:has(.thread) .sidebar-expand {
 		display: block;
 		align-self: center;
 		min-height: 32px;
@@ -1847,7 +1867,7 @@ body {
 	}
 
 	/* Expanding overlays the rail rather than returning it to the flow, which would overflow. */
-	.chitchat.has-thread .sidebar.is-expanded {
+	.chitchat:has(.thread) .sidebar.is-expanded {
 		position: absolute;
 		top: 0;
 		bottom: 0;
@@ -1857,16 +1877,16 @@ body {
 		box-shadow: 0 0 40px var(--cc-shadow-panel);
 	}
 
-	.chitchat.has-thread .sidebar.is-expanded .channel-link {
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-link {
 		padding: 10px 10px;
 		text-align: left;
 	}
 
-	.chitchat.has-thread .sidebar.is-expanded .channel-initial {
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-initial {
 		display: none;
 	}
 
-	.chitchat.has-thread .sidebar.is-expanded .channel-name {
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-name {
 		position: static;
 		width: auto;
 		height: auto;
@@ -1874,22 +1894,22 @@ body {
 		clip-path: none;
 	}
 
-	.chitchat.has-thread .sidebar.is-expanded .channel-section-title,
-	.chitchat.has-thread .sidebar.is-expanded .sidebar-title,
-	.chitchat.has-thread .sidebar.is-expanded .sidebar-create {
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-section-title,
+	.chitchat:has(.thread) .sidebar.is-expanded .sidebar-title,
+	.chitchat:has(.thread) .sidebar.is-expanded .sidebar-create {
 		display: block;
 	}
 
-	.chitchat.has-thread .sidebar.is-expanded .channel-item-actions {
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-item-actions {
 		display: flex;
 	}
 
 	/* The drawer shows the same single trigger as the wide rail, so it reserves the same 42px. It
 	   used to reserve min(150px, 55%), which was written for the old three-text-button cluster: on a
 	   215px row that is 118px held for a 28px button, and the channel name was cut to 95px. */
-	.chitchat.has-thread .sidebar.is-expanded .channel-item:hover .channel-link,
-	.chitchat.has-thread .sidebar.is-expanded .channel-item:has(:focus-visible) .channel-link,
-	.chitchat.has-thread .sidebar.is-expanded .channel-item:has([aria-expanded="true"]) .channel-link {
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-item:hover .channel-link,
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-item:has(:focus-visible) .channel-link,
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-item:has([aria-expanded="true"]) .channel-link {
 		padding-right: 42px;
 	}
 }

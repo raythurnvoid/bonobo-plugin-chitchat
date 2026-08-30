@@ -15,11 +15,15 @@ import {
 	chat_message_value_schema,
 	chat_parse_reaction_key,
 	chat_plugin_data_list_response_schema,
+	chat_plugin_data_read_response_schema,
+	chat_private_channel_key_is_valid,
 	chat_reaction_caller_key,
 	chat_reply_key_prefix,
 	chat_reply_root_key,
+	chat_root_message_key,
 	chat_validate_channel_doc,
 	chat_validate_message_doc,
+	chat_validate_private_cursor_doc,
 	chat_validate_reaction_doc,
 } from "./chat-data";
 
@@ -89,6 +93,7 @@ describe("key builders", () => {
 
 	test("a private channel key carries no colon, so every key parser still counts the same parts", () => {
 		const key = chat_create_channel_key("private");
+		expect(chat_private_channel_key_is_valid(key)).toBe(true);
 		const messageKey = message_key(key, 3_000);
 		const replyKey = message_key(messageKey, 3_100);
 		expect(key).not.toContain(":");
@@ -98,6 +103,14 @@ describe("key builders", () => {
 			token: "heart",
 			keyTailUserId: "user_1",
 		});
+	});
+
+	test("the private-channel contract needs one exact p/ UUID", () => {
+		expect(chat_private_channel_key_is_valid(`p/${CHANNEL_KEY}`)).toBe(true);
+		expect(chat_private_channel_key_is_valid(CHANNEL_KEY)).toBe(false);
+		expect(chat_private_channel_key_is_valid("p/")).toBe(false);
+		expect(chat_private_channel_key_is_valid("p/not-a-uuid")).toBe(false);
+		expect(chat_private_channel_key_is_valid(`p/${CHANNEL_KEY}:child`)).toBe(false);
 	});
 
 	test("prefixes end with a colon so the channel key is a strict prefix", () => {
@@ -145,6 +158,24 @@ describe("chat_reply_root_key", () => {
 	});
 });
 
+describe("chat_root_message_key", () => {
+	test("keeps full public and private roots and strips full reply tails", () => {
+		const publicRoot = message_key(CHANNEL_KEY, 2_000, "aa00");
+		const privateRoot = message_key(`p/${CHANNEL_KEY}`, 2_000, "aaff");
+		expect(chat_root_message_key(publicRoot)).toBe(publicRoot);
+		expect(chat_root_message_key(privateRoot)).toBe(privateRoot);
+		expect(chat_root_message_key(`${publicRoot}:${inv(3_000)}:r001`)).toBe(publicRoot);
+		expect(chat_root_message_key(`${privateRoot}:${inv(3_000)}:r002`)).toBe(privateRoot);
+	});
+
+	test("refuses malformed, nested, and stored reaction keys", () => {
+		const root = message_key(CHANNEL_KEY, 2_000);
+		expect(chat_root_message_key("not-a-message")).toBeNull();
+		expect(chat_root_message_key(`${root}:${inv(3_000)}:r001:${inv(4_000)}:nested`)).toBeNull();
+		expect(chat_root_message_key(`${root}:heart:user_b`)).toBeNull();
+	});
+});
+
 describe("value schemas", () => {
 	test("channel names must be 1-64 characters", () => {
 		expect(chat_channel_value_schema.safeParse({ name: "general", archivedAt: null }).success).toBe(true);
@@ -176,8 +207,12 @@ describe("value schemas", () => {
 		).toBe(true);
 		expect(chat_message_value_schema.safeParse({ text: "hi" }).success).toBe(false);
 		expect(
-			chat_message_value_schema.safeParse({ text: "hi", attachments: [{ fileNodeId: "" }], editedAt: null, deletedAt: null })
-				.success,
+			chat_message_value_schema.safeParse({
+				text: "hi",
+				attachments: [{ fileNodeId: "" }],
+				editedAt: null,
+				deletedAt: null,
+			}).success,
 		).toBe(false);
 	});
 });
@@ -188,17 +223,60 @@ describe("chat_plugin_data_list_response_schema", () => {
 		// validates each document but never the envelope, so this is the only check on the shape the
 		// page destructures.
 		expect(chat_plugin_data_list_response_schema.safeParse({ cursor: null, isDone: true }).success).toBe(false);
-		expect(
-			chat_plugin_data_list_response_schema.safeParse({ documents: [], cursor: 7, isDone: true }).success,
-		).toBe(false);
+		expect(chat_plugin_data_list_response_schema.safeParse({ documents: [], cursor: 7, isDone: true }).success).toBe(
+			false,
+		);
 
 		const parsed = chat_plugin_data_list_response_schema.safeParse({
-			documents: [{ key: "anything" }],
+			documents: [
+				{
+					collection: "messages",
+					key: "anything",
+					value: { futureField: true },
+					revision: 1,
+					createdBy: "user_1",
+					updatedBy: "user_1",
+					ownership: "shared",
+					createdAt: 1,
+					updatedAt: 1,
+				},
+			],
 			cursor: null,
 			isDone: false,
 		});
-		// `cursor: null` is a legal first page, so it must survive parsing as null and not be dropped.
-		expect(parsed.success && parsed.data).toEqual({ documents: [{ key: "anything" }], cursor: null, isDone: false });
+		// The full envelope and unknown value fields must survive for the collection validator.
+		expect(parsed.success && parsed.data).toEqual({
+			documents: [
+				{
+					collection: "messages",
+					key: "anything",
+					value: { futureField: true },
+					revision: 1,
+					createdBy: "user_1",
+					updatedBy: "user_1",
+					ownership: "shared",
+					createdAt: 1,
+					updatedAt: 1,
+				},
+			],
+			cursor: null,
+			isDone: false,
+		});
+		expect(
+			chat_plugin_data_list_response_schema.safeParse({
+				documents: [{ key: "no public envelope" }],
+				cursor: null,
+				isDone: false,
+			}).success,
+		).toBe(false);
+	});
+});
+
+describe("chat_plugin_data_read_response_schema", () => {
+	test("requires the document field and accepts a missing stored document", () => {
+		expect(chat_plugin_data_read_response_schema.safeParse({}).success).toBe(false);
+		expect(chat_plugin_data_read_response_schema.safeParse({ document: null }).success).toBe(true);
+		expect(chat_plugin_data_read_response_schema.safeParse({ document: doc_envelope({}) }).success).toBe(true);
 	});
 });
 
@@ -227,6 +305,35 @@ describe("document validation", () => {
 		// Client-generated channel keys carry no server time tail; createdAt stands in.
 		expect(chat_validate_channel_doc(raw)?.timestamp).toBe(2_000);
 		expect(chat_validate_channel_doc(doc_envelope({ key: CHANNEL_KEY, value: { name: "" } }))).toBeNull();
+	});
+
+	test("accepts only owned private cursor documents", () => {
+		const key = `p/${CHANNEL_KEY}:read:user_me`;
+		const raw = doc_envelope({
+			collection: "channels",
+			key,
+			value: { at: 3_000, activity: { messages: 4, replies: 2 } },
+			ownership: "owned",
+		});
+		expect(chat_validate_private_cursor_doc(raw)).toMatchObject({
+			key,
+			channelKey: `p/${CHANNEL_KEY}`,
+			createdBy: "user_a",
+			at: 3_000,
+			activity: { messages: 4, replies: 2 },
+			revision: 1,
+		});
+		expect(chat_validate_private_cursor_doc({ ...raw, ownership: "shared" })).toBeNull();
+		expect(chat_validate_private_cursor_doc({ ...raw, value: { at: 3_000 } })).toMatchObject({
+			at: 3_000,
+			activity: { messages: 0, replies: 0 },
+		});
+		expect(
+			chat_validate_private_cursor_doc({
+				...raw,
+				value: { at: 3_000, activity: { messages: -1, replies: 0 } },
+			}),
+		).toBeNull();
 	});
 
 	test("validates reaction docs and parses their key parts", () => {
@@ -286,7 +393,9 @@ describe("chat_filter_mention_members", () => {
 			"Cleo Pane",
 			chat_ANONYMOUS_MEMBER_LABEL,
 		]);
-		expect(chat_filter_mention_members(roster, "PANE", "user_me").map((member) => member.userId)).toEqual(["user_cleo"]);
+		expect(chat_filter_mention_members(roster, "PANE", "user_me").map((member) => member.userId)).toEqual([
+			"user_cleo",
+		]);
 	});
 
 	test("a null display name uses the same anonymous label the people picker uses", () => {

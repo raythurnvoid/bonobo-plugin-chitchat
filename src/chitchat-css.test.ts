@@ -269,6 +269,16 @@ describe("chitchat.css channel row actions", () => {
 		expect(popover).toMatch(/z-index:\s*\d/u);
 		expect(popover).toContain("box-shadow");
 	});
+
+	test("destructive menu items use the shared danger colour", () => {
+		expect(rule_body("\\.ChannelRowMenu-item-danger")).toContain("color: var(--cc-danger-text)");
+	});
+
+	test("the Leave and Delete group has a visible separator", () => {
+		const separator = rule_body("\\.ChannelRowMenu-separator");
+		expect(separator).toContain("height: 1px");
+		expect(separator).toContain("background: var(--cc-border)");
+	});
 });
 
 describe("chitchat.css composer", () => {
@@ -323,7 +333,7 @@ describe("chitchat.css narrow layout", () => {
 
 	test("the thread overlay hides the floating toggle and the separator behind it", () => {
 		expect(narrow).not.toBe("");
-		expect(rule_body("\\.chitchat\\.has-thread \\.drawer-toggle", narrow)).toContain("display: none");
+		expect(rule_body("\\.chitchat:has\\(\\.thread\\) \\.drawer-toggle", narrow)).toContain("display: none");
 		// Left visible, the handle is a focusable separator announcing a width nothing uses,
 		// sitting behind an opaque fixed overlay.
 		expect(rule_body("\\.thread-resize", narrow)).toContain("display: none");
@@ -354,14 +364,14 @@ describe("chitchat.css log floor", () => {
 
 describe("chitchat.css icon rail", () => {
 	// Both bounds are load-bearing. Without the lower one the rule also reaches the ≤719px drawer,
-	// where `.chitchat.has-thread .sidebar` outranks the drawer's own `.sidebar` three classes to one.
+	// where the thread-qualified sidebar rule outranks the drawer's own `.sidebar` rule.
 	const rail = media_body("(min-width: 720px) and (max-width: 903px)");
 
 	test("hides the two head controls that do not fit in 56px", () => {
 		// Left in, the wordmark and the create button clipped mid-word ("Chitch", "Crea chan") and
 		// gave the rail its own horizontal scrollbar.
 		const hidden = rule_body(
-			"\\.chitchat\\.has-thread \\.channel-section-title,\\s*\\.chitchat\\.has-thread \\.sidebar-title,\\s*\\.chitchat\\.has-thread \\.sidebar-create,\\s*\\.chitchat\\.has-thread \\.channel-item-actions",
+			"\\.chitchat:has\\(\\.thread\\) \\.channel-section-title,\\s*\\.chitchat:has\\(\\.thread\\) \\.sidebar-title,\\s*\\.chitchat:has\\(\\.thread\\) \\.sidebar-create,\\s*\\.chitchat:has\\(\\.thread\\) \\.channel-item-actions",
 			rail,
 		);
 		expect(hidden).toContain("display: none");
@@ -375,7 +385,7 @@ describe("chitchat.css icon rail", () => {
 		// initial out of a 56px one on hover.
 		expect(
 			rule_body(
-				"\\.chitchat\\.has-thread \\.channel-item:hover \\.channel-link,\\s*\\.chitchat\\.has-thread \\.channel-item:has\\(:focus-visible\\) \\.channel-link",
+				"\\.chitchat:has\\(\\.thread\\) \\.channel-item:hover \\.channel-link,\\s*\\.chitchat:has\\(\\.thread\\) \\.channel-item:has\\(:focus-visible\\) \\.channel-link",
 				rail,
 			),
 		).toContain("padding-right: 4px");
@@ -387,7 +397,7 @@ describe("chitchat.css icon rail", () => {
 		// held 118px of a 215px row for a 28px button and cut the channel name to 95px.
 		expect(
 			rule_body(
-				'\\.chitchat\\.has-thread \\.sidebar\\.is-expanded \\.channel-item:hover \\.channel-link,\\s*\\.chitchat\\.has-thread \\.sidebar\\.is-expanded \\.channel-item:has\\(:focus-visible\\) \\.channel-link,\\s*\\.chitchat\\.has-thread \\.sidebar\\.is-expanded \\.channel-item:has\\(\\[aria-expanded="true"\\]\\) \\.channel-link',
+				'\\.chitchat:has\\(\\.thread\\) \\.sidebar\\.is-expanded \\.channel-item:hover \\.channel-link,\\s*\\.chitchat:has\\(\\.thread\\) \\.sidebar\\.is-expanded \\.channel-item:has\\(:focus-visible\\) \\.channel-link,\\s*\\.chitchat:has\\(\\.thread\\) \\.sidebar\\.is-expanded \\.channel-item:has\\(\\[aria-expanded="true"\\]\\) \\.channel-link',
 				rail,
 			),
 		).toContain("padding-right: 42px");
@@ -399,7 +409,7 @@ describe("chitchat.css icon rail", () => {
 
 	test("collapses only while a thread is open, inside the two-bound band", () => {
 		expect(rail).not.toBe("");
-		expect(rule_body("\\.chitchat\\.has-thread \\.sidebar", rail)).toContain("width: 56px");
+		expect(rule_body("\\.chitchat:has\\(\\.thread\\) \\.sidebar", rail)).toContain("width: 56px");
 
 		// Unqualified, the rule costs every channel name to a member at an 800px frame who never
 		// opens a thread.
@@ -410,7 +420,7 @@ describe("chitchat.css icon rail", () => {
 	});
 
 	test("the collapsed rail centres its initials instead of ellipsing them", () => {
-		const link = rule_body("\\.chitchat\\.has-thread \\.channel-link", rail);
+		const link = rule_body("\\.chitchat:has\\(\\.thread\\) \\.channel-link", rail);
 		expect(link).toContain("padding: 10px 4px");
 		expect(link).toContain("text-align: center");
 	});

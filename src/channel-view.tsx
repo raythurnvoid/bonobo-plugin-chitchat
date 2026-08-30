@@ -26,6 +26,7 @@ import {
 	chat_REACTION_TOKENS,
 	chat_reply_key_prefix,
 	chat_reply_root_key,
+	chat_root_message_key,
 	chat_validate_message_doc,
 	chat_validate_reaction_doc,
 	type chat_Attachment,
@@ -69,6 +70,17 @@ type PendingSend = {
 	errorMessage: string | null;
 };
 
+const SEND_RETRY_INITIAL_MS = 1_000;
+const SEND_RETRY_MAX_MS = 30_000;
+
+type ActiveSend = {
+	clientRequestId: string;
+	retryDelayMs: number;
+	retryTimer: ReturnType<typeof setTimeout> | null;
+	settled: boolean;
+	cancelled: boolean;
+};
+
 /**
  * Optimistic sends for one composer. Every logical send mints one clientRequestId and
  * every retry of that send reuses it verbatim, so a replayed append answers the stored
@@ -80,6 +92,9 @@ function use_send_queue(opts: {
 	keyPrefix: string;
 	userId: string;
 	onDelivered: (doc: chat_Doc<chat_MessageValue>) => void;
+	/** Track the request in App before the append can settle or a navigation handler can run. */
+	onRequestStart: () => void;
+	onRequestSettled: () => void;
 	/**
 	 * A full store is not this send's problem, it is the channel's. Report it up so the channel
 	 * says so once and stops the composer, instead of printing the same sentence on every row the
@@ -88,6 +103,41 @@ function use_send_queue(opts: {
 	onStorageFull: (message: string) => void;
 }) {
 	const [pending, setPending] = useState<PendingSend[]>([]);
+	const activeSendsRef = useRef(new Map<string, ActiveSend>());
+	const onRequestSettledRef = useRef(opts.onRequestSettled);
+	onRequestSettledRef.current = opts.onRequestSettled;
+
+	const settle = (active: ActiveSend) => {
+		if (active.settled || active.cancelled) {
+			return;
+		}
+		active.settled = true;
+		if (active.retryTimer !== null) {
+			clearTimeout(active.retryTimer);
+			active.retryTimer = null;
+		}
+		if (activeSendsRef.current.get(active.clientRequestId) === active) {
+			activeSendsRef.current.delete(active.clientRequestId);
+		}
+		onRequestSettledRef.current();
+	};
+
+	// Stop uncertain retries on unmount, and release the App count if a remote change removed this queue.
+	useEffect(() => {
+		return () => {
+			for (const active of activeSendsRef.current.values()) {
+				active.cancelled = true;
+				if (active.retryTimer !== null) {
+					clearTimeout(active.retryTimer);
+				}
+				if (!active.settled) {
+					active.settled = true;
+					onRequestSettledRef.current();
+				}
+			}
+			activeSendsRef.current.clear();
+		};
+	}, []);
 
 	const start = (entry: {
 		clientRequestId: string;
@@ -95,6 +145,9 @@ function use_send_queue(opts: {
 		attachments: chat_Attachment[];
 		mentions: string[];
 	}) => {
+		if (activeSendsRef.current.has(entry.clientRequestId)) {
+			return;
+		}
 		const value: chat_MessageValue = {
 			text: entry.text,
 			attachments: entry.attachments,
@@ -102,53 +155,91 @@ function use_send_queue(opts: {
 			deletedAt: null,
 			...(entry.mentions.length > 0 ? { mentions: entry.mentions } : {}),
 		};
-		opts.client.data
-			.append({
-				collection: opts.collection,
-				keyPrefix: opts.keyPrefix,
-				value,
-				clientRequestId: entry.clientRequestId,
-			})
-			.then((result) => {
-				if ("_nay" in result) {
-					const storageFull = result._nay.name === "storage_full";
-					if (storageFull) {
-						opts.onStorageFull(result._nay.message);
-					}
-					setPending((prev) =>
-						prev.map((p) =>
-							p.clientRequestId === entry.clientRequestId
-								? { ...p, status: "failed" as const, errorMessage: storageFull ? null : result._nay.message }
-								: p,
-						),
+		const active: ActiveSend = {
+			clientRequestId: entry.clientRequestId,
+			retryDelayMs: SEND_RETRY_INITIAL_MS,
+			retryTimer: null,
+			settled: false,
+			cancelled: false,
+		};
+		activeSendsRef.current.set(entry.clientRequestId, active);
+		opts.onRequestStart();
+
+		const fail = (message: string, storageFull = false) => {
+			if (activeSendsRef.current.get(entry.clientRequestId) !== active || active.cancelled) {
+				return;
+			}
+			if (storageFull) {
+				opts.onStorageFull(message);
+			}
+			setPending((prev) =>
+				prev.map((p) =>
+					p.clientRequestId === entry.clientRequestId
+						? { ...p, status: "failed" as const, errorMessage: storageFull ? null : message }
+						: p,
+				),
+			);
+			settle(active);
+		};
+
+		const run = () => {
+			if (activeSendsRef.current.get(entry.clientRequestId) !== active || active.cancelled) {
+				return;
+			}
+			try {
+				void opts.client.data
+					.append({
+						collection: opts.collection,
+						keyPrefix: opts.keyPrefix,
+						value,
+						clientRequestId: entry.clientRequestId,
+					})
+					.then(
+						(result) => {
+							if (activeSendsRef.current.get(entry.clientRequestId) !== active || active.cancelled) {
+								return;
+							}
+							if ("_nay" in result) {
+								if (result._nay.name === "unavailable") {
+									// The append may have committed. Replay the same request id after a bounded wait.
+									const delayMs = active.retryDelayMs;
+									active.retryTimer = setTimeout(() => {
+										active.retryTimer = null;
+										active.retryDelayMs = Math.min(delayMs * 2, SEND_RETRY_MAX_MS);
+										run();
+									}, delayMs);
+									return;
+								}
+								fail(result._nay.message, result._nay.name === "storage_full");
+								return;
+							}
+							setPending((prev) => prev.filter((p) => p.clientRequestId !== entry.clientRequestId));
+							const key = result._yay.key;
+							const timestamp = chat_key_timestamp(key) ?? Date.now();
+							// Show the delivered message immediately; the watch echo replaces this synthetic
+							// doc because the server revision is higher.
+							opts.onDelivered({
+								key,
+								value,
+								revision: 0,
+								createdBy: opts.userId,
+								updatedBy: opts.userId,
+								createdAt: timestamp,
+								updatedAt: timestamp,
+								timestamp,
+							});
+							settle(active);
+						},
+						(error: unknown) => {
+							fail(chat_get_error_message(error));
+						},
 					);
-					return;
-				}
-				setPending((prev) => prev.filter((p) => p.clientRequestId !== entry.clientRequestId));
-				const key = result._yay.key;
-				const timestamp = chat_key_timestamp(key) ?? Date.now();
-				// Show the delivered message immediately; the watch echo replaces this synthetic
-				// doc because the server revision is higher.
-				opts.onDelivered({
-					key,
-					value,
-					revision: 0,
-					createdBy: opts.userId,
-					updatedBy: opts.userId,
-					createdAt: timestamp,
-					updatedAt: timestamp,
-					timestamp,
-				});
-			})
-			.catch((error: unknown) => {
-				setPending((prev) =>
-					prev.map((p) =>
-						p.clientRequestId === entry.clientRequestId
-							? { ...p, status: "failed" as const, errorMessage: chat_get_error_message(error) }
-							: p,
-					),
-				);
-			});
+			} catch (error: unknown) {
+				fail(chat_get_error_message(error));
+			}
+		};
+
+		run();
 	};
 
 	const send = (text: string, attachments: chat_Attachment[], mentions: string[]) => {
@@ -447,9 +538,7 @@ const MENTION_ROSTER_PAGE_SIZE = 100;
  */
 const MENTION_ROSTER_MAX_PAGES = 10;
 
-type MentionRoster =
-	| { status: "ready"; members: BonoboUiMember[] }
-	| { status: "refused"; name: string };
+type MentionRoster = { status: "ready"; members: BonoboUiMember[] } | { status: "refused"; name: string };
 
 const mention_roster_cache = new WeakMap<BonoboUiFrontendClient, MentionRoster>();
 const mention_roster_inflight = new WeakMap<BonoboUiFrontendClient, Promise<MentionRoster>>();
@@ -490,11 +579,7 @@ async function fetch_mention_roster(client: BonoboUiFrontendClient): Promise<Men
 			...(cursor === undefined ? {} : { cursor }),
 		});
 		if ("_nay" in result) {
-			// Keep names from earlier pages. A first-page refusal must not look like an empty
-			// workspace, because the SDK never answers that way.
-			if (members.length > 0) {
-				return { status: "ready", members };
-			}
+			// Do not cache an earlier page as a complete roster when a later page is refused.
 			return { status: "refused", name: result._nay.name };
 		}
 		members.push(...result._yay.members);
@@ -948,7 +1033,8 @@ function build_message_entries(
 	let previous: chat_Doc<chat_MessageValue> | null = null;
 	let markPlaced = false;
 	for (const doc of docs) {
-		const startsNewDay = previous !== null && new Date(previous.timestamp).toDateString() !== new Date(doc.timestamp).toDateString();
+		const startsNewDay =
+			previous !== null && new Date(previous.timestamp).toDateString() !== new Date(doc.timestamp).toDateString();
 		if (startsNewDay) {
 			entries.push({ kind: "divider", key: `divider:${doc.key}`, label: format_day_label(doc.timestamp, now) });
 		}
@@ -1036,12 +1122,10 @@ type MessageRow_Props = {
 	isContinuation: boolean;
 	authorName: string | null | undefined;
 	/**
-	 * "unknown" = the reactions list does not cover this row, so the app cannot say which
-	 * reactions it has. An empty array here would render as "nobody reacted", which is a different
-	 * statement and a false one. The row shows an uncovered state instead. Add stays live;
-	 * remove is hidden because there are no chips.
+	 * "pending" = the healthy reactions list has not covered this row yet. "unknown" = that
+	 * coverage failed or died. Neither state claims that nobody reacted, and Add stays live.
 	 */
-	reactionGroups: chat_ReactionGroup[] | "unknown";
+	reactionGroups: chat_ReactionGroup[] | "pending" | "unknown";
 	/**
 	 * null = this row offers no thread affordance (rows inside a thread panel).
 	 * "unknown" = the replies list does not reach this root yet, so no count is claimed.
@@ -1052,24 +1136,46 @@ type MessageRow_Props = {
 	/** True while the replies list says more replies exist below it — gates the "99+" cap. */
 	repliesHasMore: boolean;
 	onOpenThread: ((doc: chat_Doc<chat_MessageValue>) => void) | null;
+	threadDisabled: boolean;
 	replyTriggerRef: ((el: HTMLButtonElement | null) => void) | null;
 	onApplyLocal: (doc: chat_Doc<chat_MessageValue>) => void;
+	/** Keep this row mounted until its compare-and-set write has a definite outcome. */
+	onRequestStart: () => void;
+	onRequestSettled: () => void;
 	/** Merge a reaction the member just wrote, including a removed marker. */
 	onApplyReaction: (doc: chat_ReactionDoc) => void;
 	/** See `use_send_queue`: a full store is the channel's state, not this row's error. */
 	onStorageFull: (message: string) => void;
 };
 
+type ActiveMessageChange = {
+	value: chat_MessageValue;
+	expectedRevision: number;
+	onDone: () => void;
+	running: boolean;
+	uncertain: boolean;
+	settled: boolean;
+	cancelled: boolean;
+};
+
 export function MessageRow(props: MessageRow_Props) {
 	const { client, collection, doc, isOwn } = props;
+	const isDeleted = doc.value.deletedAt !== null;
 	const confirmTitleId = useId();
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
 	const [busy, setBusy] = useState(false);
+	const [changeUncertain, setChangeUncertain] = useState(false);
 	const [rowError, setRowError] = useState<string | null>(null);
 	const [confirmingDelete, setConfirmingDelete] = useState(false);
 	const editInputRef = useRef<HTMLTextAreaElement | null>(null);
 	const editButtonRef = useRef<HTMLButtonElement | null>(null);
+	const rowRef = useRef<HTMLLIElement | null>(null);
+	const rowHadFocusRef = useRef(false);
+	const focusAfterRenderRef = useRef<"edit" | "row" | null>(null);
+	const activeChangeRef = useRef<ActiveMessageChange | null>(null);
+	const onRequestSettledRef = useRef(props.onRequestSettled);
+	onRequestSettledRef.current = props.onRequestSettled;
 
 	// Move focus into the edit box when inline editing starts.
 	useEffect(() => {
@@ -1078,37 +1184,197 @@ export function MessageRow(props: MessageRow_Props) {
 		}
 	}, [editing]);
 
-	const apply_value = (value: chat_MessageValue, onDone: () => void) => {
-		setBusy(true);
+	// The edit button and delete dialog are absent until the closing render finishes.
+	useEffect(() => {
+		const target = focusAfterRenderRef.current;
+		if (target === null) {
+			return;
+		}
+		const element = target === "edit" ? editButtonRef.current : rowRef.current;
+		if (element !== null) {
+			focusAfterRenderRef.current = null;
+			element.focus();
+		}
+	}, [editing, confirmingDelete, isDeleted]);
+
+	const settle_change = (active: ActiveMessageChange) => {
+		if (active.settled) {
+			return;
+		}
+		active.settled = true;
+		active.cancelled = true;
+		if (activeChangeRef.current === active) {
+			activeChangeRef.current = null;
+		}
+		onRequestSettledRef.current();
+	};
+
+	const finish_change = (active: ActiveMessageChange) => {
+		settle_change(active);
+		setBusy(false);
+		setChangeUncertain(false);
 		setRowError(null);
-		client.data
-			// Compare against the revision this row is showing. Another member's edit reaches the
-			// row through the window, so a stale number here is a real conflict and must be told.
-			.put({ collection, key: doc.key, value, expectedRevision: doc.revision })
-			.then((result) => {
-				setBusy(false);
-				if ("_nay" in result) {
-					if (result._nay.name === "storage_full") {
-						props.onStorageFull(result._nay.message);
+		active.onDone();
+	};
+
+	const run_change = (active: ActiveMessageChange) => {
+		if (activeChangeRef.current !== active || active.running || active.cancelled) {
+			return;
+		}
+		active.running = true;
+		setBusy(true);
+		setChangeUncertain(false);
+		setRowError(null);
+		const mark_uncertain = (message: string) => {
+			if (activeChangeRef.current !== active || active.cancelled) {
+				return;
+			}
+			active.running = false;
+			active.uncertain = true;
+			setBusy(false);
+			setChangeUncertain(true);
+			setRowError(message);
+		};
+		try {
+			void client.data
+				// Keep the exact submitted value and revision. An unavailable result may hide a commit.
+				.put({ collection, key: doc.key, value: active.value, expectedRevision: active.expectedRevision })
+				.then((result) => {
+					if (activeChangeRef.current !== active || active.cancelled) {
 						return;
 					}
-					setRowError(result._nay.message);
-					return;
-				}
-				// Echo the revision the server stored, not a guessed `doc.revision + 1`. The store
-				// merges forward, so this echo is what the next edit compares against. A guess that
-				// is lower than the stored one refuses the member's own next edit as a conflict.
-				props.onApplyLocal({ ...doc, value, revision: result._yay.revision, updatedAt: Date.now() });
-				onDone();
-			})
-			.catch((error: unknown) => {
-				setBusy(false);
-				setRowError(chat_get_error_message(error));
-			});
+					active.running = false;
+					if ("_nay" in result) {
+						if (result._nay.name === "unavailable") {
+							mark_uncertain(result._nay.message);
+							return;
+						}
+						// A stale-revision answer after an uncertain result may be the replay of a committed write.
+						// Keep the exact retry locked until its watch echo arrives or the member cancels it.
+						if (active.uncertain && result._nay.name === "conflict") {
+							setBusy(false);
+							setChangeUncertain(true);
+							setRowError(result._nay.message);
+							return;
+						}
+						settle_change(active);
+						setBusy(false);
+						setChangeUncertain(false);
+						if (result._nay.name === "storage_full") {
+							props.onStorageFull(result._nay.message);
+							return;
+						}
+						setRowError(result._nay.message);
+						return;
+					}
+					// Echo the revision the server stored, not a guessed `doc.revision + 1`. The store
+					// merges forward, so this echo is what the next edit compares against. A guess that
+					// is lower than the stored one refuses the member's own next edit as a conflict.
+					props.onApplyLocal({ ...doc, value: active.value, revision: result._yay.revision, updatedAt: Date.now() });
+					finish_change(active);
+				})
+				.catch((error: unknown) => {
+					mark_uncertain(chat_get_error_message(error));
+				});
+		} catch (error: unknown) {
+			mark_uncertain(chat_get_error_message(error));
+		}
 	};
+
+	const apply_value = (value: chat_MessageValue, onDone: () => void) => {
+		if (activeChangeRef.current !== null) {
+			return;
+		}
+		const active: ActiveMessageChange = {
+			value,
+			expectedRevision: doc.revision,
+			onDone,
+			running: false,
+			uncertain: false,
+			settled: false,
+			cancelled: false,
+		};
+		activeChangeRef.current = active;
+		props.onRequestStart();
+		run_change(active);
+	};
+
+	const cancel_change = () => {
+		const active = activeChangeRef.current;
+		if (active !== null) {
+			settle_change(active);
+		}
+		setBusy(false);
+		setChangeUncertain(false);
+		setRowError(null);
+	};
+
+	// A tombstone removes every row action. Keep focus on the same message instead of losing it
+	// to the document, and clear any editor or dialog state that is now hidden.
+	useEffect(() => {
+		if (!isDeleted) {
+			return;
+		}
+		if (editing || confirmingDelete) {
+			if (rowHadFocusRef.current) {
+				focusAfterRenderRef.current = "row";
+			}
+			setEditing(false);
+			setEditText("");
+			setConfirmingDelete(false);
+			setBusy(false);
+			setChangeUncertain(false);
+			setRowError(null);
+		} else if (rowHadFocusRef.current) {
+			rowRef.current?.focus();
+		}
+	}, [isDeleted, editing, confirmingDelete]);
+
+	// A watch can prove that an unavailable write committed before its result was lost.
+	useEffect(() => {
+		const active = activeChangeRef.current;
+		if (active === null || active.cancelled || doc.revision <= active.expectedRevision) {
+			return;
+		}
+		if (doc.value.deletedAt !== null && active.value.deletedAt === null) {
+			// A later delete wins over an edit, even when the tombstone kept the submitted text.
+			settle_change(active);
+			setBusy(false);
+			setChangeUncertain(false);
+			setRowError(null);
+			return;
+		}
+		const matches =
+			active.value.deletedAt !== null
+				? doc.value.deletedAt !== null
+				: doc.value.text === active.value.text && doc.value.editedAt === active.value.editedAt;
+		if (matches) {
+			finish_change(active);
+			return;
+		}
+		settle_change(active);
+		setBusy(false);
+		setChangeUncertain(false);
+		setRowError("Someone else changed this message while the request was pending. Review it and try again.");
+	}, [doc.revision, doc.value.deletedAt, doc.value.editedAt, doc.value.text]);
+
+	// A real scope removal may unmount the row even though local navigation is locked.
+	useEffect(() => {
+		return () => {
+			const active = activeChangeRef.current;
+			if (active !== null) {
+				settle_change(active);
+			}
+		};
+	}, []);
 
 	const handle_edit_save = () => {
 		if (busy) {
+			return;
+		}
+		const active = activeChangeRef.current;
+		if (active !== null) {
+			run_change(active);
 			return;
 		}
 		const trimmed = editText.trim();
@@ -1116,30 +1382,49 @@ export function MessageRow(props: MessageRow_Props) {
 			return;
 		}
 		apply_value({ ...doc.value, text: trimmed, editedAt: Date.now() }, () => {
+			focusAfterRenderRef.current = "edit";
 			setEditing(false);
-			editButtonRef.current?.focus();
+			setEditText("");
 		});
 	};
 
 	const handle_edit_cancel = () => {
+		if (busy) {
+			return;
+		}
+		cancel_change();
+		focusAfterRenderRef.current = "edit";
 		setEditing(false);
-		editButtonRef.current?.focus();
+		setEditText("");
 	};
 
 	const handle_delete = () => {
+		if (busy) {
+			return;
+		}
+		const active = activeChangeRef.current;
+		if (active !== null) {
+			run_change(active);
+			return;
+		}
 		apply_value({ ...doc.value, deletedAt: Date.now() }, () => {
-			// The Dialog gives focus back to the Delete button on unmount.
+			focusAfterRenderRef.current = "row";
 			setConfirmingDelete(false);
 		});
 	};
 
+	const handle_delete_close = () => {
+		if (!busy) {
+			cancel_change();
+			setConfirmingDelete(false);
+		}
+	};
+
 	const handle_toggle_reaction = (token: chat_ReactionToken, currentlyPressed: boolean) => {
 		setRowError(null);
-		// The reactions list does not cover this row, so nothing here knows what this member
-		// already holds. The remove path is hidden rather than refused — no chips render, and the
-		// row says why — while the add path stays live: `putOwned` writes the member's own key
-		// whether or not a chip is on screen, so it is correct either way.
-		if (props.reactionGroups === "unknown" && currentlyPressed) {
+		// An uncovered row cannot know what this member holds. Hide remove with the chips, but keep
+		// Add live: `putOwned` writes the member's own key either way.
+		if (!Array.isArray(props.reactionGroups) && currentlyPressed) {
 			setRowError("Reactions on this message could not be loaded, so they can't be removed right now.");
 			return;
 		}
@@ -1174,7 +1459,6 @@ export function MessageRow(props: MessageRow_Props) {
 			});
 	};
 
-	const isDeleted = doc.value.deletedAt !== null;
 	const authorLabel = props.authorName === null ? "Former member" : (props.authorName ?? "…");
 	// Within a week the row shows clock time only, so the hidden span carries the date back for a
 	// screen reader moving row by row — the day divider is a sibling and names no row. Beyond a
@@ -1182,11 +1466,23 @@ export function MessageRow(props: MessageRow_Props) {
 	const isRecent = Date.now() - doc.timestamp < 7 * DAY_MS;
 	// A root with replies shows its summary as body content; a root with none, or one the replies
 	// window cannot speak for, keeps the affordance in the hover cluster.
-	const hasThreadSummary =
-		props.onOpenThread !== null && typeof props.replyCount === "number" && props.replyCount > 0;
+	const hasThreadSummary = props.onOpenThread !== null && typeof props.replyCount === "number" && props.replyCount > 0;
 
 	return (
-		<li className={props.isContinuation ? "message is-continuation" : "message is-leader"} data-key={doc.key}>
+		<li
+			ref={rowRef}
+			className={props.isContinuation ? "message is-continuation" : "message is-leader"}
+			data-key={doc.key}
+			tabIndex={-1}
+			onFocusCapture={() => {
+				rowHadFocusRef.current = true;
+			}}
+			onBlurCapture={(event) => {
+				if (event.relatedTarget instanceof Node) {
+					rowHadFocusRef.current = event.currentTarget.contains(event.relatedTarget);
+				}
+			}}
+		>
 			<span className="message-avatar" aria-hidden="true">
 				{author_initials(props.authorName)}
 			</span>
@@ -1209,6 +1505,7 @@ export function MessageRow(props: MessageRow_Props) {
 						aria-label="Edit message"
 						rows={2}
 						value={editText}
+						readOnly={busy || changeUncertain}
 						onInput={(event) => setEditText(event.currentTarget.value)}
 						onKeyDown={(event) => {
 							if (event.key === "Escape") {
@@ -1225,7 +1522,7 @@ export function MessageRow(props: MessageRow_Props) {
 							Cancel
 						</button>
 						<button type="button" className="button button-primary" disabled={busy} onClick={handle_edit_save}>
-							{busy ? "Saving…" : "Save"}
+							{busy ? "Saving…" : changeUncertain ? "Retry" : "Save"}
 						</button>
 					</div>
 				</div>
@@ -1240,7 +1537,7 @@ export function MessageRow(props: MessageRow_Props) {
 					) : null}
 					{props.reactionGroups === "unknown" ? (
 						<div className="message-reactions-unknown">Reactions unavailable</div>
-					) : props.reactionGroups.length > 0 ? (
+					) : Array.isArray(props.reactionGroups) && props.reactionGroups.length > 0 ? (
 						<div className="message-reactions">
 							{props.reactionGroups.map((group) => (
 								<button
@@ -1264,6 +1561,7 @@ export function MessageRow(props: MessageRow_Props) {
 							ref={props.replyTriggerRef ?? undefined}
 							type="button"
 							className="message-thread-summary"
+							disabled={props.threadDisabled}
 							onClick={() => props.onOpenThread?.(doc)}
 						>
 							<span className="message-thread-summary-icon" aria-hidden="true">
@@ -1290,6 +1588,7 @@ export function MessageRow(props: MessageRow_Props) {
 							ref={props.replyTriggerRef ?? undefined}
 							type="button"
 							className="button message-action"
+							disabled={props.threadDisabled}
 							onClick={() => props.onOpenThread?.(doc)}
 						>
 							{props.replyCount === "unknown" ? "View thread" : "Reply in thread"}
@@ -1298,7 +1597,7 @@ export function MessageRow(props: MessageRow_Props) {
 					{/* An uncovered row has no known pressed state, so the palette shows none.
 					    Add still writes this member's own key. Remove is hidden — no chips. */}
 					<AddReactionButton
-						groups={props.reactionGroups === "unknown" ? [] : props.reactionGroups}
+						groups={Array.isArray(props.reactionGroups) ? props.reactionGroups : []}
 						onPick={handle_toggle_reaction}
 					/>
 					{isOwn ? (
@@ -1325,29 +1624,28 @@ export function MessageRow(props: MessageRow_Props) {
 					) : null}
 				</div>
 			) : null}
-			{rowError !== null ? (
+			{rowError !== null && !confirmingDelete ? (
 				<p className="form-error" role="alert">
 					{rowError}
 				</p>
 			) : null}
 			{confirmingDelete ? (
-				<Dialog labelledBy={confirmTitleId} onClose={() => setConfirmingDelete(false)}>
+				<Dialog labelledBy={confirmTitleId} onClose={handle_delete_close}>
 					<h2 id={confirmTitleId} className="dialog-title">
 						Delete message?
 					</h2>
 					<p>The message is replaced by a "Message deleted" placeholder for everyone.</p>
+					{rowError !== null ? (
+						<p className="form-error" role="alert">
+							{rowError}
+						</p>
+					) : null}
 					<div className="dialog-actions">
-						<button
-							type="button"
-							className="button"
-							data-dialog-initial
-							disabled={busy}
-							onClick={() => setConfirmingDelete(false)}
-						>
+						<button type="button" className="button" data-dialog-initial disabled={busy} onClick={handle_delete_close}>
 							Cancel
 						</button>
 						<button type="button" className="button button-danger" disabled={busy} onClick={handle_delete}>
-							{busy ? "Deleting…" : "Delete message"}
+							{busy ? "Deleting…" : changeUncertain ? "Retry delete" : "Delete message"}
 						</button>
 					</div>
 				</Dialog>
@@ -1360,9 +1658,7 @@ function PendingRow(props: { pending: PendingSend; onRetry: () => void }) {
 	return (
 		<li
 			className={
-				props.pending.status === "failed"
-					? "message is-leader is-pending is-failed"
-					: "message is-leader is-pending"
+				props.pending.status === "failed" ? "message is-leader is-pending is-failed" : "message is-leader is-pending"
 			}
 		>
 			<span className="message-avatar" aria-hidden="true">
@@ -1374,9 +1670,7 @@ function PendingRow(props: { pending: PendingSend; onRetry: () => void }) {
 			</div>
 			<p className="message-text">{props.pending.text}</p>
 			{props.pending.attachments.length > 0 ? (
-				<p className="message-text">
-					{props.pending.attachments.map((attachment) => attachment.name).join(", ")}
-				</p>
+				<p className="message-text">{props.pending.attachments.map((attachment) => attachment.name).join(", ")}</p>
 			) : null}
 			{props.pending.status === "failed" ? (
 				<div className="message-send-error" role="alert">
@@ -1408,7 +1702,7 @@ function watch_death_message(reason: string | undefined, subject: string) {
 		return `This Chitchat session expired, so ${subject} stopped updating. Reload the page to continue.`;
 	}
 	if (reason === "unavailable") {
-		return `Chitchat cannot reach ${subject} right now. Nothing here will update until the connection returns.`;
+		return `Chitchat cannot reach ${subject} right now. Check your connection and reload the page.`;
 	}
 	if (reason === "capacity") {
 		return `Chitchat has too many live views open, so ${subject} stopped updating. Reload the page.`;
@@ -1425,6 +1719,7 @@ type ThreadPanel_Props = {
 	repliesLoaded: boolean;
 	repliesTruncated: boolean;
 	repliesError: string | null;
+	reactionCoverage: CompanionCoverageState;
 	reactionGroupsByTarget: Map<string, chat_ReactionGroup[]>;
 	memberNames: chat_MemberNamesApi;
 	/** Below 720px the panel covers the whole frame, so its way out reads as "back", not "close". */
@@ -1433,6 +1728,10 @@ type ThreadPanel_Props = {
 	onStorageFull: (message: string) => void;
 	onApplyLocalRoot: (doc: chat_Doc<chat_MessageValue>) => void;
 	onApplyLocalReply: (doc: chat_Doc<chat_MessageValue>) => void;
+	onRequestStart: () => void;
+	onRequestSettled: () => void;
+	sendInFlight: boolean;
+	announce: (text: string) => void;
 	onApplyReaction: (doc: chat_ReactionDoc) => void;
 	onClose: () => void;
 };
@@ -1454,6 +1753,8 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 		onDelivered: (doc) => {
 			props.onApplyLocalReply(doc);
 		},
+		onRequestStart: props.onRequestStart,
+		onRequestSettled: props.onRequestSettled,
 		onStorageFull: props.onStorageFull,
 	});
 
@@ -1474,6 +1775,10 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 	const handle_key_down = (event: KeyboardEvent<HTMLElement>) => {
 		if (event.key === "Escape") {
 			event.stopPropagation();
+			if (props.sendInFlight) {
+				props.announce("Wait for pending message changes to finish before closing the thread.");
+				return;
+			}
 			props.onClose();
 		}
 	};
@@ -1482,12 +1787,18 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 	const replyEntries = build_message_entries([...replies].reverse(), Date.now());
 
 	return (
-		<section className="thread" aria-label="Thread" onKeyDown={handle_key_down}>
+		<section className="thread" aria-label="Thread" tabIndex={-1} onKeyDown={handle_key_down}>
 			<div className="thread-head">
 				<h3 className="thread-title">Thread</h3>
 				{/* Below 720px the panel covers the frame and the drawer toggle is hidden, so this is
 				    the only way out — say "back", which is what it does there. */}
-				<button ref={closeButtonRef} type="button" className="button" onClick={props.onClose}>
+				<button
+					ref={closeButtonRef}
+					type="button"
+					className="button"
+					disabled={props.sendInFlight}
+					onClick={props.onClose}
+				>
 					{props.isNarrow ? "Back to messages" : "Close thread"}
 				</button>
 			</div>
@@ -1501,13 +1812,16 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 					memberNames={memberNames}
 					isContinuation={false}
 					authorName={memberNames.get(root.createdBy)}
-					reactionGroups={props.reactionGroupsByTarget.get(root.key) ?? []}
+					reactionGroups={reaction_groups_for_row(props.reactionCoverage, props.reactionGroupsByTarget, root.key)}
 					replyCount={null}
 					replyLatestAt={null}
 					repliesHasMore={false}
 					onOpenThread={null}
+					threadDisabled={false}
 					replyTriggerRef={null}
 					onApplyLocal={props.onApplyLocalRoot}
+					onRequestStart={props.onRequestStart}
+					onRequestSettled={props.onRequestSettled}
 					onApplyReaction={props.onApplyReaction}
 					onStorageFull={props.onStorageFull}
 				/>
@@ -1526,17 +1840,17 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 				<div className="channel-status" role="status">
 					Loading replies…
 				</div>
-			) : replies.length === 0 && queue.pending.length === 0 ? (
+			) : null}
+			{repliesLoaded && replies.length === 0 && queue.pending.length === 0 ? (
 				<div className="channel-status">No replies yet</div>
-			) : (
+			) : replies.length > 0 || queue.pending.length > 0 ? (
 				<ul className="message-list thread-replies">
 					{replyEntries.map((entry) =>
 						entry.kind === "divider" ? (
 							<li key={entry.key} className="day-divider">
 								{entry.label}
 							</li>
-						) : entry.kind === "new" ? // A thread panel passes no read cursor, so this entry never reaches it.
-						null : (
+						) : entry.kind === "new" ? null : ( // A thread panel passes no read cursor, so this entry never reaches it.
 							<MessageRow
 								key={entry.doc.key}
 								client={client}
@@ -1547,13 +1861,20 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 								memberNames={memberNames}
 								isContinuation={entry.isContinuation}
 								authorName={memberNames.get(entry.doc.createdBy)}
-								reactionGroups={props.reactionGroupsByTarget.get(entry.doc.key) ?? []}
+								reactionGroups={reaction_groups_for_row(
+									props.reactionCoverage,
+									props.reactionGroupsByTarget,
+									entry.doc.key,
+								)}
 								replyCount={null}
 								replyLatestAt={null}
 								repliesHasMore={false}
 								onOpenThread={null}
+								threadDisabled={false}
 								replyTriggerRef={null}
 								onApplyLocal={props.onApplyLocalReply}
+								onRequestStart={props.onRequestStart}
+								onRequestSettled={props.onRequestSettled}
 								onApplyReaction={props.onApplyReaction}
 								onStorageFull={props.onStorageFull}
 							/>
@@ -1563,7 +1884,7 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 						<PendingRow key={pending.clientRequestId} pending={pending} onRetry={() => queue.retry(pending)} />
 					))}
 				</ul>
-			)}
+			) : null}
 			{props.storageFull !== null ? (
 				<div className="channel-status is-error" role="alert">
 					{props.storageFull}
@@ -1588,6 +1909,8 @@ type ChannelView_Props = {
 	client: BonoboUiFrontendClient;
 	userId: string;
 	channel: chat_Doc<chat_ChannelValue>;
+	/** Restart private reads in place after this member's scope membership changes. */
+	readGeneration: number;
 	memberNames: chat_MemberNamesApi;
 	announce: (text: string) => void;
 	/**
@@ -1598,6 +1921,10 @@ type ChannelView_Props = {
 	setThreadRootKey: (key: string | null) => void;
 	/** True while `(max-width: 719px)` matches, where the thread panel covers the whole frame. */
 	isNarrow: boolean;
+	/** App owns the stable in-flight count so navigation cannot unmount this send queue. */
+	onRequestStart: () => void;
+	onRequestSettled: () => void;
+	sendInFlight: boolean;
 	/**
 	 * Called with the newest rendered message's timestamp after every delivery. The app debounces
 	 * it into this member's read-cursor write, so what was on screen stays read after a reload.
@@ -1611,12 +1938,6 @@ type ChannelView_Props = {
 	 */
 	openedAtLastReadAt: number | null;
 };
-
-/**
- * How much newer a private send must be than the channel doc's `lastMessageAt` before the sender
- * stamps it again. One stamp per burst keeps the doubled write inside the send rate budget.
- */
-const PRIVATE_STAMP_DEBOUNCE_MS = 15_000;
 
 /** The loadOlder/unsubscribe handle `client.data.watchWindow` returns. */
 type WindowHandle = ReturnType<BonoboUiFrontendClient["data"]["watchWindow"]>;
@@ -1637,6 +1958,13 @@ type CompanionCoverageState = {
 	death: { reason?: string } | null;
 };
 
+const INITIAL_COMPANION_COVERAGE: CompanionCoverageState = {
+	hasMore: true,
+	deepestRoot: null,
+	incomplete: false,
+	death: null,
+};
+
 /**
  * Whether a companion HTTP list can speak for one row. A finished list covers everything;
  * otherwise it covers only roots strictly newer than the deepest root it delivered.
@@ -1650,13 +1978,6 @@ function companion_covers_root(coverage: CompanionCoverageState, rootKey: string
 
 	return !coverage.hasMore || (coverage.deepestRoot !== null && rootKey < coverage.deepestRoot);
 }
-
-/**
- * Message and reply keys are `<channel uuid (36)>:<inverted ms (13)>:<rand (4)>...`, so the
- * first 55 characters of any chitchat-minted key name its root message. Companion keys
- * (reactions, replies) extend a root key, so the same slice normalizes them all.
- */
-const ROOT_KEY_LENGTH = 55;
 
 /** How many documents one deep-history page asks for. The route's own ceiling is 100. */
 const DEEP_HISTORY_PAGE_SIZE = 100;
@@ -1736,7 +2057,7 @@ function reaction_groups_for_row(
 	coverage: CompanionCoverageState,
 	groupsByTarget: Map<string, chat_ReactionGroup[]>,
 	key: string,
-): chat_ReactionGroup[] | "unknown" {
+): chat_ReactionGroup[] | "pending" | "unknown" {
 	// A dead or gapped list cannot speak for any row, even one we already grouped.
 	if (coverage.incomplete || coverage.death !== null) {
 		return "unknown";
@@ -1745,10 +2066,11 @@ function reaction_groups_for_row(
 	if (groups !== undefined && groups.length > 0) {
 		return groups;
 	}
-	if (companion_covers_root(coverage, key.slice(0, ROOT_KEY_LENGTH))) {
+	const rootKey = chat_root_message_key(key);
+	if (rootKey !== null && companion_covers_root(coverage, rootKey)) {
 		return groups ?? [];
 	}
-	return "unknown";
+	return "pending";
 }
 
 function reply_count_for_row(
@@ -1763,7 +2085,8 @@ function reply_count_for_row(
 	if (entry !== undefined && entry.count > 0) {
 		return entry.count;
 	}
-	if (companion_covers_root(coverage, key.slice(0, ROOT_KEY_LENGTH))) {
+	const rootKey = chat_root_message_key(key);
+	if (rootKey !== null && companion_covers_root(coverage, rootKey)) {
 		return entry?.count ?? 0;
 	}
 	return "unknown";
@@ -1825,33 +2148,26 @@ export function ChannelView(props: ChannelView_Props) {
 		client,
 		userId,
 		channel,
+		readGeneration,
 		memberNames,
 		announce,
 		threadRootKey,
 		setThreadRootKey,
 		isNarrow,
+		onRequestStart,
+		onRequestSettled,
+		sendInFlight,
 		onNewestVisible,
 		openedAtLastReadAt,
-	} =
-		props;
+	} = props;
 	const [messages, setMessages] = useState<chat_Doc<chat_MessageValue>[]>([]);
 	const [messagesLoaded, setMessagesLoaded] = useState(false);
 	const [messagesDeath, setMessagesDeath] = useState<{ reason?: string } | null>(null);
 	const [messagesWindow, setMessagesWindow] = useState({ hasMore: false, atCapacity: false, incomplete: false });
 	const [reactionDocs, setReactionDocs] = useState<chat_ReactionDoc[]>([]);
 	const [channelReplies, setChannelReplies] = useState<chat_Doc<chat_MessageValue>[]>([]);
-	const [reactionCoverage, setReactionCoverage] = useState<CompanionCoverageState>({
-		hasMore: false,
-		deepestRoot: null,
-		incomplete: false,
-		death: null,
-	});
-	const [replyCoverage, setReplyCoverage] = useState<CompanionCoverageState>({
-		hasMore: false,
-		deepestRoot: null,
-		incomplete: false,
-		death: null,
-	});
+	const [reactionCoverage, setReactionCoverage] = useState<CompanionCoverageState>(INITIAL_COMPANION_COVERAGE);
+	const [replyCoverage, setReplyCoverage] = useState<CompanionCoverageState>(INITIAL_COMPANION_COVERAGE);
 	const [storageFull, setStorageFull] = useState<string | null>(null);
 	const [deepHistory, setDeepHistory] = useState<DeepHistoryState>({ kind: "idle" });
 	const [threadWidth, setThreadWidth] = useState(DEFAULT_THREAD_WIDTH);
@@ -1859,6 +2175,7 @@ export function ChannelView(props: ChannelView_Props) {
 	const [messagesSince, setMessagesSince] = useState<number | null>(null);
 	const [repliesSince, setRepliesSince] = useState<number | null>(null);
 	const [reactionsSince, setReactionsSince] = useState<number | null>(null);
+	const [feedsReadGeneration, setFeedsReadGeneration] = useState<number | null>(null);
 	const [threadRepliesLoaded, setThreadRepliesLoaded] = useState(false);
 	const [threadRepliesTruncated, setThreadRepliesTruncated] = useState(false);
 	const [threadRepliesError, setThreadRepliesError] = useState<string | null>(null);
@@ -1873,6 +2190,8 @@ export function ChannelView(props: ChannelView_Props) {
 	// HTTP page merges older keys into that store forever, and reading the fencepost back off it
 	// would drag both companions into paging history the window never asked for.
 	const windowOldestKeyRef = useRef<string | null>(null);
+	/** The raw window frontier held when the member asked the SDK to extend older history. */
+	const windowHistoryFenceRef = useRef<string | null>(null);
 	/** The last key the previous HTTP page returned. The next page continues strictly after it. */
 	const httpOldestKeyRef = useRef<string | null>(null);
 	const companionHttpFenceRef = useRef<{ reactions: string | null; replies: string | null }>({
@@ -1883,6 +2202,7 @@ export function ChannelView(props: ChannelView_Props) {
 		reactions: false,
 		replies: false,
 	});
+	const companionGenerationRef = useRef(0);
 	const companionRetryRef = useRef<{
 		reactions: { delayMs: number; timer: ReturnType<typeof setTimeout> | null };
 		replies: { delayMs: number; timer: ReturnType<typeof setTimeout> | null };
@@ -1901,8 +2221,23 @@ export function ChannelView(props: ChannelView_Props) {
 	const logRef = useRef<HTMLDivElement | null>(null);
 	const newestKeyRef = useRef<string | null>(null);
 	const pendingCountRef = useRef(0);
+	const requestCountRef = useRef(0);
 	const channelPrefix = chat_message_key_prefix(channel.key);
 	const privateScopeId = chat_channel_is_private(channel.key) ? channel.key : undefined;
+
+	// Update a ref before App state paints, so a same-turn thread action cannot unmount the request.
+	const handle_request_start = () => {
+		requestCountRef.current += 1;
+		onRequestStart();
+	};
+
+	const handle_request_settled = () => {
+		if (requestCountRef.current === 0) {
+			return;
+		}
+		requestCountRef.current -= 1;
+		onRequestSettled();
+	};
 
 	// The announcer reads the channel name through this ref so a rename does not sit in the
 	// messages effect's dependencies: any member renaming the channel in a loop would
@@ -1933,28 +2268,39 @@ export function ChannelView(props: ChannelView_Props) {
 
 	const set_companion_coverage = (
 		collection: "reactions" | "replies",
-		pageDocs: { key: string }[],
+		pageDocs: ({ key: string } & { targetKey?: string })[],
+		rawPageDocs: { key: string }[],
 		isDone: boolean,
 		incomplete: boolean,
 	) => {
+		const lastDoc = pageDocs.at(-1);
 		const deepestRoot =
-			pageDocs.length > 0 ? pageDocs[pageDocs.length - 1]!.key.slice(0, ROOT_KEY_LENGTH) : null;
-		if (pageDocs.length > 0) {
-			companionHttpFenceRef.current[collection] = pageDocs[pageDocs.length - 1]!.key;
+			lastDoc === undefined
+				? null
+				: collection === "reactions"
+					? lastDoc.targetKey === undefined
+						? null
+						: chat_root_message_key(lastDoc.targetKey)
+					: chat_reply_root_key(lastDoc.key);
+		if (rawPageDocs.length > 0) {
+			// Page from the last valid envelope, not the last value this Chitchat version knows.
+			// A full page of foreign values must not hide older valid reactions or replies.
+			companionHttpFenceRef.current[collection] = rawPageDocs[rawPageDocs.length - 1]!.key;
 		}
 		const next: CompanionCoverageState = {
 			// An empty page with isDone still false would otherwise re-request the same range forever.
-			hasMore: pageDocs.length === 0 ? false : !isDone,
+			hasMore: rawPageDocs.length === 0 ? false : !isDone,
 			deepestRoot:
 				deepestRoot ??
-				(collection === "reactions" ? reactionsCoverageRef.current?.deepestRoot : repliesCoverageRef.current?.deepestRoot) ??
+				(collection === "reactions"
+					? reactionsCoverageRef.current?.deepestRoot
+					: repliesCoverageRef.current?.deepestRoot) ??
 				null,
 			incomplete,
 			// Keep a dead feed dead. An HTTP list that was already in flight must not wipe the
 			// death flag, or chips look live again while later hearts never arrive.
 			death:
-				(collection === "reactions" ? reactionsCoverageRef.current?.death : repliesCoverageRef.current?.death) ??
-				null,
+				(collection === "reactions" ? reactionsCoverageRef.current?.death : repliesCoverageRef.current?.death) ?? null,
 		};
 		if (collection === "reactions") {
 			reactionsCoverageRef.current = next;
@@ -2011,6 +2357,7 @@ export function ChannelView(props: ChannelView_Props) {
 			return;
 		}
 		companionInflightRef.current[collection] = true;
+		const generation = companionGenerationRef.current;
 		const fence = companionHttpFenceRef.current[collection];
 		list_plugin_documents(client, {
 			collection,
@@ -2019,10 +2366,10 @@ export function ChannelView(props: ChannelView_Props) {
 			limit: DEEP_HISTORY_PAGE_SIZE,
 		})
 			.then((page) => {
-				companionInflightRef.current[collection] = false;
-				if (!companionMountedRef.current) {
+				if (!companionMountedRef.current || companionGenerationRef.current !== generation) {
 					return;
 				}
+				companionInflightRef.current[collection] = false;
 				if (collection === "reactions") {
 					const store = reactionsStoreRef.current;
 					if (store === null) {
@@ -2030,7 +2377,11 @@ export function ChannelView(props: ChannelView_Props) {
 					}
 					const validated = store.apply_window(page.documents);
 					setReactionDocs(store.get_sorted());
-					set_companion_coverage("reactions", validated, page.isDone, false);
+					const incomplete = page.documents.length === 0 && !page.isDone;
+					set_companion_coverage("reactions", validated, page.documents, page.isDone, incomplete);
+					if (incomplete) {
+						schedule_companion_retry("reactions");
+					}
 				} else {
 					const store = repliesStoreRef.current;
 					if (store === null) {
@@ -2038,16 +2389,20 @@ export function ChannelView(props: ChannelView_Props) {
 					}
 					const validated = store.apply_window(page.documents);
 					setChannelReplies(store.get_sorted());
-					set_companion_coverage("replies", validated, page.isDone, false);
+					const incomplete = page.documents.length === 0 && !page.isDone;
+					set_companion_coverage("replies", validated, page.documents, page.isDone, incomplete);
+					if (incomplete) {
+						schedule_companion_retry("replies");
+					}
 				}
 				evaluate_companion_catch_up();
 			})
 			.catch(() => {
-				companionInflightRef.current[collection] = false;
-				if (!companionMountedRef.current) {
+				if (!companionMountedRef.current || companionGenerationRef.current !== generation) {
 					return;
 				}
-				set_companion_coverage(collection, [], true, true);
+				companionInflightRef.current[collection] = false;
+				set_companion_coverage(collection, [], [], true, true);
 				// Failure recovery with backoff, not a periodic refresh: one timer, stop on
 				// success, never on a dead feed. The SDK can deliver a cached snapshot before
 				// this list fails, and then the feed will not fire again, so a quiet tab still
@@ -2088,11 +2443,13 @@ export function ChannelView(props: ChannelView_Props) {
 		}
 	};
 
-	const start_feeds_if_needed = (windowDocs: { updatedAt: number }[]) => {
+	const start_feeds_if_needed = (rawWindowDocs: { updatedAt: number }[]) => {
 		if (feedsStartedRef.current) {
 			return;
 		}
-		const fence = newest_updated_at(windowDocs);
+		// Foreign values still occupy the shared store. Use their valid envelopes so they cannot
+		// stop every change feed when this Chitchat version drops the whole visible window.
+		const fence = newest_updated_at(rawWindowDocs);
 		if (fence === null) {
 			return;
 		}
@@ -2100,6 +2457,7 @@ export function ChannelView(props: ChannelView_Props) {
 		// One fence for all three feeds: the newest messages-window updatedAt. Companion lists
 		// do not pick their own. A lower fence only over-delivers, and the merge already dedups.
 		// The query is inclusive, so subscribe at this value as-is — not plus one.
+		setFeedsReadGeneration(readGeneration);
 		setMessagesSince(fence);
 		setRepliesSince(fence);
 		setReactionsSince(fence);
@@ -2109,10 +2467,14 @@ export function ChannelView(props: ChannelView_Props) {
 	// The accumulating store stays as the merge seam for optimistic local echoes (its
 	// revision-forward rule), plus remote-arrival detection for the announcer.
 	useEffect(() => {
-		const store = chat_create_accumulating_store(chat_validate_message_doc);
+		let active = true;
+		let announcementVersion = 0;
+		// Keep cached rows and the mounted composer while a membership change replaces the reads.
+		const store = messagesStoreRef.current ?? chat_create_accumulating_store(chat_validate_message_doc);
 		messagesStoreRef.current = store;
-		repliesStoreRef.current = chat_create_accumulating_store(chat_validate_message_doc);
-		reactionsStoreRef.current = chat_create_accumulating_store(chat_validate_reaction_doc);
+		repliesStoreRef.current ??= chat_create_accumulating_store(chat_validate_message_doc);
+		reactionsStoreRef.current ??= chat_create_accumulating_store(chat_validate_reaction_doc);
+		companionGenerationRef.current += 1;
 		companionMountedRef.current = true;
 		feedsStartedRef.current = false;
 		companionHttpFenceRef.current = { reactions: null, replies: null };
@@ -2121,9 +2483,13 @@ export function ChannelView(props: ChannelView_Props) {
 		reset_companion_retry("replies");
 		reactionsCoverageRef.current = null;
 		repliesCoverageRef.current = null;
+		setReactionCoverage(INITIAL_COMPANION_COVERAGE);
+		setReplyCoverage(INITIAL_COMPANION_COVERAGE);
+		setFeedsReadGeneration(null);
 		setMessagesSince(null);
 		setRepliesSince(null);
 		setReactionsSince(null);
+		windowHistoryFenceRef.current = null;
 		const watchWindow = client.data.watchWindow(
 			{ collection: "messages", keyPrefix: chat_message_key_prefix(channel.key), pageSize: 100 },
 			(update, info) => {
@@ -2131,19 +2497,17 @@ export function ChannelView(props: ChannelView_Props) {
 					setMessagesDeath({ reason: info?.reason });
 					return;
 				}
+				setMessagesDeath(null);
 				const windowDocs = store.apply_window(update.docs);
 				setMessages(store.get_sorted());
 				setMessagesLoaded(true);
 				setMessagesWindow({ hasMore: update.hasMore, atCapacity: update.atCapacity, incomplete: update.incomplete });
-				// Read the frontier off this delivery, not off the merged store: the store also holds
-				// every row an HTTP page added below the window, and the companions must not chase those.
-				const windowOldestKey = windowDocs.reduce<string | null>(
-					(oldest, doc) => (oldest === null || doc.key > oldest ? doc.key : oldest),
-					null,
-				);
+				// Read the server-ordered raw frontier off this delivery. A foreign value still occupies
+				// the shared store and must not hide older valid messages or companion rows.
+				const windowOldestKey = update.docs.at(-1)?.key ?? null;
 				windowOldestKeyRef.current = windowOldestKey;
-				oldestRootRef.current = windowOldestKey === null ? null : windowOldestKey.slice(0, ROOT_KEY_LENGTH);
-				start_feeds_if_needed(windowDocs);
+				oldestRootRef.current = windowOldestKey === null ? null : chat_root_message_key(windowOldestKey);
+				start_feeds_if_needed(update.docs);
 				if (reactionsCoverageRef.current === null && !companionInflightRef.current.reactions) {
 					list_companion("reactions");
 				}
@@ -2158,6 +2522,25 @@ export function ChannelView(props: ChannelView_Props) {
 					seenKeysRef.current = new Set(windowDocs.map((doc) => doc.key));
 					return;
 				}
+				const historyFence = windowHistoryFenceRef.current;
+				if (historyFence !== null) {
+					const historyFenceIndex = update.docs.findIndex((doc) => doc.key === historyFence);
+					if (historyFenceIndex < 0) {
+						windowHistoryFenceRef.current = null;
+					} else {
+						// The host orders this array. Rows below the old frontier are loaded history, while a
+						// concurrent newer row is above it and must still reach the announcer.
+						const historyDocs = update.docs.slice(historyFenceIndex + 1);
+						for (const historyDoc of historyDocs) {
+							seen.add(historyDoc.key);
+						}
+						// The SDK can report atCapacity before its sixth tail has delivered. Keep the
+						// fence through that state so the later tail still reads as history.
+						if (historyDocs.length > 0 || !update.hasMore) {
+							windowHistoryFenceRef.current = null;
+						}
+					}
+				}
 				// Announce only messages authored by OTHER members. The user's own sends must
 				// never reach the announcer — the log itself is aria-live="off" for the same reason.
 				const arrivals = windowDocs.filter(
@@ -2166,17 +2549,24 @@ export function ChannelView(props: ChannelView_Props) {
 				for (const doc of windowDocs) {
 					seen.add(doc.key);
 				}
+				const currentAnnouncementVersion = arrivals.length > 0 ? ++announcementVersion : announcementVersion;
 				if (arrivals.length === 1) {
 					const arrival = arrivals[0];
 					memberNames
 						.resolve([arrival.createdBy])
 						.then(() => {
+							if (!active || currentAnnouncementVersion !== announcementVersion) {
+								return;
+							}
 							const name = memberNames.get(arrival.createdBy) ?? null;
 							const text = arrival.value.text;
 							const preview = text.length > 80 ? `${text.slice(0, 80)}…` : text;
 							announce(`${name ?? "Former member"}: ${preview}`);
 						})
 						.catch(() => {
+							if (!active || currentAnnouncementVersion !== announcementVersion) {
+								return;
+							}
 							announce(`New message in #${channelNameRef.current}`);
 						});
 				} else if (arrivals.length > 1) {
@@ -2187,18 +2577,19 @@ export function ChannelView(props: ChannelView_Props) {
 		);
 		messagesWindowRef.current = watchWindow;
 		return () => {
+			active = false;
 			companionMountedRef.current = false;
 			reset_companion_retry("reactions");
 			reset_companion_retry("replies");
 			messagesWindowRef.current = null;
 			watchWindow.unsubscribe();
 		};
-	}, [client, channel.key, userId, memberNames, announce]);
+	}, [client, channel.key, readGeneration, userId, memberNames, announce]);
 
 	const feed_scope_args = privateScopeId === undefined ? {} : { scopeId: privateScopeId };
 
 	useEffect(() => {
-		if (messagesSince === null) {
+		if (messagesSince === null || feedsReadGeneration !== readGeneration) {
 			return;
 		}
 		const unsubscribe = client.data.watchChanges(
@@ -2208,6 +2599,7 @@ export function ChannelView(props: ChannelView_Props) {
 					setMessagesDeath({ reason: info?.reason });
 					return;
 				}
+				setMessagesDeath(null);
 				const store = messagesStoreRef.current;
 				if (store === null) {
 					return;
@@ -2239,10 +2631,10 @@ export function ChannelView(props: ChannelView_Props) {
 			},
 		);
 		return unsubscribe;
-	}, [client, channel.key, messagesSince, privateScopeId, channelPrefix]);
+	}, [client, channel.key, messagesSince, feedsReadGeneration, readGeneration, privateScopeId, channelPrefix]);
 
 	useEffect(() => {
-		if (repliesSince === null) {
+		if (repliesSince === null || feedsReadGeneration !== readGeneration) {
 			return;
 		}
 		const unsubscribe = client.data.watchChanges(
@@ -2265,6 +2657,12 @@ export function ChannelView(props: ChannelView_Props) {
 				if (store === null) {
 					return;
 				}
+				const previous = repliesCoverageRef.current;
+				if (previous !== null && previous.death !== null) {
+					const next = { ...previous, death: null };
+					repliesCoverageRef.current = next;
+					setReplyCoverage(next);
+				}
 				const mine = docs_in_prefix(update.docs, channelPrefix);
 				store.apply_window(mine);
 				setChannelReplies(store.get_sorted());
@@ -2281,10 +2679,10 @@ export function ChannelView(props: ChannelView_Props) {
 			},
 		);
 		return unsubscribe;
-	}, [client, channel.key, repliesSince, privateScopeId, channelPrefix]);
+	}, [client, channel.key, repliesSince, feedsReadGeneration, readGeneration, privateScopeId, channelPrefix]);
 
 	useEffect(() => {
-		if (reactionsSince === null) {
+		if (reactionsSince === null || feedsReadGeneration !== readGeneration) {
 			return;
 		}
 		const unsubscribe = client.data.watchChanges(
@@ -2307,6 +2705,12 @@ export function ChannelView(props: ChannelView_Props) {
 				if (store === null) {
 					return;
 				}
+				const previous = reactionsCoverageRef.current;
+				if (previous !== null && previous.death !== null) {
+					const next = { ...previous, death: null };
+					reactionsCoverageRef.current = next;
+					setReactionCoverage(next);
+				}
 				const mine = docs_in_prefix(update.docs, channelPrefix);
 				store.apply_window(mine);
 				setReactionDocs(store.get_sorted());
@@ -2323,7 +2727,7 @@ export function ChannelView(props: ChannelView_Props) {
 			},
 		);
 		return unsubscribe;
-	}, [client, channel.key, reactionsSince, privateScopeId, channelPrefix]);
+	}, [client, channel.key, reactionsSince, feedsReadGeneration, readGeneration, privateScopeId, channelPrefix]);
 
 	useEffect(() => {
 		const on_visibility = () => {
@@ -2371,43 +2775,7 @@ export function ChannelView(props: ChannelView_Props) {
 		return () => {
 			cancelled = true;
 		};
-	}, [client, threadRootKey]);
-
-	/**
-	 * §7.4's private-channel mitigation: after a successful append in a private channel the
-	 * sender stamps `lastMessageAt` on the channel doc, because a rangeless read never sees a
-	 * private scope and members with the channel closed have nothing else to say "unread" from.
-	 * Compare-and-set so a concurrent rename is not clobbered; a lost race parks the timestamp
-	 * and the effect below retries once from the fresher doc the channels watch delivers.
-	 */
-	const stampRetryRef = useRef<number | null>(null);
-	const stamp_last_message = (channelDoc: chat_Doc<chat_ChannelValue>, at: number) => {
-		client.data
-			.put({
-				collection: "channels",
-				key: channelDoc.key,
-				value: { ...channelDoc.value, lastMessageAt: at },
-				expectedRevision: channelDoc.revision,
-			})
-			.then((result) => {
-				if ("_nay" in result && result._nay.name === "conflict" && stampRetryRef.current === null) {
-					stampRetryRef.current = at;
-				}
-			})
-			.catch(() => {});
-	};
-
-	// The one retry of a conflicted stamp, fired when the channels watch delivers a fresher doc.
-	useEffect(() => {
-		const at = stampRetryRef.current;
-		if (at === null) {
-			return;
-		}
-		stampRetryRef.current = null;
-		if ((channel.value.lastMessageAt ?? 0) < at) {
-			stamp_last_message(channel, at);
-		}
-	}, [channel]);
+	}, [client, threadRootKey, readGeneration]);
 
 	const queue = use_send_queue({
 		client,
@@ -2418,15 +2786,9 @@ export function ChannelView(props: ChannelView_Props) {
 			messagesStoreRef.current?.apply_local(doc);
 			seenKeysRef.current?.add(doc.key);
 			setMessages(messagesStoreRef.current?.get_sorted() ?? []);
-			// Debounced: a burst of sends stamps once, so the doubled write stays inside the
-			// send rate budget.
-			if (
-				chat_channel_is_private(channel.key) &&
-				doc.timestamp - (channel.value.lastMessageAt ?? 0) >= PRIVATE_STAMP_DEBOUNCE_MS
-			) {
-				stamp_last_message(channel, doc.timestamp);
-			}
 		},
+		onRequestStart: handle_request_start,
+		onRequestSettled: handle_request_settled,
 		onStorageFull: setStorageFull,
 	});
 
@@ -2475,7 +2837,12 @@ export function ChannelView(props: ChannelView_Props) {
 	// The SDK window retains everything it loaded, so "load older" is one call on the window
 	// handle; the extended window arrives as a normal update.
 	const handle_load_older = () => {
-		messagesWindowRef.current?.loadOlder();
+		const window = messagesWindowRef.current;
+		if (window === null) {
+			return;
+		}
+		windowHistoryFenceRef.current = windowOldestKeyRef.current;
+		window.loadOlder();
 	};
 
 	/**
@@ -2512,15 +2879,25 @@ export function ChannelView(props: ChannelView_Props) {
 				if (store === null) {
 					return;
 				}
+				if (parsed.data.documents.length === 0 && !parsed.data.isDone) {
+					setDeepHistory({
+						kind: "failed",
+						message: "Older messages returned an incomplete page. Please retry.",
+						retryAt: null,
+					});
+					return;
+				}
+				const lastEnvelope = parsed.data.documents.at(-1);
+				if (lastEnvelope !== undefined) {
+					// Continue from the last valid envelope, even when this Chitchat version drops its value.
+					httpOldestKeyRef.current = lastEnvelope.key;
+				}
 				// The store merges by key, so a page that overlaps what is already held adds nothing.
 				const merged = store.apply_window(parsed.data.documents);
 				setMessages(store.get_sorted());
 				for (const doc of merged) {
 					// These rows are history. They must never reach the announcer as new arrivals.
 					seenKeysRef.current?.add(doc.key);
-					if (httpOldestKeyRef.current === null || doc.key > httpOldestKeyRef.current) {
-						httpOldestKeyRef.current = doc.key;
-					}
 				}
 				// `isDone` is the route's own exhaustion signal. A page that happens to be exactly
 				// full is not the end, and treating it as one would hide real history.
@@ -2645,11 +3022,21 @@ export function ChannelView(props: ChannelView_Props) {
 	};
 
 	const threadReplies =
-		threadRootKey === null
-			? []
-			: channelReplies.filter((doc) => chat_reply_root_key(doc.key) === threadRootKey);
+		threadRootKey === null ? [] : channelReplies.filter((doc) => chat_reply_root_key(doc.key) === threadRootKey);
+
+	const handle_open_thread = (root: chat_Doc<chat_MessageValue>) => {
+		if ((sendInFlight || requestCountRef.current > 0) && threadRootKey !== root.key) {
+			announce("Wait for pending message changes to finish before switching threads.");
+			return;
+		}
+		setThreadRootKey(root.key);
+	};
 
 	const handle_close_thread = () => {
+		if (sendInFlight || requestCountRef.current > 0) {
+			announce("Wait for pending message changes to finish before closing the thread.");
+			return;
+		}
 		const key = threadRootKey;
 		setThreadRootKey(null);
 		if (key !== null) {
@@ -2666,7 +3053,7 @@ export function ChannelView(props: ChannelView_Props) {
 	const threadWidthMaximum = Math.max(MIN_THREAD_WIDTH, bodyWidth - MIN_LOG_WIDTH);
 	const threadWidthEffective = clamp_thread_width(threadWidth);
 
-	if (messagesDeath !== null) {
+	if (messagesDeath !== null && privateScopeId === undefined) {
 		return (
 			<div className="channel">
 				<div className="channel-dead" role="alert">
@@ -2705,6 +3092,11 @@ export function ChannelView(props: ChannelView_Props) {
 					aria-live="off"
 					aria-label={`Messages in #${channel.value.name}`}
 				>
+					{messagesDeath !== null ? (
+						<div className="channel-status is-error" role="alert">
+							{watch_death_message(messagesDeath.reason, `messages in #${channel.value.name}`)}
+						</div>
+					) : null}
 					{messagesLoaded && messagesWindow.hasMore && !messagesWindow.atCapacity ? (
 						<div className="log-older">
 							<button type="button" className="button" onClick={handle_load_older}>
@@ -2730,8 +3122,7 @@ export function ChannelView(props: ChannelView_Props) {
 									type="button"
 									className="button"
 									disabled={
-										deepHistory.kind === "loading" ||
-										(deepHistory.kind === "failed" && deepHistory.retryAt !== null)
+										deepHistory.kind === "loading" || (deepHistory.kind === "failed" && deepHistory.retryAt !== null)
 									}
 									onClick={handle_load_older_http}
 								>
@@ -2798,17 +3189,14 @@ export function ChannelView(props: ChannelView_Props) {
 										memberNames={memberNames}
 										isContinuation={entry.isContinuation}
 										authorName={memberNames.get(entry.doc.createdBy)}
-										// Known groups still render even when the HTTP list has not reached
-										// this row yet. Empty + uncovered still reads as unknown.
-										reactionGroups={reaction_groups_for_row(
-											reactionCoverage,
-											reactionGroupsByTarget,
-											entry.doc.key,
-										)}
+										// Known groups still render while healthy coverage catches up. A
+										// healthy uncovered row stays neutral; only failure is unavailable.
+										reactionGroups={reaction_groups_for_row(reactionCoverage, reactionGroupsByTarget, entry.doc.key)}
 										replyCount={reply_count_for_row(replyCoverage, replyCounts, entry.doc.key)}
 										replyLatestAt={replyCounts.get(entry.doc.key)?.latestAt ?? null}
 										repliesHasMore={replyCoverage.hasMore}
-										onOpenThread={(root) => setThreadRootKey(root.key)}
+										onOpenThread={handle_open_thread}
+										threadDisabled={sendInFlight}
 										replyTriggerRef={(el) => {
 											if (el === null) {
 												replyTriggersRef.current.delete(entry.doc.key);
@@ -2817,6 +3205,8 @@ export function ChannelView(props: ChannelView_Props) {
 											}
 										}}
 										onApplyLocal={apply_local_message}
+										onRequestStart={handle_request_start}
+										onRequestSettled={handle_request_settled}
 										onApplyReaction={apply_local_reaction}
 										onStorageFull={setStorageFull}
 									/>
@@ -2860,6 +3250,7 @@ export function ChannelView(props: ChannelView_Props) {
 						repliesLoaded={threadRepliesLoaded}
 						repliesTruncated={threadRepliesTruncated}
 						repliesError={threadRepliesError}
+						reactionCoverage={reactionCoverage}
 						reactionGroupsByTarget={reactionGroupsByTarget}
 						memberNames={memberNames}
 						isNarrow={isNarrow}
@@ -2867,6 +3258,10 @@ export function ChannelView(props: ChannelView_Props) {
 						onStorageFull={setStorageFull}
 						onApplyLocalRoot={apply_local_message}
 						onApplyLocalReply={apply_local_reply}
+						onRequestStart={handle_request_start}
+						onRequestSettled={handle_request_settled}
+						sendInFlight={sendInFlight}
+						announce={announce}
 						onApplyReaction={apply_local_reaction}
 						onClose={handle_close_thread}
 					/>
@@ -2877,6 +3272,11 @@ export function ChannelView(props: ChannelView_Props) {
 			{storageFull !== null ? (
 				<div className="channel-status is-error" role="alert">
 					{storageFull}
+				</div>
+			) : null}
+			{sendInFlight ? (
+				<div className="channel-status" role="status">
+					Wait for pending message changes to finish before leaving this channel or thread.
 				</div>
 			) : null}
 			<Composer

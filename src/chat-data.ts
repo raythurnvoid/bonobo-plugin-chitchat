@@ -64,12 +64,13 @@ export function chat_key_timestamp(key: string): number | null {
  * `/` and not `:`, because every key parser here splits on `:` and counts the parts.
  */
 const PRIVATE_CHANNEL_KEY_PREFIX = "p/";
+const PRIVATE_CHANNEL_KEY_REGEX = /^p\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 /**
  * The collections a private channel's scope must cover.
  *
- * All four, in one `scopes.create` call. A scope covering three of them would leave the fourth
- * readable by the whole workspace, and the channel doc alone carries the channel's name.
+ * All four, in one `scopes.createWithDocument` call with the first channel document. A scope
+ * covering three of them would leave the fourth readable by the whole workspace.
  */
 export const chat_PRIVATE_CHANNEL_COLLECTIONS = ["channels", "messages", "replies", "reactions"];
 
@@ -84,9 +85,9 @@ export const chat_PRIVATE_CHANNEL_DISCLOSURE =
 	"Only the people added here can read it — and the organization owner, who can read everything in this workspace.";
 
 /**
- * Channel keys are client-generated so channels are created through `put`, which makes the
- * doc SHARED — any member can rename or archive it. A UUID is printable ASCII and short
- * enough (36 chars) to leave room for the message and reply segments under the 128 budget.
+ * Channel keys are client-generated. Public channels use `put`; private channels use the atomic
+ * scope-and-document call. Both store a SHARED document, so any member who can see the channel can
+ * rename or archive it. A UUID leaves room for message and reply segments under the 128 budget.
  */
 export function chat_create_channel_key(visibility: "public" | "private"): string {
 	const id = crypto.randomUUID();
@@ -101,6 +102,11 @@ export function chat_create_channel_key(visibility: "public" | "private"): strin
  */
 export function chat_channel_is_private(channelKey: string): boolean {
 	return channelKey.startsWith(PRIVATE_CHANNEL_KEY_PREFIX);
+}
+
+/** Whether a key has the exact shape Chitchat mints for one private channel and its scope. */
+export function chat_private_channel_key_is_valid(channelKey: string): boolean {
+	return PRIVATE_CHANNEL_KEY_REGEX.test(channelKey);
 }
 
 /** Message keys are `<channelKey>:<invertedPaddedMs>:<rand4>` — appended under this prefix. */
@@ -172,6 +178,18 @@ export function chat_reply_root_key(replyKey: string): string | null {
 	return rootKey;
 }
 
+/** The full root message key of a message or reply key, without assuming a channel-key length. */
+export function chat_root_message_key(key: string): string | null {
+	const parts = key.split(":");
+	if (parts.length === 3) {
+		return chat_key_timestamp(key) === null ? null : key;
+	}
+	if (parts.length === 5) {
+		return chat_reply_root_key(key);
+	}
+	return null;
+}
+
 /**
  * The caller key of the member's public read-cursor document in the `cursors` collection. It is
  * written with `putOwned` and the server appends `:<userId>`, so the stored key is `me:<userId>`
@@ -228,15 +246,6 @@ export const chat_channel_value_schema = z.object({
 	 * every null — so a required field would empty the channel list of an existing workspace.
 	 */
 	topic: z.string().max(chat_CHANNEL_TOPIC_MAX_LENGTH).optional(),
-	/**
-	 * When the newest message in this channel was sent, epoch ms. Only private channels carry it:
-	 * a rangeless read never sees a private scope, so this stamp is how a CLOSED private channel
-	 * can say "unread". The sender stamps it after a successful append, debounced to one write
-	 * per 15 s so a burst does not double its rate-limit cost. Public channels get the same
-	 * answer from the recent-messages feed instead. Optional: channels written before the stamp
-	 * existed carry none.
-	 */
-	lastMessageAt: z.number().optional(),
 });
 
 export type chat_ChannelValue = z.infer<typeof chat_channel_value_schema>;
@@ -349,10 +358,29 @@ export const chat_cursor_map_value_schema = z.object({
 
 export type chat_CursorMapValue = z.infer<typeof chat_cursor_map_value_schema>;
 
-/** A private channel's per-member read cursor: the newest read time, epoch ms. */
-export const chat_private_cursor_value_schema = z.object({
-	at: z.number(),
+/** Per-collection durable append positions covered by one private read cursor. */
+export const chat_private_activity_cursor_schema = z.object({
+	messages: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+	replies: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 });
+
+export type chat_PrivateActivityCursor = z.infer<typeof chat_private_activity_cursor_schema>;
+
+/**
+ * A private channel's per-member read cursor. `activity` drives unread state. `at` only places
+ * the New divider. Map an old time-only cursor to zero sequences so rollout may show extra unread
+ * state but can never hide a new append.
+ */
+export const chat_private_cursor_value_schema = z.union([
+	z.object({
+		at: z.number(),
+		activity: chat_private_activity_cursor_schema,
+	}),
+	z.object({ at: z.number(), activity: z.undefined().optional() }).transform((value) => ({
+		at: value.at,
+		activity: { messages: 0, replies: 0 },
+	})),
+]);
 
 // #endregion value schemas
 
@@ -483,8 +511,11 @@ export function chat_validate_reaction_doc(raw: unknown): chat_ReactionDoc | nul
 	};
 }
 
+/** A public cursor doc keeps ownership because the watch must accept only this member's owned row. */
+export type chat_CursorMapDoc = chat_Doc<chat_CursorMapValue> & { ownership: "shared" | "owned" };
+
 /** The member's public cursor doc, or null when the doc fails validation. */
-export function chat_validate_cursor_map_doc(raw: unknown): chat_Doc<chat_CursorMapValue> | null {
+export function chat_validate_cursor_map_doc(raw: unknown): chat_CursorMapDoc | null {
 	const envelope = public_doc_schema.safeParse(raw);
 	if (!envelope.success) {
 		return null;
@@ -501,6 +532,7 @@ export function chat_validate_cursor_map_doc(raw: unknown): chat_Doc<chat_Cursor
 		updatedBy: envelope.data.updatedBy,
 		createdAt: envelope.data.createdAt,
 		updatedAt: envelope.data.updatedAt,
+		ownership: envelope.data.ownership,
 		// Cursor keys are client-chosen with no server time tail; use createdAt instead.
 		timestamp: envelope.data.createdAt,
 	};
@@ -512,12 +544,13 @@ export type chat_PrivateCursorDoc = {
 	channelKey: string;
 	createdBy: string;
 	at: number;
+	activity: chat_PrivateActivityCursor;
 	revision: number;
 };
 
 export function chat_validate_private_cursor_doc(raw: unknown): chat_PrivateCursorDoc | null {
 	const envelope = public_doc_schema.safeParse(raw);
-	if (!envelope.success) {
+	if (!envelope.success || envelope.data.ownership !== "owned") {
 		return null;
 	}
 	const parsed = chat_parse_private_cursor_key(envelope.data.key);
@@ -533,6 +566,7 @@ export function chat_validate_private_cursor_doc(raw: unknown): chat_PrivateCurs
 		channelKey: parsed.channelKey,
 		createdBy: envelope.data.createdBy,
 		at: value.data.at,
+		activity: value.data.activity,
 		revision: envelope.data.revision,
 	};
 }
@@ -631,6 +665,11 @@ export function chat_format_recency(timestamp: number, now: number): string {
 
 // #region HTTP response schemas
 
+/** Response of `POST /api/v1/plugin-data/read`. */
+export const chat_plugin_data_read_response_schema = z.object({
+	document: public_doc_schema.nullable(),
+});
+
 export const chat_files_list_item_schema = z.object({
 	path: z.string(),
 	name: z.string(),
@@ -652,11 +691,11 @@ export const chat_files_list_response_schema = z.object({
 /**
  * Response of `POST /api/v1/plugin-data/list`, the deep-history fallback's envelope.
  *
- * `fetchJson` resolves `unknown`, and the accumulating store validates each **document** and never
- * the envelope around them. Without this schema the page would read `documents` off an `unknown`.
+ * `fetchJson` resolves `unknown`. Validate each public-document envelope here so paging can use its
+ * key even when the collection-specific validator later drops its value.
  */
 export const chat_plugin_data_list_response_schema = z.object({
-	documents: z.array(z.unknown()),
+	documents: z.array(public_doc_schema),
 	cursor: z.string().nullable(),
 	isDone: z.boolean(),
 });

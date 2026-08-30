@@ -1,8 +1,18 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { BonoboUiFrontendClient, BonoboUiTheme } from "bonobo-plugin-sdk/frontend";
+import type {
+	BonoboUiFrontendClient,
+	BonoboUiScopePrincipal,
+	BonoboUiScopePrincipalListResult,
+	BonoboUiTheme,
+} from "bonobo-plugin-sdk/frontend";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App } from "./app";
-import { chat_ANONYMOUS_MEMBER_LABEL, chat_mention_roster_refusal_copy, chat_PRIVATE_CHANNEL_COLLECTIONS } from "./chat-data";
+import {
+	chat_ANONYMOUS_MEMBER_LABEL,
+	chat_mention_roster_refusal_copy,
+	chat_PRIVATE_CHANNEL_COLLECTIONS,
+} from "./chat-data";
 
 function inv(epochMs: number): string {
 	return String(9_999_999_999_999 - epochMs).padStart(13, "0");
@@ -35,11 +45,11 @@ function channel_doc(
 }
 
 /** This member's own read cursor for one private channel, as the scope's channels read delivers it. */
-function private_cursor_doc(channelKey: string, at: number, revision = 1) {
+function private_cursor_doc(channelKey: string, at: number, revision = 1, activity = { messages: 0, replies: 0 }) {
 	return {
 		collection: "channels",
 		key: `${channelKey}:read:user_me`,
-		value: { at },
+		value: { at, activity },
 		revision,
 		createdBy: "user_me",
 		updatedBy: "user_me",
@@ -47,6 +57,10 @@ function private_cursor_doc(channelKey: string, at: number, revision = 1) {
 		createdAt: 1,
 		updatedAt: 1,
 	};
+}
+
+function legacy_private_cursor_doc(channelKey: string, at: number, revision = 1) {
+	return { ...private_cursor_doc(channelKey, at, revision), value: { at } };
 }
 
 /** The member's public cursor map doc, as the cursors watch delivers it. */
@@ -128,7 +142,14 @@ function watch_update(docs: unknown[], truncated = false): WatchUpdate {
 }
 
 type RecentSub = {
-	opts: { collection: string; limit: number; order?: "asc" | "desc"; since?: number; before?: number; scopeId?: string };
+	opts: {
+		collection: string;
+		limit: number;
+		order?: "asc" | "desc";
+		since?: number;
+		before?: number;
+		scopeId?: string;
+	};
 	onUpdate: (update: WatchUpdate | null, info?: WatchDeathInfo) => void;
 	unsubscribed: boolean;
 };
@@ -162,8 +183,24 @@ type KeyOpts = { collection: string; key: string };
 type MembersListResult =
 	| { _yay: { members: { userId: string; displayName: string | null }[]; cursor: string | null } }
 	| { _nay: { name: string; message: string } };
+type ScopeChangeResult =
+	| { _yay: { scopeId: string; deleted: boolean; membershipRevision: number } }
+	| { _nay: { name?: string; message: string } };
 type FetchInit = { method?: string; headers?: Record<string, string>; body?: Record<string, unknown> };
-type ScopeEntry = { scopeId: string; keyPrefix: string; collections: string[]; level: "member" | "manage" };
+type ScopeEntry = {
+	scopeId: string;
+	keyPrefix: string;
+	collections: string[];
+	level: "member" | "manage";
+	membershipRevision: number;
+	appendActivity: { collection: string; at: number; createdByUserId: string; sequence: number }[];
+};
+type ScopeFixture = Omit<ScopeEntry, "membershipRevision" | "appendActivity"> & {
+	membershipRevision?: number;
+	appendActivity?: (Omit<ScopeEntry["appendActivity"][number], "sequence"> & { sequence?: number })[];
+};
+type ScopeChangeOpts = { scopeId: string; expectedPrincipalCount?: number };
+type ScopeWatchCallback = (scopes: ScopeEntry[] | null, info?: WatchDeathInfo) => void;
 
 function make_harness() {
 	let putRevision = 1;
@@ -173,6 +210,12 @@ function make_harness() {
 	const changes: ChangesSub[] = [];
 	const themeListeners: ((theme: BonoboUiTheme) => void)[] = [];
 	const names: Record<string, string | null> = { user_me: "Me", user_other: "Bob", user_third: "Cleo" };
+	const scopeMembershipRevisions = new Map<string, number>();
+	const next_scope_membership_revision = (scopeId: string) => {
+		const revision = (scopeMembershipRevisions.get(scopeId) ?? 0) + 1;
+		scopeMembershipRevisions.set(scopeId, revision);
+		return revision;
+	};
 	/**
 	 * Every call the page makes that changes or reads a scope, in order, next to the data writes.
 	 * The order is the point: a channel document written before its scope exists can never be made
@@ -182,7 +225,7 @@ function make_harness() {
 	/** What `scopes.listPrincipals` answers per scope. A missing entry answers null, as the server does. */
 	const scopePrincipals = new Map<string, { userId: string; level: "member" | "manage" }[]>();
 	/** Live subscribers to `scopes.watchMine`, so a test can hand the page a private range. */
-	const scopeWatchers: ((scopes: ScopeEntry[] | null) => void)[] = [];
+	const scopeWatchers: ScopeWatchCallback[] = [];
 	const client = {
 		context: {
 			kind: "page",
@@ -267,32 +310,81 @@ function make_harness() {
 				// The server puts the creator in with `manage`, so the fake does too — the people
 				// dialog decides whether to offer its controls from exactly that.
 				scopePrincipals.set(opts.scopeId, [{ userId: "user_me", level: "manage" }]);
-				return { _yay: { scopeId: opts.scopeId } };
+				return {
+					_yay: {
+						scopeId: opts.scopeId,
+						deleted: false,
+						membershipRevision: next_scope_membership_revision(opts.scopeId),
+					},
+				};
 			}),
-			setPrincipal: vi.fn(async (opts: { scopeId: string; userId: string; level: "member" | "manage" }) => {
+			createWithDocument: vi.fn<
+				(opts: {
+					scopeId: string;
+					collections: string[];
+					keyPrefix: string;
+					principals: { userId: string; level: "member" | "manage" }[];
+					document: { collection: string; key: string; value: Record<string, unknown> };
+				}) => Promise<ScopeChangeResult>
+			>(async (opts) => {
+				calls.push({ op: "scopes.createWithDocument", args: { ...opts } });
+				scopePrincipals.set(opts.scopeId, [{ userId: "user_me", level: "manage" }, ...opts.principals]);
+				return {
+					_yay: {
+						scopeId: opts.scopeId,
+						deleted: false,
+						membershipRevision: next_scope_membership_revision(opts.scopeId),
+					},
+				};
+			}),
+			setPrincipal: vi.fn<
+				(opts: { scopeId: string; userId: string; level: "member" | "manage" }) => Promise<ScopeChangeResult>
+			>(async (opts) => {
 				calls.push({ op: "scopes.setPrincipal", args: { ...opts } });
 				const current = scopePrincipals.get(opts.scopeId) ?? [];
 				scopePrincipals.set(opts.scopeId, [
 					...current.filter((principal) => principal.userId !== opts.userId),
 					{ userId: opts.userId, level: opts.level },
 				]);
-				return { _yay: { scopeId: opts.scopeId } };
+				return {
+					_yay: {
+						scopeId: opts.scopeId,
+						deleted: false,
+						membershipRevision: next_scope_membership_revision(opts.scopeId),
+					},
+				};
 			}),
-			removePrincipal: vi.fn(async (opts: { scopeId: string; userId: string }) => {
-				calls.push({ op: "scopes.removePrincipal", args: { ...opts } });
-				scopePrincipals.set(
-					opts.scopeId,
-					(scopePrincipals.get(opts.scopeId) ?? []).filter((principal) => principal.userId !== opts.userId),
-				);
-				return { _yay: { scopeId: opts.scopeId } };
-			}),
-			delete: vi.fn(async (opts: { scopeId: string }) => {
+			removePrincipal: vi.fn<(opts: ScopeChangeOpts & { userId: string }) => Promise<ScopeChangeResult>>(
+				async (opts) => {
+					calls.push({ op: "scopes.removePrincipal", args: { ...opts } });
+					scopePrincipals.set(
+						opts.scopeId,
+						(scopePrincipals.get(opts.scopeId) ?? []).filter((principal) => principal.userId !== opts.userId),
+					);
+					return {
+						_yay: {
+							scopeId: opts.scopeId,
+							deleted: false,
+							membershipRevision: next_scope_membership_revision(opts.scopeId),
+						},
+					};
+				},
+			),
+			delete: vi.fn<(opts: ScopeChangeOpts) => Promise<ScopeChangeResult>>(async (opts) => {
 				calls.push({ op: "scopes.delete", args: { ...opts } });
 				scopePrincipals.delete(opts.scopeId);
-				return { _yay: { scopeId: opts.scopeId } };
+				return {
+					_yay: {
+						scopeId: opts.scopeId,
+						deleted: true,
+						membershipRevision: next_scope_membership_revision(opts.scopeId),
+					},
+				};
 			}),
-			listPrincipals: vi.fn(async (opts: { scopeId: string }) => scopePrincipals.get(opts.scopeId) ?? null),
-			watchMine: vi.fn((onUpdate: (scopes: ScopeEntry[] | null) => void) => {
+			listPrincipals: vi.fn<(opts: { scopeId: string }) => Promise<BonoboUiScopePrincipalListResult>>(async (opts) => ({
+				_yay: scopePrincipals.get(opts.scopeId) ?? null,
+			})),
+			watchMine: vi.fn((onUpdate: ScopeWatchCallback) => {
 				scopeWatchers.push(onUpdate);
 				return () => {
 					const index = scopeWatchers.indexOf(onUpdate);
@@ -351,10 +443,30 @@ function make_harness() {
 		}
 	};
 	/** Delivers the scope list the way the server does after somebody changes who is in a range. */
-	const send_scopes = (scopes: ScopeEntry[] | null) => {
-		for (const listener of [...scopeWatchers]) {
-			listener(scopes);
+	const send_scopes = (scopes: ScopeFixture[]) => {
+		const delivered = scopes.map((scope) => ({
+			...scope,
+			membershipRevision: scope.membershipRevision ?? 1,
+			appendActivity: (scope.appendActivity ?? []).map((entry, index) => ({
+				...entry,
+				sequence: entry.sequence ?? index + 1,
+			})),
+		}));
+		scopeMembershipRevisions.clear();
+		for (const scope of delivered) {
+			scopeMembershipRevisions.set(scope.scopeId, scope.membershipRevision);
 		}
+		for (const listener of [...scopeWatchers]) {
+			listener(delivered);
+		}
+	};
+	/** Ends the newest scope watch the way the SDK does before its one final null delivery. */
+	const send_scope_death = (reason: string) => {
+		const listener = scopeWatchers.pop();
+		if (listener === undefined) {
+			throw new Error("No live scope watch");
+		}
+		listener(null, { reason, message: `Scope watch ${reason}` });
 	};
 	return {
 		client: client as unknown as BonoboUiFrontendClient,
@@ -369,6 +481,7 @@ function make_harness() {
 		find_changes,
 		send_theme,
 		send_scopes,
+		send_scope_death,
 		calls,
 		scopePrincipals,
 	};
@@ -581,13 +694,16 @@ test("channel sections are grouped, not flat, and no channel appears in two of t
 
 	// Sorted by name inside each section, and an archived channel is in exactly one of them —
 	// the defect the accepted mockups were rejected for.
-	expect(within(channelsList!).getAllByRole("button", { name: /^#/u }).map((button) => button.textContent)).toEqual([
-		"G#general",
-		"R#random",
-	]);
-	expect(within(archivedList!).getAllByRole("button", { name: /^#/u }).map((button) => button.textContent)).toEqual([
-		"O#old-stuff (archived)",
-	]);
+	expect(
+		within(channelsList!)
+			.getAllByRole("button", { name: /^#/u })
+			.map((button) => button.textContent),
+	).toEqual(["G#general", "R#random"]);
+	expect(
+		within(archivedList!)
+			.getAllByRole("button", { name: /^#/u })
+			.map((button) => button.textContent),
+	).toEqual(["O#old-stuff (archived)"]);
 	expect(within(channelsList!).queryByRole("button", { name: "#old-stuff (archived)" })).toBeNull();
 
 	// The toggle the sections replace is gone; two independent controls over one visibility is the
@@ -628,6 +744,154 @@ test("the closed drawer is inert only while it is the narrow overlay", async () 
 	await waitFor(() => expect(document.querySelector(".sidebar-inner")!.hasAttribute("inert")).toBe(false));
 });
 
+test("a narrow resize moves focus from the channel rail to the visible Channels toggle", async () => {
+	const h = make_harness();
+	set_viewport_narrow(false);
+	await boot(h);
+	const selected = screen.getByRole("button", { name: "#general" });
+	selected.focus();
+	expect(document.activeElement).toBe(selected);
+
+	set_viewport_narrow(true);
+	const toggle = screen.getByRole("button", { name: "Channels" });
+	await waitFor(() => expect(document.activeElement).toBe(toggle));
+	expect(document.querySelector(".sidebar-inner")!.hasAttribute("inert")).toBe(true);
+});
+
+test("a narrow resize moves channel focus to the open thread instead of the hidden toggle", async () => {
+	const h = make_harness();
+	set_viewport_narrow(false);
+	await boot(h);
+	const message = message_doc(1_000, { rand: "thread", text: "thread root" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([message]));
+	await screen.findByText("thread root");
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+
+	const selected = screen.getByRole("button", { name: "#general" });
+	selected.focus();
+	expect(document.activeElement).toBe(selected);
+
+	set_viewport_narrow(true);
+	const thread = screen.getByRole("region", { name: "Thread" });
+	const back = await within(thread).findByRole("button", { name: "Back to messages" });
+	await waitFor(() => expect(document.activeElement).toBe(back));
+	expect(document.querySelector(".sidebar-inner")!.hasAttribute("inert")).toBe(true);
+});
+
+test("a narrow resize keeps focus in an open drawer that stays visible", async () => {
+	const h = make_harness();
+	set_viewport_narrow(true);
+	await boot(h);
+	fireEvent.click(screen.getByRole("button", { name: "Channels" }));
+	set_viewport_narrow(false);
+
+	const selected = screen.getByRole("button", { name: "#general" });
+	selected.focus();
+	expect(document.activeElement).toBe(selected);
+
+	set_viewport_narrow(true);
+	await waitFor(() => expect(document.querySelector(".sidebar-inner")!.hasAttribute("inert")).toBe(false));
+	expect(document.activeElement).toBe(selected);
+});
+
+test("a narrow resize focuses the thread region while its Back button is disabled", async () => {
+	const h = make_harness();
+	const ack = deferred<{ _yay: { key: string; revision: number } }>();
+	h.raw.data.append.mockReturnValueOnce(ack.promise);
+	set_viewport_narrow(false);
+	await boot(h);
+	const message = message_doc(1_000, { rand: "thread", text: "thread root" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([message]));
+	await screen.findByText("thread root");
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+
+	const thread = await screen.findByRole("region", { name: "Thread" });
+	const replyBox = within(thread).getByRole("combobox", { name: "Reply in thread" });
+	fireEvent.input(replyBox, { target: { value: "pending reply" } });
+	fireEvent.keyDown(replyBox, { key: "Enter" });
+	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(1));
+	const back = within(thread).getByRole("button", { name: "Close thread" });
+	expect(back.hasAttribute("disabled")).toBe(true);
+
+	const expand = screen.getByRole("button", { name: "Expand channel rail" });
+	expand.focus();
+	expect(document.activeElement).toBe(expand);
+	set_viewport_narrow(true);
+	await waitFor(() => expect(document.activeElement).toBe(thread));
+
+	await act(async () => {
+		ack.resolve({ _yay: { key: "reply", revision: 1 } });
+		await ack.promise;
+	});
+});
+
+test("a narrow resize falls back to Channels while a requested thread root is not loaded", async () => {
+	const h = make_harness();
+	set_viewport_narrow(false);
+	await boot(h);
+	await open_missing_general_thread_from_threads(h);
+
+	const selected = screen.getByRole("button", { name: "#general" });
+	selected.focus();
+	expect(document.activeElement).toBe(selected);
+	set_viewport_narrow(true);
+
+	const toggle = screen.getByRole("button", { name: "Channels" });
+	await waitFor(() => expect(document.activeElement).toBe(toggle));
+	expect(document.querySelector(".sidebar-inner")!.hasAttribute("inert")).toBe(true);
+});
+
+test("a wide resize moves focus from the hidden Channels toggle to the selected row", async () => {
+	const h = make_harness();
+	set_viewport_narrow(true);
+	await boot(h);
+	const toggle = screen.getByRole("button", { name: "Channels" });
+	toggle.focus();
+	expect(document.activeElement).toBe(toggle);
+
+	set_viewport_narrow(false);
+	const selected = screen.getByRole("button", { name: "#general" });
+	await waitFor(() => expect(document.activeElement).toBe(selected));
+	expect(document.querySelector(".sidebar-inner")!.hasAttribute("inert")).toBe(false);
+});
+
+test("a resize does not pull focus back after it moves outside Chitchat", async () => {
+	const h = make_harness();
+	set_viewport_narrow(false);
+	await boot(h);
+	const selected = screen.getByRole("button", { name: "#general" });
+	selected.focus();
+	const outside = document.createElement("button");
+	document.body.append(outside);
+	try {
+		outside.focus();
+		expect(document.activeElement).toBe(outside);
+		set_viewport_narrow(true);
+		await waitFor(() => expect(document.querySelector(".sidebar-inner")!.hasAttribute("inert")).toBe(true));
+		expect(document.activeElement).toBe(outside);
+	} finally {
+		outside.remove();
+	}
+});
+
+test("a narrow resize moves focus from the hidden thread separator to the thread back button", async () => {
+	const h = make_harness();
+	set_viewport_narrow(false);
+	await boot(h);
+	const message = message_doc(1_000, { rand: "thread", text: "thread root" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([message]));
+	await screen.findByText("thread root");
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+	const separator = await screen.findByRole("separator", { name: "Resize thread panel" });
+	separator.focus();
+	expect(document.activeElement).toBe(separator);
+
+	set_viewport_narrow(true);
+	const thread = screen.getByRole("region", { name: "Thread" });
+	const back = await within(thread).findByRole("button", { name: "Back to messages" });
+	await waitFor(() => expect(document.activeElement).toBe(back));
+});
+
 test("the page heading and the nav landmark survive an inert closed drawer", async () => {
 	const h = make_harness();
 	set_viewport_narrow(true);
@@ -645,7 +909,7 @@ test("the page heading and the nav landmark survive an inert closed drawer", asy
 	expect(nav.hasAttribute("inert")).toBe(false);
 });
 
-test("the thread-open class is on the app root and a channel switch clears it", async () => {
+test("the rendered thread controls the responsive layout and a channel switch removes it", async () => {
 	const h = make_harness();
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const doc = message_doc(1_000, { rand: "root", text: "thread root" });
@@ -653,19 +917,20 @@ test("the thread-open class is on the app root and a channel switch clears it", 
 	await screen.findByText("thread root");
 
 	const root = document.querySelector(".chitchat")!;
+	expect(root.querySelector(".thread")).toBeNull();
 	expect(root.classList.contains("has-thread")).toBe(false);
 
-	// The rail collapse is a stylesheet rule on this class, so nothing else can observe whether any
-	// element ever carries it.
+	// The stylesheet reads the rendered panel through :has(.thread), not a state-only root class.
 	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
-	await screen.findByRole("region", { name: "Thread" });
-	expect(document.querySelector(".chitchat")!.classList.contains("has-thread")).toBe(true);
+	const thread = await screen.findByRole("region", { name: "Thread" });
+	expect(root.querySelector(".thread")).toBe(thread);
+	expect(root.classList.contains("has-thread")).toBe(false);
 
-	// ChannelView is keyed by channel and remounts on a switch; this state does not. Left set, the
-	// key resolves to no message in the new channel, so no panel renders while the rail stays
-	// collapsed to 56 icon-only pixels beside an empty column.
+	// ChannelView is keyed by channel and remounts on a switch. The old thread key resolves to no
+	// message in the new channel, so the panel leaves the DOM and the :has(.thread) rule stops.
 	fireEvent.click(screen.getByRole("button", { name: "#random" }));
-	await waitFor(() => expect(document.querySelector(".chitchat")!.classList.contains("has-thread")).toBe(false));
+	await waitFor(() => expect(root.querySelector(".thread")).toBeNull());
+	expect(root.classList.contains("has-thread")).toBe(false);
 });
 
 test("the icon rail's expand control is a labelled toggle that reports its state", async () => {
@@ -680,12 +945,14 @@ test("the icon rail's expand control is a labelled toggle that reports its state
 	fireEvent.click(expand);
 	const collapse = await screen.findByRole("button", { name: "Collapse channel rail" });
 	expect(collapse.getAttribute("aria-expanded")).toBe("true");
-	expect(document.querySelector(".sidebar")!.classList.contains("is-expanded")).toBe(true);
+	expect(screen.getByRole("navigation", { name: "Channels" }).classList.contains("is-expanded")).toBe(true);
 });
 
 test("a rename carries the channel topic and an emptied topic is removed", async () => {
 	const h = make_harness();
-	await boot(h, [{ ...channel_doc(CH1_KEY, "general"), value: { name: "general", archivedAt: null, topic: "standups" } }]);
+	await boot(h, [
+		{ ...channel_doc(CH1_KEY, "general"), value: { name: "general", archivedAt: null, topic: "standups" } },
+	]);
 
 	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
 	const dialog = await screen.findByRole("dialog");
@@ -707,7 +974,10 @@ test("a rename carries the channel topic and an emptied topic is removed", async
 test('permission-lost: a "denied" channels death names no cause and offers a reload', async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_watch("channels")!.onUpdate(null, { reason: "denied", message: "This plugin no longer has access to its data" });
+	h.find_watch("channels")!.onUpdate(null, {
+		reason: "denied",
+		message: "This plugin no longer has access to its data",
+	});
 
 	const alert = await screen.findByRole("alert");
 	// The commonest trigger is an uninstall or a revoked installation. Telling a member their
@@ -721,8 +991,7 @@ test('permission-lost: a "denied" channels death names no cause and offers a rel
 });
 
 test("the other channels-death reasons each say something different", async () => {
-	// A member whose session ran out only has to reload; a member whose connection dropped cannot
-	// fix anything by reloading. One string for both is advice that is wrong half the time.
+	// Keep each cause clear, and give a connection death the manual recovery this page needs.
 	const cases = [
 		{ reason: "session_expired", contains: "session expired" },
 		{ reason: "unavailable", contains: "cannot reach its data" },
@@ -737,6 +1006,10 @@ test("the other channels-death reasons each say something different", async () =
 
 		const alert = await screen.findByRole("alert");
 		expect(alert.textContent?.toLowerCase()).toContain(contains);
+		if (reason === "unavailable") {
+			expect(alert.textContent).toMatch(/reload/iu);
+			expect(alert.textContent).not.toContain("connection returns");
+		}
 		cleanup();
 	}
 });
@@ -762,6 +1035,17 @@ test("a dead messages window names its reason", async () => {
 	expect(alert.textContent).not.toContain("permissions");
 });
 
+test("an unavailable messages window tells the member to check the connection and reload", async () => {
+	const h = make_harness();
+	await boot(h);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(null, { reason: "unavailable" } satisfies WatchDeathInfo);
+
+	const alert = await screen.findByRole("alert");
+	expect(alert.textContent).toContain("Check your connection");
+	expect(alert.textContent).toMatch(/reload/iu);
+	expect(alert.textContent).not.toContain("connection returns");
+});
+
 test("create channel dialog validates the name and puts a shared doc under a client key", async () => {
 	const h = make_harness();
 	await boot(h, []);
@@ -785,7 +1069,70 @@ test("create channel dialog validates the name and puts a shared doc under a cli
 	expect(typeof call.key).toBe("string");
 	expect(call.key.length).toBeGreaterThan(0);
 	expect(call.value).toEqual({ name: "general", archivedAt: null });
+	expect(call.expectedRevision).toBe(0);
 	expect(h.raw.data.append).not.toHaveBeenCalled();
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+test("an unavailable public create retries the same create-only put and treats a conflict as committed", async () => {
+	const h = make_harness();
+	h.raw.data.put
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost after send" } })
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Channel already exists" } });
+	await boot(h, []);
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	const dialog = await screen.findByRole("dialog");
+	const name = within(dialog).getByLabelText("Channel name") as HTMLInputElement;
+	const topic = within(dialog).getByLabelText("Topic (optional)") as HTMLInputElement;
+	const privacy = within(dialog).getByLabelText("Private channel") as HTMLInputElement;
+	fireEvent.input(name, { target: { value: "general" } });
+	fireEvent.input(topic, { target: { value: "Team updates" } });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+	expect((await within(dialog).findByRole("alert")).textContent).toContain("Connection lost after send");
+	expect(name.disabled).toBe(true);
+	expect(topic.disabled).toBe(true);
+	expect(privacy.disabled).toBe(true);
+	const retry = within(dialog).getByRole("button", { name: "Retry" });
+	expect((retry as HTMLButtonElement).disabled).toBe(false);
+	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+	fireEvent.click(retry);
+
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
+	const first = h.raw.data.put.mock.calls[0]![0];
+	expect(first.expectedRevision).toBe(0);
+	expect(h.raw.data.put.mock.calls[1]![0]).toEqual(first);
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+test("a first public create conflict unlocks the form and a new submit uses a fresh key", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Channel already exists" } });
+	await boot(h, []);
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	const dialog = await screen.findByRole("dialog");
+	const name = within(dialog).getByLabelText("Channel name") as HTMLInputElement;
+	const topic = within(dialog).getByLabelText("Topic (optional)") as HTMLInputElement;
+	const privacy = within(dialog).getByLabelText("Private channel") as HTMLInputElement;
+	fireEvent.input(name, { target: { value: "general" } });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+	expect((await within(dialog).findByRole("alert")).textContent).toContain("Channel already exists");
+	expect(name.disabled).toBe(false);
+	expect(topic.disabled).toBe(false);
+	expect(privacy.disabled).toBe(false);
+	expect(within(dialog).getByRole("button", { name: "Create" })).toBeTruthy();
+	fireEvent.input(name, { target: { value: "random" } });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
+	const first = h.raw.data.put.mock.calls[0]![0];
+	const second = h.raw.data.put.mock.calls[1]![0];
+	expect(second.key).not.toBe(first.key);
+	expect(second.value).toEqual({ name: "random", archivedAt: null });
+	expect(second.expectedRevision).toBe(0);
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 });
 
@@ -834,6 +1181,389 @@ test("rename is compare-and-set: a conflict keeps the dialog open with a clear e
 	const alert = await within(dialog).findByRole("alert");
 	expect(alert.textContent).toContain("Someone else changed this channel");
 	expect(screen.getByRole("dialog")).toBeTruthy();
+});
+
+test.each(["unavailable", "thrown"] as const)(
+	"an %s rename locks its exact request until a retry and matching watch settle it",
+	async (failure) => {
+		const h = make_harness();
+		if (failure === "unavailable") {
+			h.raw.data.put.mockResolvedValueOnce({
+				_nay: { name: "unavailable", message: "Connection lost after send" },
+			});
+		} else {
+			h.raw.data.put.mockRejectedValueOnce(new Error("Connection lost after send"));
+		}
+		h.raw.data.put.mockResolvedValueOnce({
+			_nay: { name: "conflict", message: "This document changed since it was read" },
+		});
+		await boot(h);
+
+		fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
+		const dialog = await screen.findByRole("dialog");
+		const name = within(dialog).getByLabelText("Channel name") as HTMLInputElement;
+		const topic = within(dialog).getByLabelText("Topic (optional)") as HTMLInputElement;
+		fireEvent.input(name, { target: { value: "renamed" } });
+		fireEvent.input(topic, { target: { value: "daily updates" } });
+		fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
+
+		expect((await within(dialog).findByRole("alert")).textContent).toContain("Connection lost after send");
+		expect(name.disabled).toBe(true);
+		expect(topic.disabled).toBe(true);
+		expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+		fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+
+		await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
+		const first = h.raw.data.put.mock.calls[0]![0];
+		expect(h.raw.data.put.mock.calls[1]![0]).toEqual(first);
+		h.find_watch("channels")!.onUpdate(
+			watch_update([{ ...channel_doc(CH1_KEY, "renamed", null, { topic: "daily updates" }), revision: 2 }]),
+		);
+
+		await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	},
+);
+
+test("an uncertain rename settles when its name and topic arrive with a concurrent archive", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "Connection lost after send" },
+	});
+	await boot(h);
+
+	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "renamed" } });
+	fireEvent.input(within(dialog).getByLabelText("Topic (optional)"), { target: { value: "daily updates" } });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
+	await within(dialog).findByRole("alert");
+
+	h.find_watch("channels")!.onUpdate(
+		watch_update([{ ...channel_doc(CH1_KEY, "renamed", 123, { topic: "daily updates" }), revision: 2 }]),
+	);
+
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+test("Escape cannot dismiss a channel-name dialog while its write is pending", async () => {
+	const h = make_harness();
+	const pendingPut = deferred<WriteResult>();
+	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	await boot(h);
+
+	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "renamed" } });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
+	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Saving…" })).toBeTruthy());
+	expect((within(dialog).getByLabelText("Channel name") as HTMLInputElement).disabled).toBe(true);
+	expect((within(dialog).getByLabelText("Topic (optional)") as HTMLInputElement).disabled).toBe(true);
+
+	fireEvent.keyDown(dialog, { key: "Escape" });
+	expect(screen.getByRole("dialog")).toBe(dialog);
+	pendingPut.resolve({ _yay: { key: CH1_KEY, revision: 2 } });
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+test("Escape cannot dismiss the archive dialog while its write is pending", async () => {
+	const h = make_harness();
+	const pendingPut = deferred<WriteResult>();
+	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	await boot(h);
+
+	fireEvent.click(await open_channel_menu_item("general", "Archive #general"));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.click(within(dialog).getByRole("button", { name: "Archive channel" }));
+	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Archiving…" })).toBeTruthy());
+
+	fireEvent.keyDown(dialog, { key: "Escape" });
+	expect(screen.getByRole("dialog")).toBe(dialog);
+	pendingPut.resolve({ _yay: { key: CH1_KEY, revision: 2 } });
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+test.each([
+	{ failure: "unavailable", matchingWatch: true },
+	{ failure: "thrown", matchingWatch: false },
+] as const)(
+	"an uncertain archive after a $failure result retries exactly and settles from the watch",
+	async (testCase) => {
+		const h = make_harness();
+		if (testCase.failure === "unavailable") {
+			h.raw.data.put.mockResolvedValueOnce({
+				_nay: { name: "unavailable", message: "Connection lost after send" },
+			});
+		} else {
+			h.raw.data.put.mockRejectedValueOnce(new Error("Connection lost after send"));
+		}
+		h.raw.data.put.mockResolvedValueOnce({
+			_nay: { name: "conflict", message: "This document changed since it was read" },
+		});
+		await boot(h);
+
+		fireEvent.click(await open_channel_menu_item("general", "Archive #general"));
+		const dialog = await screen.findByRole("dialog", { name: "Archive #general?" });
+		fireEvent.click(within(dialog).getByRole("button", { name: "Archive channel" }));
+
+		expect((await within(dialog).findByRole("alert")).textContent).toContain("Connection lost after send");
+		expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+		fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+
+		await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
+		const first = h.raw.data.put.mock.calls[0]![0];
+		expect(h.raw.data.put.mock.calls[1]![0]).toEqual(first);
+		const archivedAt = first.value.archivedAt as number;
+		h.find_watch("channels")!.onUpdate(
+			watch_update([
+				{
+					...channel_doc(
+						CH1_KEY,
+						testCase.matchingWatch ? "general" : "renamed",
+						testCase.matchingWatch ? archivedAt + 1 : null,
+					),
+					revision: 2,
+				},
+			]),
+		);
+
+		if (testCase.matchingWatch) {
+			await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+		} else {
+			await waitFor(() =>
+				expect(within(dialog).getByRole("alert").textContent).toContain("while the request was pending"),
+			);
+			expect(within(dialog).getByRole("button", { name: "Archive channel" })).toBeTruthy();
+		}
+	},
+);
+
+test("keyboard archive repairs focus after the channel watch moves the row", async () => {
+	const h = make_harness();
+	const pendingPut = deferred<WriteResult>();
+	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	await boot(h);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	const archive = await open_channel_menu_item("general", "Archive #general");
+	archive.focus();
+	fireEvent.click(archive);
+	const dialog = await screen.findByRole("dialog", { name: "Archive #general?" });
+	const confirm = within(dialog).getByRole("button", { name: "Archive channel" });
+	confirm.focus();
+	fireEvent.click(confirm);
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
+
+	pendingPut.resolve({ _yay: { key: CH1_KEY, revision: 2 } });
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	h.find_watch("channels")!.onUpdate(watch_update([{ ...channel_doc(CH1_KEY, "general", 123), revision: 2 }]));
+
+	await screen.findByRole("button", { name: "#general (archived)" });
+	await waitFor(() => expect(document.activeElement).toBe(nav));
+});
+
+test("keyboard unarchive repairs focus after the channel watch moves the row", async () => {
+	const h = make_harness();
+	const pendingPut = deferred<WriteResult>();
+	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	const unarchive = await open_channel_menu_item("old-stuff", "Unarchive #old-stuff");
+	unarchive.focus();
+	fireEvent.click(unarchive);
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
+
+	await act(async () => {
+		pendingPut.resolve({ _yay: { key: CH2_KEY, revision: 2 } });
+		await pendingPut.promise;
+	});
+	h.find_watch("channels")!.onUpdate(
+		watch_update([channel_doc(CH1_KEY, "general"), { ...channel_doc(CH2_KEY, "old-stuff"), revision: 2 }]),
+	);
+
+	await screen.findByRole("button", { name: "#old-stuff" });
+	await waitFor(() => expect(document.activeElement).toBe(nav));
+});
+
+test("a delayed unarchive watch keeps focus on the control the member moved to", async () => {
+	const h = make_harness();
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
+
+	fireEvent.click(await open_channel_menu_item("old-stuff", "Unarchive #old-stuff"));
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
+	const create = screen.getByRole("button", { name: "Create channel" });
+	create.focus();
+
+	h.find_watch("channels")!.onUpdate(
+		watch_update([channel_doc(CH1_KEY, "general"), { ...channel_doc(CH2_KEY, "old-stuff"), revision: 2 }]),
+	);
+
+	await screen.findByRole("button", { name: "#old-stuff" });
+	await waitFor(() => expect(document.activeElement).toBe(create));
+});
+
+test("archive repairs focus when its response is lost before the committed watch update", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost after send" } });
+	await boot(h);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	const archive = await open_channel_menu_item("general", "Archive #general");
+	archive.focus();
+	fireEvent.click(archive);
+	const dialog = await screen.findByRole("dialog", { name: "Archive #general?" });
+	const confirm = within(dialog).getByRole("button", { name: "Archive channel" });
+	confirm.focus();
+	fireEvent.click(confirm);
+	await within(dialog).findByRole("alert");
+
+	h.find_watch("channels")!.onUpdate(watch_update([{ ...channel_doc(CH1_KEY, "general", 123), revision: 2 }]));
+	await screen.findByRole("button", { name: "#general (archived)" });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	await waitFor(() => expect(document.activeElement).toBe(nav));
+});
+
+test("unarchive repairs focus when its response is lost before the committed watch update", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost after send" } });
+	const utils = await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	const unarchive = await open_channel_menu_item("old-stuff", "Unarchive #old-stuff");
+	unarchive.focus();
+	fireEvent.click(unarchive);
+	await waitFor(() => expect(announcer_text(utils.container)).toContain("Connection lost after send"));
+
+	h.find_watch("channels")!.onUpdate(
+		watch_update([channel_doc(CH1_KEY, "general"), { ...channel_doc(CH2_KEY, "old-stuff"), revision: 2 }]),
+	);
+
+	await screen.findByRole("button", { name: "#old-stuff" });
+	await waitFor(() => expect(document.activeElement).toBe(nav));
+});
+
+test("archive conflict repairs focus when the winner arrives through the watch", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({
+		_nay: { name: "conflict", message: "This document changed since it was read" },
+	});
+	await boot(h);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	fireEvent.click(await open_channel_menu_item("general", "Archive #general"));
+	const dialog = await screen.findByRole("dialog", { name: "Archive #general?" });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Archive channel" }));
+	await within(dialog).findByRole("alert");
+
+	h.find_watch("channels")!.onUpdate(watch_update([{ ...channel_doc(CH1_KEY, "general", 123), revision: 2 }]));
+	await screen.findByRole("button", { name: "#general (archived)" });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	await waitFor(() => expect(document.activeElement).toBe(nav));
+});
+
+test("unarchive conflict repairs focus when the winner arrives through the watch", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({
+		_nay: { name: "conflict", message: "This document changed since it was read" },
+	});
+	const utils = await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	const unarchive = await open_channel_menu_item("old-stuff", "Unarchive #old-stuff");
+	unarchive.focus();
+	fireEvent.click(unarchive);
+	await waitFor(() => expect(announcer_text(utils.container)).toContain("This document changed since it was read"));
+
+	h.find_watch("channels")!.onUpdate(
+		watch_update([channel_doc(CH1_KEY, "general"), { ...channel_doc(CH2_KEY, "old-stuff"), revision: 2 }]),
+	);
+
+	await screen.findByRole("button", { name: "#old-stuff" });
+	await waitFor(() => expect(document.activeElement).toBe(nav));
+});
+
+test("a missing background private channel settles unarchive and repairs focus", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost after send" } });
+	const utils = await boot_sidebar(
+		h,
+		[channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans", 123)],
+		[PRIVATE_KEY],
+	);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	const unarchive = await open_channel_menu_item("secret-plans", "Unarchive #secret-plans");
+	unarchive.focus();
+	fireEvent.click(unarchive);
+	await waitFor(() => expect(announcer_text(utils.container)).toContain("Connection lost after send"));
+
+	// Scope removal is authoritative even though no newer channel document can arrive.
+	h.send_scopes([]);
+
+	await waitFor(() => expect(screen.queryByRole("button", { name: /#secret-plans/u })).toBeNull());
+	await waitFor(() => expect(document.activeElement).toBe(nav));
+});
+
+test("one conflicted unarchive cannot remove an overlapping successful request's focus repair", async () => {
+	const h = make_harness();
+	const successfulPut = deferred<WriteResult>();
+	h.raw.data.put
+		.mockReturnValueOnce(successfulPut.promise)
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This document changed since it was read" } });
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	const first = await open_channel_menu_item("old-stuff", "Unarchive #old-stuff");
+	first.focus();
+	fireEvent.click(first);
+	await waitFor(() => expect(screen.queryByRole("menuitem", { name: "Unarchive #old-stuff" })).toBeNull());
+	const second = await open_channel_menu_item("old-stuff", "Unarchive #old-stuff");
+	second.focus();
+	fireEvent.click(second);
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
+
+	await act(async () => {
+		successfulPut.resolve({ _yay: { key: CH2_KEY, revision: 2 } });
+		await successfulPut.promise;
+	});
+	h.find_watch("channels")!.onUpdate(
+		watch_update([channel_doc(CH1_KEY, "general"), { ...channel_doc(CH2_KEY, "old-stuff"), revision: 2 }]),
+	);
+
+	await screen.findByRole("button", { name: "#old-stuff" });
+	await waitFor(() => expect(document.activeElement).toBe(nav));
+});
+
+test("a newer opposite update discards an uncertain move without stealing focus later", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockRejectedValueOnce(new Error("Connection lost after send"));
+	await boot(h);
+
+	fireEvent.click(await open_channel_menu_item("general", "Archive #general"));
+	const dialog = await screen.findByRole("dialog", { name: "Archive #general?" });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Archive channel" }));
+	await within(dialog).findByRole("alert");
+
+	// A newer rename proves the uncertain archive did not win. Settle its request without repair.
+	h.find_watch("channels")!.onUpdate(watch_update([{ ...channel_doc(CH1_KEY, "renamed"), revision: 2 }]));
+	await screen.findByRole("button", { name: "#renamed" });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	const create = screen.getByRole("button", { name: "Create channel" });
+	create.focus();
+
+	// A later independent archive must not consume the already settled request and move focus.
+	await act(async () => {
+		h.find_watch("channels")!.onUpdate(watch_update([{ ...channel_doc(CH1_KEY, "renamed", 123), revision: 3 }]));
+		await Promise.resolve();
+	});
+
+	expect(screen.getByRole("button", { name: "#renamed (archived)" })).toBeTruthy();
+	expect(document.activeElement).toBe(create);
 });
 
 test("channel switch announces the channel name through the polite announcer", async () => {
@@ -1102,6 +1832,40 @@ test("an in-flight send disables Send, shows the pending row, and the ack keeps 
 	expect(screen.getByRole("button", { name: "Send" }).hasAttribute("disabled")).toBe(false);
 });
 
+test("an in-flight top-level send blocks a channel switch, and a late failure keeps Retry visible", async () => {
+	const h = make_harness();
+	const ack = deferred<{ _yay: { key: string; revision: number } }>();
+	h.raw.data.append.mockReturnValueOnce(ack.promise);
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
+
+	const input = await screen.findByRole("combobox", { name: "Message #general" });
+	const random = screen.getByRole("button", { name: "#random" });
+	fireEvent.input(input, { target: { value: "late top-level send" } });
+	// Keep both clicks in one turn. The App ref must see the send before React can paint disabled nav.
+	act(() => {
+		fireEvent.click(screen.getByRole("button", { name: "Send" }));
+		fireEvent.click(random);
+	});
+
+	expect(screen.getByRole("combobox", { name: "Message #general" })).toBeTruthy();
+	expect(
+		await screen.findByText("Wait for pending message changes to finish before leaving this channel or thread.", {
+			selector: ".channel-status",
+		}),
+	).toBeTruthy();
+	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(true));
+
+	await act(async () => {
+		ack.reject(new Error("late top-level failed"));
+		await Promise.resolve();
+	});
+	const failedRow = screen.getByText("late top-level send").closest(".message") as HTMLElement;
+	expect(await within(failedRow).findByRole("button", { name: "Retry sending message" })).toBeTruthy();
+	expect(within(failedRow).getByRole("alert").textContent).toContain("late top-level failed");
+	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(false));
+});
+
 test("a failed send surfaces the _nay message and Retry reuses the same clientRequestId", async () => {
 	const h = make_harness();
 	h.raw.data.append
@@ -1151,14 +1915,37 @@ test("a storage_full refusal becomes one announced channel state and stops the c
 	const alert = await screen.findByText("This plugin has used its 10000 document slots");
 	expect(alert.getAttribute("role")).toBe("alert");
 	expect(alert.closest(".message")).toBeNull();
-	await waitFor(() =>
-		expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true),
-	);
+	await waitFor(() => expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true));
 
 	// The failed row keeps its retry, but not a second copy of the same sentence.
 	const failedRow = screen.getByText("hello").closest(".message") as HTMLElement;
 	expect(within(failedRow).queryByText(/document slots/)).toBeNull();
 	expect(within(failedRow).getByRole("button", { name: "Retry sending message" })).toBeTruthy();
+});
+
+test("an unavailable send retry timer stops when the page unmounts", async () => {
+	const h = make_harness();
+	h.raw.data.append.mockResolvedValue({ _nay: { name: "unavailable", message: "Reply lost" } });
+	const { unmount } = await boot(h);
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
+
+	vi.useFakeTimers();
+	try {
+		type_in_composer(composer_box("Message #general"), "uncertain send");
+		await act(async () => {
+			fireEvent.keyDown(composer_box("Message #general"), { key: "Enter" });
+			await Promise.resolve();
+		});
+		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
+
+		unmount();
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(60_000);
+		});
+		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
+	} finally {
+		vi.useRealTimers();
+	}
 });
 
 // #endregion send flow
@@ -1213,6 +2000,62 @@ test("a burst of remote arrivals coalesces into one counted announcement", async
 		]),
 	);
 	await waitFor(() => expect(announcer_text(container)).toContain("3 new messages in #general"));
+});
+
+test("a delayed author lookup cannot announce after the member switches channels", async () => {
+	const h = make_harness();
+	const names = deferred<Record<string, string | null>>();
+	h.raw.members.resolve.mockReturnValueOnce(names.promise);
+	const { container } = await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	messages.onUpdate(window_update([]));
+	messages.onUpdate(window_update([message_doc(9_000, { rand: "old", text: "old message" })]));
+
+	fireEvent.click(screen.getByRole("button", { name: "#random" }));
+	await waitFor(() => expect(announcer_text(container)).toContain("#random"));
+
+	await act(async () => {
+		names.resolve({ user_other: "Bob" });
+		await names.promise;
+		await Promise.resolve();
+	});
+	expect(announcer_text(container)).toContain("#random");
+	expect(announcer_text(container)).not.toContain("old message");
+});
+
+test("same-author arrivals wait for one lookup and only announce the newest message", async () => {
+	const h = make_harness();
+	const names = deferred<Record<string, string | null>>();
+	const startedAt = Date.now();
+	const now = vi.spyOn(Date, "now").mockReturnValue(startedAt);
+	h.raw.members.resolve.mockReturnValueOnce(names.promise);
+	try {
+		const { container } = await boot(h);
+		const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+		const first = message_doc(9_000, { rand: "first", text: "first message" });
+		const second = message_doc(9_100, { rand: "second", text: "second message" });
+		messages.onUpdate(window_update([]));
+		messages.onUpdate(window_update([first]));
+		// A suspended lookup may outlive the cache TTL. It is still the one request to await.
+		now.mockReturnValue(startedAt + 5 * 60 * 1_000 + 1);
+		messages.onUpdate(window_update([second, first]));
+
+		await act(async () => {
+			await Promise.resolve();
+		});
+		expect(announcer_text(container)).not.toContain("Former member");
+		expect(h.raw.members.resolve).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			names.resolve({ user_other: "Bob" });
+			await names.promise;
+			await Promise.resolve();
+		});
+		await waitFor(() => expect(announcer_text(container)).toBe("Bob: second message"));
+		expect(announcer_text(container)).not.toContain("first message");
+	} finally {
+		now.mockRestore();
+	}
 });
 
 test("the announcer speaks the text alone: the sequence lives in an attribute", async () => {
@@ -1277,6 +2120,236 @@ test("editing an own message puts the new text and renders the (edited) marker",
 	expect(typeof call.value.editedAt).toBe("number");
 	expect(await screen.findByText("(edited)")).toBeTruthy();
 	expect(screen.getByText("after")).toBeTruthy();
+	await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit" })));
+});
+
+test("Cancel closes an edit and restores focus to its Edit button", async () => {
+	const h = make_harness();
+	await boot(h);
+	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
+
+	await screen.findByText("before");
+	fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+	const editBox = await screen.findByRole("textbox", { name: "Edit message" });
+	expect(document.activeElement).toBe(editBox);
+	fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+	await waitFor(() => expect(screen.queryByRole("textbox", { name: "Edit message" })).toBeNull());
+	expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit" }));
+});
+
+test("a pending message edit freezes its draft and ignores Escape until a refusal settles", async () => {
+	const h = make_harness();
+	const pendingPut = deferred<WriteResult>();
+	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	await boot(h);
+	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
+
+	await screen.findByText("before");
+	fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+	const editBox = (await screen.findByRole("textbox", { name: "Edit message" })) as HTMLTextAreaElement;
+	fireEvent.input(editBox, { target: { value: "submitted draft" } });
+	fireEvent.click(screen.getByRole("button", { name: "Save" }));
+	await screen.findByRole("button", { name: "Saving…" });
+
+	expect(editBox.readOnly).toBe(true);
+	expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
+	// readOnly makes normal typing inert. Escape must also leave the submitted draft open.
+	fireEvent.keyDown(editBox, { key: "x" });
+	fireEvent.keyDown(editBox, { key: "Escape" });
+	expect(screen.getByRole("textbox", { name: "Edit message" })).toBe(editBox);
+	expect(editBox.value).toBe("submitted draft");
+
+	pendingPut.resolve({ _nay: { name: "conflict", message: "Message changed" } });
+	expect((await screen.findByRole("alert")).textContent).toContain("Message changed");
+	expect(editBox.readOnly).toBe(false);
+	expect(editBox.value).toBe("submitted draft");
+	expect(h.raw.data.put.mock.calls[0]![0].value.text).toBe("submitted draft");
+});
+
+test("an unavailable message edit retries the exact write and stays locked until its watch echo", async () => {
+	const h = make_harness();
+	const firstPut = deferred<WriteResult>();
+	const retryPut = deferred<WriteResult>();
+	h.raw.data.put.mockReturnValueOnce(firstPut.promise).mockReturnValueOnce(retryPut.promise);
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
+	messages.onUpdate(window_update([doc]));
+
+	await screen.findByText("before");
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+	const panel = await screen.findByRole("region", { name: "Thread" });
+	fireEvent.click(within(panel).getByRole("button", { name: "Edit" }));
+	const editBox = (await within(panel).findByRole("textbox", { name: "Edit message" })) as HTMLTextAreaElement;
+	const close = within(panel).getByRole("button", { name: "Close thread" });
+	const random = screen.getByRole("button", { name: "#random" });
+	fireEvent.input(editBox, { target: { value: "submitted once" } });
+	// Start and navigate in one turn. The stable counters must lock before React paints.
+	act(() => {
+		fireEvent.click(within(panel).getByRole("button", { name: "Save" }));
+		fireEvent.click(close);
+		fireEvent.click(random);
+	});
+
+	expect(screen.getByRole("combobox", { name: "Message #general" })).toBeTruthy();
+	expect(screen.getByRole("region", { name: "Thread" })).toBe(panel);
+	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(true));
+	await waitFor(() => expect(close.hasAttribute("disabled")).toBe(true));
+	const submitted = h.raw.data.put.mock.calls[0]![0];
+	expect(submitted.expectedRevision).toBe(doc.revision);
+	expect(submitted.value.text).toBe("submitted once");
+	expect(typeof submitted.value.editedAt).toBe("number");
+
+	await act(async () => {
+		firstPut.resolve({ _nay: { name: "unavailable", message: "The edit result was lost" } });
+		await firstPut.promise;
+	});
+	expect((await within(panel).findByRole("alert")).textContent).toContain("The edit result was lost");
+	expect(editBox.readOnly).toBe(true);
+	expect((within(panel).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+	expect(random.hasAttribute("disabled")).toBe(true);
+
+	fireEvent.click(within(panel).getByRole("button", { name: "Retry" }));
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
+	expect(h.raw.data.put.mock.calls[1]![0]).toEqual(submitted);
+
+	await act(async () => {
+		messages.onUpdate(
+			window_update([{ ...doc, value: submitted.value, revision: doc.revision + 1, updatedAt: 2_000 }]),
+		);
+		await Promise.resolve();
+	});
+	await waitFor(() => expect(within(panel).queryByRole("textbox", { name: "Edit message" })).toBeNull());
+	expect(within(panel).getByText("submitted once")).toBeTruthy();
+	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(false));
+	await waitFor(() => expect(close.hasAttribute("disabled")).toBe(false));
+
+	// The late replay result belongs to the request the watch already proved.
+	await act(async () => {
+		retryPut.resolve({ _nay: { name: "conflict", message: "Already stored" } });
+		await retryPut.promise;
+	});
+	expect(screen.queryByText("Already stored")).toBeNull();
+});
+
+test("a newer different watch value settles an uncertain edit as a conflict", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "The edit result was lost" },
+	});
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
+	messages.onUpdate(window_update([doc]));
+
+	await screen.findByText("before");
+	fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+	const editBox = (await screen.findByRole("textbox", { name: "Edit message" })) as HTMLTextAreaElement;
+	fireEvent.input(editBox, { target: { value: "keep my draft" } });
+	fireEvent.click(screen.getByRole("button", { name: "Save" }));
+	await screen.findByText("The edit result was lost");
+
+	messages.onUpdate(
+		window_update([
+			{
+				...doc,
+				value: { ...doc.value, text: "other edit", editedAt: 2_000 },
+				revision: 2,
+				updatedAt: 2_000,
+			},
+		]),
+	);
+
+	await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Someone else changed this message"));
+	expect(editBox.readOnly).toBe(false);
+	expect(editBox.value).toBe("keep my draft");
+	expect((screen.getByRole("button", { name: "#random" }) as HTMLButtonElement).disabled).toBe(false);
+	fireEvent.click(screen.getByRole("button", { name: "Save" }));
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
+	expect(h.raw.data.put.mock.calls[1]![0].expectedRevision).toBe(2);
+});
+
+test("a newer tombstone ends an uncertain edit and focuses the stable message row", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "The edit result was lost" },
+	});
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
+	messages.onUpdate(window_update([doc]));
+
+	await screen.findByText("before");
+	fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+	const editBox = await screen.findByRole("textbox", { name: "Edit message" });
+	fireEvent.input(editBox, { target: { value: "submitted edit" } });
+	fireEvent.click(screen.getByRole("button", { name: "Save" }));
+	await screen.findByText("The edit result was lost");
+	expect((screen.getByRole("button", { name: "#random" }) as HTMLButtonElement).disabled).toBe(true);
+
+	messages.onUpdate(
+		window_update([
+			{
+				...doc,
+				value: { ...doc.value, deletedAt: 2_000 },
+				revision: 2,
+				updatedAt: 2_000,
+			},
+		]),
+	);
+
+	const deleted = await screen.findByText("Message deleted");
+	const row = deleted.closest("[data-key]") as HTMLElement;
+	await waitFor(() => expect(document.activeElement).toBe(row));
+	expect(row.tabIndex).toBe(-1);
+	expect(screen.queryByRole("textbox", { name: "Edit message" })).toBeNull();
+	expect(screen.queryByRole("alert")).toBeNull();
+	expect((screen.getByRole("button", { name: "#random" }) as HTMLButtonElement).disabled).toBe(false);
+
+	// A later live value must not reveal the old editor or its submitted text.
+	messages.onUpdate(
+		window_update([
+			{
+				...doc,
+				value: { ...doc.value, text: "restored message", editedAt: 3_000 },
+				revision: 3,
+				updatedAt: 3_000,
+			},
+		]),
+	);
+	expect(await screen.findByText("restored message")).toBeTruthy();
+	expect(screen.queryByRole("textbox", { name: "Edit message" })).toBeNull();
+});
+
+test("a remote tombstone moves focus from a removed Edit button to the message row", async () => {
+	const h = make_harness();
+	await boot(h);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
+	messages.onUpdate(window_update([doc]));
+
+	await screen.findByText("before");
+	const edit = screen.getByRole("button", { name: "Edit" });
+	edit.focus();
+	expect(document.activeElement).toBe(edit);
+	messages.onUpdate(
+		window_update([
+			{
+				...doc,
+				value: { ...doc.value, deletedAt: 2_000 },
+				revision: 2,
+				updatedAt: 2_000,
+			},
+		]),
+	);
+
+	const deleted = await screen.findByText("Message deleted");
+	const row = deleted.closest("[data-key]") as HTMLElement;
+	await waitFor(() => expect(document.activeElement).toBe(row));
+	expect(row.tabIndex).toBe(-1);
 });
 
 test("deleting an own message confirms in a dialog, puts a tombstone, and renders Message deleted", async () => {
@@ -1294,14 +2367,132 @@ test("deleting an own message confirms in a dialog, puts a tombstone, and render
 	const call = h.raw.data.put.mock.calls[0][0];
 	expect(call.key).toBe(doc.key);
 	expect(typeof call.value.deletedAt).toBe("number");
-	expect(await screen.findByText("Message deleted")).toBeTruthy();
+	const deleted = await screen.findByText("Message deleted");
+	const row = deleted.closest("[data-key]") as HTMLElement;
+	await waitFor(() => expect(document.activeElement).toBe(row));
+	expect(row.tabIndex).toBe(-1);
 	expect(screen.queryByText("to remove")).toBeNull();
+});
+
+test("Escape cannot close a delete confirmation while its write is pending", async () => {
+	const h = make_harness();
+	const pendingPut = deferred<WriteResult>();
+	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	await boot(h);
+	const doc = message_doc(1_000, { rand: "mine", text: "to remove", createdBy: "user_me" });
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
+
+	await screen.findByText("to remove");
+	fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.click(within(dialog).getByRole("button", { name: "Delete message" }));
+	await within(dialog).findByRole("button", { name: "Deleting…" });
+
+	fireEvent.keyDown(dialog, { key: "Escape" });
+	expect(screen.getByRole("dialog")).toBe(dialog);
+	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
+
+	pendingPut.resolve({ _yay: { key: doc.key, revision: 2 } });
+	expect(await screen.findByText("Message deleted")).toBeTruthy();
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
+
+test("a thrown message delete retries the exact tombstone and stays locked until its watch echo", async () => {
+	const h = make_harness();
+	const firstPut = deferred<WriteResult>();
+	const retryPut = deferred<WriteResult>();
+	h.raw.data.put.mockReturnValueOnce(firstPut.promise).mockReturnValueOnce(retryPut.promise);
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	const doc = message_doc(1_000, { rand: "mine", text: "to remove", createdBy: "user_me" });
+	messages.onUpdate(window_update([doc]));
+
+	await screen.findByText("to remove");
+	const random = screen.getByRole("button", { name: "#random" });
+	fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.click(within(dialog).getByRole("button", { name: "Delete message" }));
+	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(true));
+	const submitted = h.raw.data.put.mock.calls[0]![0];
+	expect(submitted.expectedRevision).toBe(doc.revision);
+	expect(typeof submitted.value.deletedAt).toBe("number");
+
+	await act(async () => {
+		firstPut.reject(new Error("Connection ended after delete"));
+		try {
+			await firstPut.promise;
+		} catch {
+			// The row turns the transport rejection into the exact retry state below.
+		}
+	});
+	expect((await within(dialog).findByRole("alert")).textContent).toContain("Connection ended after delete");
+	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+	expect(random.hasAttribute("disabled")).toBe(true);
+
+	fireEvent.click(within(dialog).getByRole("button", { name: "Retry delete" }));
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
+	expect(h.raw.data.put.mock.calls[1]![0]).toEqual(submitted);
+
+	await act(async () => {
+		messages.onUpdate(
+			window_update([{ ...doc, value: submitted.value, revision: doc.revision + 1, updatedAt: 2_000 }]),
+		);
+		await Promise.resolve();
+	});
+	expect(await screen.findByText("Message deleted")).toBeTruthy();
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(false));
+
+	await act(async () => {
+		retryPut.resolve({ _nay: { name: "conflict", message: "Already deleted" } });
+		await retryPut.promise;
+	});
+	expect(screen.queryByText("Already deleted")).toBeNull();
+});
+
+test("a newer live message settles an uncertain delete as a conflict", async () => {
+	const h = make_harness();
+	h.raw.data.put.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "The delete result was lost" },
+	});
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	const doc = message_doc(1_000, { rand: "mine", text: "to remove", createdBy: "user_me" });
+	messages.onUpdate(window_update([doc]));
+
+	await screen.findByText("to remove");
+	fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.click(within(dialog).getByRole("button", { name: "Delete message" }));
+	await within(dialog).findByText("The delete result was lost");
+
+	messages.onUpdate(
+		window_update([
+			{
+				...doc,
+				value: { ...doc.value, text: "other edit", editedAt: 2_000 },
+				revision: 2,
+				updatedAt: 2_000,
+			},
+		]),
+	);
+
+	await waitFor(() =>
+		expect(within(dialog).getByRole("alert").textContent).toContain("Someone else changed this message"),
+	);
+	expect(within(dialog).getByRole("button", { name: "Delete message" })).toBeTruthy();
+	expect((screen.getByRole("button", { name: "#random" }) as HTMLButtonElement).disabled).toBe(false);
+	fireEvent.click(within(dialog).getByRole("button", { name: "Delete message" }));
+	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
+	expect(h.raw.data.put.mock.calls[1]![0].expectedRevision).toBe(2);
 });
 
 test("a plain text-only message row keeps its action buttons focusable", async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([message_doc(1_000, { rand: "m1", text: "plain row" })]));
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
+		window_update([message_doc(1_000, { rand: "m1", text: "plain row" })]),
+	);
 
 	await screen.findByText("plain row");
 	const row = screen.getByText("plain row").closest("[data-key]") as HTMLElement;
@@ -1486,7 +2677,33 @@ async function pick_reaction(row: HTMLElement, name: string) {
 	fireEvent.click(within(palette).getByRole("button", { name }));
 }
 
-test("a row the reactions list cannot reach says so instead of showing no reactions", async () => {
+test("an initial pending reactions list stays neutral until its result arrives", async () => {
+	const h = make_harness();
+	await boot(h);
+	const root = message_doc(2_000, { rand: "newr", text: "pending reactions" });
+	const pendingReactions = deferred<unknown>();
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		return collection === "reactions" ? pendingReactions.promise : http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+	const row = await waitFor(() => row_of("pending reactions"));
+	await waitFor(() => expect(list_calls(h, "reactions")).toHaveLength(1));
+	expect(within(row).queryByText("Reactions unavailable")).toBeNull();
+	expect(within(row).getByRole("button", { name: "Add reaction" })).toBeTruthy();
+
+	await act(async () => {
+		pendingReactions.resolve(http_page([reaction_doc(root.key, "heart", "user_other")], true));
+		await Promise.resolve();
+	});
+	expect(await within(row).findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+	expect(within(row).queryByText("Reactions unavailable")).toBeNull();
+});
+
+test("a healthy row below the reactions frontier stays neutral without claiming no reactions", async () => {
 	const h = make_harness();
 	const newestRoot = message_doc(2_000, { rand: "newr", text: "new root" });
 	await boot_two_roots(h, {
@@ -1495,7 +2712,7 @@ test("a row the reactions list cannot reach says so instead of showing no reacti
 	});
 
 	const oldRow = row_of("old root");
-	expect(await within(oldRow).findByText("Reactions unavailable")).toBeTruthy();
+	expect(within(oldRow).queryByText("Reactions unavailable")).toBeNull();
 	expect(oldRow.querySelector(".message-reactions")).toBeNull();
 
 	// The remove path is hidden, not refused: with no chips there is nothing to un-react. The add
@@ -1557,7 +2774,10 @@ test("an incomplete companion list is reported to the member", async () => {
 		return http_page([], true);
 	});
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
-		window_update([message_doc(2_000, { rand: "newr", text: "new root" }), message_doc(1_000, { rand: "oldr", text: "old root" })]),
+		window_update([
+			message_doc(2_000, { rand: "newr", text: "new root" }),
+			message_doc(1_000, { rand: "oldr", text: "old root" }),
+		]),
 	);
 
 	const notice = await screen.findByText("Some reactions and replies in this range could not be loaded.");
@@ -1583,6 +2803,47 @@ test("a failed companion list retries on the backoff timer without a feed", asyn
 				throw new Error("companion list failed");
 			}
 			return http_page([heart], true);
+		}
+		return http_page([], true);
+	});
+	try {
+		await act(async () => {
+			h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		const row = row_of("new root");
+		expect(within(row).getByText("Reactions unavailable")).toBeTruthy();
+		expect(list_calls(h, "reactions")).toHaveLength(1);
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(1_000);
+		});
+		expect(within(row).getByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+		expect(within(row).queryByText("Reactions unavailable")).toBeNull();
+		expect(list_calls(h, "reactions")).toHaveLength(2);
+	} finally {
+		randomSpy.mockRestore();
+		vi.useRealTimers();
+	}
+});
+
+test("an empty non-final companion page is incomplete and retries", async () => {
+	const h = make_harness();
+	await boot(h);
+	vi.useFakeTimers();
+	const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
+	const root = message_doc(2_000, { rand: "newr", text: "new root" });
+	const heart = reaction_doc(root.key, "heart", "user_other");
+	let reactionLists = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			reactionLists += 1;
+			return reactionLists === 1 ? http_page([], false) : http_page([heart], true);
 		}
 		return http_page([], true);
 	});
@@ -1823,10 +3084,14 @@ test("an in-flight companion list does not start backoff after a channel switch"
 	});
 	const ch1Prefix = `${CH1_KEY}:`;
 	const lists_for_ch1 = () =>
-		list_calls(h, "reactions").filter(([, init]) => (init?.body as { keyPrefix?: string } | undefined)?.keyPrefix === ch1Prefix);
+		list_calls(h, "reactions").filter(
+			([, init]) => (init?.body as { keyPrefix?: string } | undefined)?.keyPrefix === ch1Prefix,
+		);
 	try {
 		await act(async () => {
-			h.find_window("messages", ch1Prefix)!.onUpdate(window_update([message_doc(2_000, { rand: "newr", text: "new root" })]));
+			h.find_window("messages", ch1Prefix)!.onUpdate(
+				window_update([message_doc(2_000, { rand: "newr", text: "new root" })]),
+			);
 			await Promise.resolve();
 			await Promise.resolve();
 		});
@@ -1923,6 +3188,73 @@ test("a dead reactions feed makes the chips uncovered instead of freezing them",
 	expect(screen.queryByRole("button", { name: "Heart, 1 reaction" })).toBeNull();
 });
 
+test("a failed reactions list hides a cached thread-root chip", async () => {
+	const h = make_harness();
+	await boot(h);
+	const root = message_doc(1_000, { rand: "root", text: "failed thread root" });
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			throw new Error("reaction list failed");
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+	await wait_for_feeds(h);
+	h.find_changes("reactions")!.onUpdate(watch_update([reaction_doc(root.key, "heart", "user_me")]));
+	expect(await within(row_of("failed thread root")).findByText("Reactions unavailable")).toBeTruthy();
+
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+	const panel = await screen.findByRole("region", { name: "Thread" });
+	const threadRoot = within(panel).getByText("failed thread root").closest("[data-key]") as HTMLElement;
+	expect(within(threadRoot).getByText("Reactions unavailable")).toBeTruthy();
+	expect(within(threadRoot).queryByRole("button", { name: "Heart, 1 reaction" })).toBeNull();
+	expect(h.raw.data.putOwned).not.toHaveBeenCalled();
+});
+
+test("a dead reactions feed hides stale chips on the thread root and its reply", async () => {
+	const h = make_harness();
+	await boot(h);
+	const root = message_doc(1_000, { rand: "root", text: "dead thread root" });
+	const reply = {
+		...message_doc(2_000, { rand: "r001", text: "dead thread reply" }),
+		collection: "replies",
+		key: `${root.key}:${inv(2_000)}:r001`,
+	};
+	const rootHeart = reaction_doc(root.key, "heart", "user_me");
+	const replyParty = reaction_doc(reply.key, "party", "user_other");
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			return http_page([rootHeart, replyParty], true);
+		}
+		if (collection === "replies") {
+			return http_page([reply], true);
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+	expect(await screen.findByRole("button", { name: /^1 reply/ })).toBeTruthy();
+	await wait_for_feeds(h);
+
+	fireEvent.click(screen.getByRole("button", { name: /^1 reply/ }));
+	const panel = await screen.findByRole("region", { name: "Thread" });
+	expect(await within(panel).findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+	expect(await within(panel).findByRole("button", { name: "Party, 1 reaction" })).toBeTruthy();
+
+	h.find_changes("reactions")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	await waitFor(() => expect(within(panel).getAllByText("Reactions unavailable")).toHaveLength(2));
+	expect(within(panel).queryByRole("button", { name: "Heart, 1 reaction" })).toBeNull();
+	expect(within(panel).queryByRole("button", { name: "Party, 1 reaction" })).toBeNull();
+	expect(h.raw.data.putOwned).not.toHaveBeenCalled();
+});
+
 // #endregion reactions
 
 // #region threads
@@ -2013,7 +3345,7 @@ test("the thread panel opens with focus inside, replies append under the root, c
 	expect(document.activeElement?.textContent).toContain("Reply in thread");
 });
 
-test("switching the open thread to another root resets replies, loading state, and pending sends", async () => {
+test("an in-flight reply blocks a thread switch, and a late failure keeps Retry visible", async () => {
 	const h = make_harness();
 	const ack = deferred<{ _yay: { key: string; revision: number } }>();
 	h.raw.data.append.mockReturnValueOnce(ack.promise);
@@ -2034,7 +3366,13 @@ test("switching the open thread to another root resets replies, loading state, a
 		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
 		if (body?.collection === "replies" && body.keyPrefix === `${rootA.key}:`) {
 			return http_page(
-				[{ ...message_doc(3_000, { text: "reply on a" }), collection: "replies", key: `${rootA.key}:${inv(3_000)}:ra01` }],
+				[
+					{
+						...message_doc(3_000, { text: "reply on a" }),
+						collection: "replies",
+						key: `${rootA.key}:${inv(3_000)}:ra01`,
+					},
+				],
 				true,
 			);
 		}
@@ -2054,14 +3392,34 @@ test("switching the open thread to another root resets replies, loading state, a
 	fireEvent.keyDown(replyBox, { key: "Enter" });
 	await screen.findAllByText("Sending…");
 
-	// Switch the panel to thread B: the panel must remount with fresh state — no A
-	// replies, no surviving pending send whose retry would write under B's prefix.
+	// Keep thread A mounted until the append settles. A late failure must still have its text and
+	// retry button, rather than being lost under a new thread prefix.
+	const selectedChannel = screen.getByRole("button", { name: "#general" });
+	expect(selectedChannel.hasAttribute("disabled")).toBe(true);
+	fireEvent.click(selectedChannel);
+	expect(await screen.findByRole("region", { name: "Thread" })).toBe(panel);
 	const rowB = screen.getByText("root b").closest("[data-key]") as HTMLElement;
-	fireEvent.click(within(rowB).getByRole("button", { name: "Reply in thread" }));
+	const switchThread = within(rowB).getByRole("button", { name: "Reply in thread" });
+	expect(switchThread.hasAttribute("disabled")).toBe(true);
+	fireEvent.click(switchThread);
+	expect(await screen.findByRole("region", { name: "Thread" })).toBe(panel);
+	expect(within(panel).getByText("late reply")).toBeTruthy();
+
+	await act(async () => {
+		ack.reject(new Error("late reply failed"));
+		await Promise.resolve();
+	});
+	expect(await within(panel).findByRole("button", { name: "Retry sending message" })).toBeTruthy();
+	expect(within(panel).getByRole("alert").textContent).toContain("late reply failed");
+	await waitFor(() => expect(switchThread.hasAttribute("disabled")).toBe(false));
+
+	// Once the request has failed, navigation unlocks. Switching now deliberately discards A's
+	// local failed row instead of losing it before the user can choose Retry.
+	fireEvent.click(switchThread);
 	const freshPanel = await screen.findByRole("region", { name: "Thread" });
 	expect(await within(freshPanel).findByText("No replies yet")).toBeTruthy();
 	expect(screen.queryByText("reply on a")).toBeNull();
-	expect(screen.queryByText("Sending…")).toBeNull();
+	expect(screen.queryByText("late reply")).toBeNull();
 });
 
 test("a thread whose replies list is cut says so in the panel", async () => {
@@ -2338,6 +3696,7 @@ test("retained history survives a remote arrival: the messages window never resu
 		]),
 	);
 	await screen.findByText("the older one");
+	expect(announcer_text(container)).toBe("");
 
 	// A remote arrival makes the announcer resolve the author, which re-renders the App.
 	// The window subscription and its retained history must survive that render.
@@ -2356,8 +3715,55 @@ test("retained history survives a remote arrival: the messages window never resu
 	expect(messageWindowCount).toBe(1);
 });
 
+test("history below an invalid live-window frontier is not announced as a new message", async () => {
+	const h = make_harness();
+	const { container } = await boot(h);
+	const invalid = {
+		...message_doc(1_000, { rand: "invalid-live", text: "invalid live" }),
+		value: { notAMessage: true },
+	};
+	const older = message_doc(500, { rand: "valid-history", text: "valid history" });
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	messages.onUpdate(window_update([invalid], { hasMore: true }));
+
+	fireEvent.click(await screen.findByRole("button", { name: "Load older" }));
+	messages.onUpdate(window_update([invalid, older]));
+	await screen.findByText("valid history");
+	expect(announcer_text(container)).toBe("");
+
+	const newer = message_doc(1_500, { rand: "valid-arrival", text: "valid arrival" });
+	messages.onUpdate(window_update([newer, invalid, older]));
+	await waitFor(() => expect(announcer_text(container)).toContain("Bob: valid arrival"));
+});
+
+test("an at-capacity arrival before the older tail does not clear its history fence", async () => {
+	const h = make_harness();
+	const { container } = await boot(h);
+	const live = message_doc(1_000, { rand: "live", text: "live row" });
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	messages.onUpdate(window_update([live], { hasMore: true }));
+	await screen.findByText("live row");
+	fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+
+	// A five-range window pushes its sixth tail before that tail has data. A newer delivery from an
+	// existing range can therefore report atCapacity first, and that newer row must still announce.
+	const newer = message_doc(1_500, { rand: "newer", text: "newer arrival" });
+	messages.onUpdate(window_update([newer, live], { hasMore: true, atCapacity: true }));
+	await waitFor(() => expect(announcer_text(container)).toContain("Bob: newer arrival"));
+	const arrivalAnnouncement = announcer_text(container);
+
+	const older = message_doc(500, { rand: "older", text: "older tail" });
+	messages.onUpdate(window_update([newer, live, older], { hasMore: true, atCapacity: true }));
+	await screen.findByText("older tail");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(announcer_text(container)).toBe(arrivalAnnouncement);
+});
+
 /** Drives the window to capacity so the HTTP control is the only way further back. */
-async function boot_at_capacity(h: ReturnType<typeof make_harness>, newest = message_doc(1_000, { rand: "m1", text: "window newest" })) {
+async function boot_at_capacity(
+	h: ReturnType<typeof make_harness>,
+	newest = message_doc(1_000, { rand: "m1", text: "window newest" }),
+) {
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([newest], { hasMore: true, atCapacity: true }));
 	await screen.findByText("window newest");
@@ -2396,6 +3802,57 @@ test("at capacity the control pages older history over HTTP with a fencepost and
 	expect(list_calls(h, "messages")[1]?.[1]?.body).toMatchObject({ keyStartExclusive: oldest.key });
 	expect(screen.getAllByText("older one").length).toBe(1);
 	expect(screen.getByText("window newest")).toBeTruthy();
+});
+
+test("foreign message values advance both history fences and still start the change feeds", async () => {
+	const h = make_harness();
+	await boot(h);
+	const invalidWindowDoc = {
+		...message_doc(1_000, { rand: "window-bad", text: "invalid window value" }),
+		value: { notAMessage: true },
+	};
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
+		window_update([invalidWindowDoc], { hasMore: true, atCapacity: true }),
+	);
+	await wait_for_companion_lists(h);
+	await wait_for_feeds(h);
+	expect(h.find_changes("messages")!.opts.updatedSince).toBe(1_000);
+	expect(screen.queryByText("invalid window value")).toBeNull();
+
+	const invalidPage = Array.from({ length: 100 }, (_, index) => ({
+		...message_doc(900 - index, { rand: `page-bad-${index}`, text: `invalid page value ${index}` }),
+		value: { notAMessage: true },
+	}));
+	h.raw.fetchJson.mockResolvedValueOnce(http_page(invalidPage, false));
+	const control = screen.getByRole("button", { name: "Load older messages" });
+	fireEvent.click(control);
+	await waitFor(() => expect((control as HTMLButtonElement).disabled).toBe(false));
+	expect(screen.queryByText("invalid page value 0")).toBeNull();
+
+	h.raw.fetchJson.mockResolvedValueOnce(http_page([message_doc(500, { rand: "older-good", text: "older valid" })], true));
+	fireEvent.click(control);
+	await screen.findByText("older valid");
+	expect(list_calls(h, "messages")[0]?.[1]?.body).toMatchObject({ keyStartExclusive: invalidWindowDoc.key });
+	expect(list_calls(h, "messages")[1]?.[1]?.body).toMatchObject({
+		keyStartExclusive: invalidPage.at(-1)!.key,
+	});
+});
+
+test("an empty non-final history page shows Retry and keeps the same fencepost", async () => {
+	const h = make_harness();
+	const newest = await boot_at_capacity(h);
+	h.raw.fetchJson.mockResolvedValueOnce(http_page([], false));
+	const control = screen.getByRole("button", { name: "Load older messages" });
+	fireEvent.click(control);
+	await screen.findByText("Older messages returned an incomplete page. Please retry.");
+	expect((control as HTMLButtonElement).disabled).toBe(false);
+
+	h.raw.fetchJson.mockResolvedValueOnce(http_page([message_doc(500, { rand: "retry-good", text: "retry older" })], true));
+	fireEvent.click(control);
+	await screen.findByText("retry older");
+	expect(list_calls(h, "messages")).toHaveLength(2);
+	expect(list_calls(h, "messages")[0]?.[1]?.body).toMatchObject({ keyStartExclusive: newest.key });
+	expect(list_calls(h, "messages")[1]?.[1]?.body).toMatchObject({ keyStartExclusive: newest.key });
 });
 
 test("a frozen HTTP-loaded row updates when the messages change feed delivers a newer revision", async () => {
@@ -2490,7 +3947,9 @@ test("a truncated messages feed HTTP-lists the frozen window range", async () =>
 	const newest = await boot_at_capacity(h);
 	await wait_for_feeds(h);
 	const messageListsBefore = list_calls(h, "messages").length;
-	h.find_changes("messages")!.onUpdate(watch_update([{ ...newest, revision: 2, updatedAt: newest.updatedAt + 50 }], true));
+	h.find_changes("messages")!.onUpdate(
+		watch_update([{ ...newest, revision: 2, updatedAt: newest.updatedAt + 50 }], true),
+	);
 	await waitFor(() => expect(list_calls(h, "messages").length).toBe(messageListsBefore + 1));
 	expect(list_calls(h, "messages").at(-1)?.[1]?.body).toEqual({
 		collection: "messages",
@@ -2500,7 +3959,7 @@ test("a truncated messages feed HTTP-lists the frozen window range", async () =>
 	});
 });
 
-test("a page in flight disables the control, and rows below the reactions frontier stay uncovered", async () => {
+test("a page in flight disables the control, and rows below a healthy reactions frontier stay neutral", async () => {
 	const h = make_harness();
 	await boot(h);
 	const newest = message_doc(1_000, { rand: "m1", text: "window newest" });
@@ -2533,13 +3992,18 @@ test("a page in flight disables the control, and rows below the reactions fronti
 
 	pendingMessagesPage.resolve(http_page([message_doc(500, { rand: "old1", text: "fetched row" })], false));
 	await screen.findByText("fetched row");
-	expect(within(row_of("fetched row")).getByText("Reactions unavailable")).toBeTruthy();
+	expect(within(row_of("fetched row")).queryByText("Reactions unavailable")).toBeNull();
 });
 
 test("isDone replaces the control with static text and a further interaction issues no request", async () => {
 	const h = make_harness();
 	await boot_at_capacity(h);
-	h.raw.fetchJson.mockResolvedValueOnce(http_page(Array.from({ length: 100 }, (_, index) => message_doc(500 - index, { rand: `o${index}` })), true));
+	h.raw.fetchJson.mockResolvedValueOnce(
+		http_page(
+			Array.from({ length: 100 }, (_, index) => message_doc(500 - index, { rand: `o${index}` })),
+			true,
+		),
+	);
 
 	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
 	await screen.findByText("You have reached the start of #general.");
@@ -2578,7 +4042,10 @@ test("a non-429 failure reads differently and hands the control straight back", 
 	const h = make_harness();
 	await boot_at_capacity(h);
 	h.raw.fetchJson.mockRejectedValueOnce(
-		Object.assign(new Error("/api/v1/plugin-data/list responded 403: forbidden"), { status: 403, responseText: "forbidden" }),
+		Object.assign(new Error("/api/v1/plugin-data/list responded 403: forbidden"), {
+			status: 403,
+			responseText: "forbidden",
+		}),
 	);
 
 	// fetchJson throws on every non-ok response, so a 400, a 403 after a permission change and a
@@ -2650,6 +4117,135 @@ test("the catch-up loop lists another companion page after every delivery", asyn
 	expect(list_calls(h, "replies").length).toBe(1);
 });
 
+test("private same-millisecond roots do not collapse at the companion frontier", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	fireEvent.click(within(nav).getByRole("button", { name: /^#secret-plans/ }));
+	const messages = await waitFor(() => {
+		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	const rootNew = message_doc(1_000, {
+		channelKey: PRIVATE_KEY,
+		rand: "aa00",
+		text: "same-time new root",
+	});
+	const rootOld = message_doc(1_000, {
+		channelKey: PRIVATE_KEY,
+		rand: "aaff",
+		text: "same-time old root",
+	});
+	const firstReaction = reaction_doc(rootNew.key, "heart", "user_other");
+	const firstReply = {
+		...message_doc(1_100, { channelKey: PRIVATE_KEY, rand: "r001", text: "first reply" }),
+		collection: "replies",
+		key: `${rootNew.key}:${inv(1_100)}:r001`,
+	};
+	const secondReply = {
+		...message_doc(1_200, { channelKey: PRIVATE_KEY, rand: "r002", text: "second reply" }),
+		collection: "replies",
+		key: `${rootOld.key}:${inv(1_200)}:r002`,
+	};
+	let reactionPages = 0;
+	let replyPages = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			reactionPages += 1;
+			return reactionPages === 1
+				? http_page([firstReaction], false)
+				: http_page([reaction_doc(rootOld.key, "party", "user_other")], true);
+		}
+		if (collection === "replies") {
+			replyPages += 1;
+			return replyPages === 1 ? http_page([firstReply], false) : http_page([secondReply], true);
+		}
+		return http_page([], true);
+	});
+
+	messages.onUpdate(window_update([rootNew, rootOld]));
+	const oldRow = (await screen.findByText("same-time old root")).closest("[data-key]") as HTMLElement;
+	await waitFor(() => {
+		expect(list_calls(h, "reactions")).toHaveLength(2);
+		expect(list_calls(h, "replies")).toHaveLength(2);
+	});
+
+	const reactionCalls = list_calls(h, "reactions");
+	const replyCalls = list_calls(h, "replies");
+	expect(reactionCalls[1]?.[1]?.body).toMatchObject({ keyStartExclusive: firstReaction.key });
+	expect(replyCalls[1]?.[1]?.body).toMatchObject({ keyStartExclusive: firstReply.key });
+	expect(within(oldRow).getByRole("button", { name: "Party, 1 reaction" })).toBeTruthy();
+	expect(within(oldRow).getByRole("button", { name: /^1 reply/ })).toBeTruthy();
+});
+
+test("invalid full companion pages advance from their raw envelope keys", async () => {
+	const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+	try {
+		const h = make_harness();
+		await boot(h);
+		const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+		const rootNew = message_doc(2_000, { rand: "newr", text: "new root before invalid companions" });
+		const rootOld = message_doc(1_000, { rand: "oldr", text: "old root after invalid companions" });
+		const invalidReactions = Array.from({ length: 100 }, (_, index) => ({
+			...reaction_doc(rootNew.key, "heart", `user_bad_${index}`, `bad_${String(index).padStart(3, "0")}`),
+			value: { removed: false },
+		}));
+		const invalidReplies = Array.from({ length: 100 }, (_, index) => ({
+			...message_doc(3_000 + index, { rand: `b${String(index).padStart(3, "0")}` }),
+			collection: "replies",
+			key: `${rootNew.key}:${inv(3_000 + index)}:b${String(index).padStart(3, "0")}`,
+			value: { text: "missing required fields" },
+		})).sort((a, b) => a.key.localeCompare(b.key));
+		const oldReply = {
+			...message_doc(1_100, { rand: "r001", text: "older valid reply" }),
+			collection: "replies",
+			key: `${rootOld.key}:${inv(1_100)}:r001`,
+		};
+		let reactionPages = 0;
+		let replyPages = 0;
+		h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+			if (path !== "/api/v1/plugin-data/list") {
+				throw new Error("fetchJson not stubbed");
+			}
+			const collection = (init?.body as { collection?: string } | undefined)?.collection;
+			if (collection === "reactions") {
+				reactionPages += 1;
+				return reactionPages === 1
+					? http_page(invalidReactions, false)
+					: http_page([reaction_doc(rootOld.key, "party", "user_other")], true);
+			}
+			if (collection === "replies") {
+				replyPages += 1;
+				return replyPages === 1 ? http_page(invalidReplies, false) : http_page([oldReply], true);
+			}
+			return http_page([], true);
+		});
+
+		messages.onUpdate(window_update([rootNew, rootOld]));
+		const oldRow = (await screen.findByText("old root after invalid companions")).closest("[data-key]") as HTMLElement;
+		await waitFor(() => {
+			expect(list_calls(h, "reactions")).toHaveLength(2);
+			expect(list_calls(h, "replies")).toHaveLength(2);
+		});
+
+		expect(list_calls(h, "reactions")[1]?.[1]?.body).toMatchObject({
+			keyStartExclusive: invalidReactions.at(-1)!.key,
+		});
+		expect(list_calls(h, "replies")[1]?.[1]?.body).toMatchObject({
+			keyStartExclusive: invalidReplies.at(-1)!.key,
+		});
+		expect(within(oldRow).getByRole("button", { name: "Party, 1 reaction" })).toBeTruthy();
+		expect(within(oldRow).getByRole("button", { name: /^1 reply/ })).toBeTruthy();
+	} finally {
+		warn.mockRestore();
+	}
+});
+
 // #endregion companion catch-up
 
 // #region attachments
@@ -2672,7 +4268,14 @@ test("one click resolves the whole message in a single request; a per-file error
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
 		window_update([
-			message_doc(1_000, { rand: "m1", text: "with files", attachments: [{ fileNodeId: "n1", name: "spec.pdf" }, { fileNodeId: "n2", name: "secret.txt" }] }),
+			message_doc(1_000, {
+				rand: "m1",
+				text: "with files",
+				attachments: [
+					{ fileNodeId: "n1", name: "spec.pdf" },
+					{ fileNodeId: "n2", name: "secret.txt" },
+				],
+			}),
 			message_doc(900, { rand: "m2", text: "other files", attachments: [{ fileNodeId: "n9", name: "untouched.pdf" }] }),
 		]),
 	);
@@ -2735,7 +4338,14 @@ test("the picker lists workspace files and a picked file rides the next send", a
 		if (path === "/api/v1/files/list") {
 			return {
 				items: [
-					{ path: "/docs/spec.pdf", name: "spec.pdf", kind: "file", nodeId: "n1", contentType: "application/pdf", updatedAt: 1 },
+					{
+						path: "/docs/spec.pdf",
+						name: "spec.pdf",
+						kind: "file",
+						nodeId: "n1",
+						contentType: "application/pdf",
+						updatedAt: 1,
+					},
 				],
 				cursor: null,
 				isDone: true,
@@ -2837,9 +4447,15 @@ const PRIVATE_DM_KEY = "p/55555555-5555-4555-8555-555555555555";
  * read with no key range answers only the public part of a collection, so a scoped document never
  * comes back on the public watch. `privateKeys` are the ranges this member is in.
  */
-async function boot_sidebar(h: ReturnType<typeof make_harness>, channels: unknown[], privateKeys: string[] = []) {
+async function boot_sidebar(
+	h: ReturnType<typeof make_harness>,
+	channels: unknown[],
+	privateKeys: string[] = [],
+	strict = false,
+) {
 	const publicChannels = channels.filter((doc) => !privateKeys.some((key) => (doc as { key: string }).key === key));
-	const utils = render(<App client={h.client} />);
+	const app = <App client={h.client} />;
+	const utils = render(strict ? <StrictMode>{app}</StrictMode> : app);
 	h.find_watch("channels")!.onUpdate(watch_update(publicChannels));
 	await deliver_scopes(h, channels, privateKeys);
 	await waitFor(() => expect(screen.getByRole("navigation", { name: "Channels" })).toBeTruthy());
@@ -2866,6 +4482,47 @@ async function deliver_scopes(h: ReturnType<typeof make_harness>, channels: unkn
 	}
 }
 
+/** Opens a Threads row whose root is outside the selected channel's loaded message window. */
+async function open_missing_general_thread_from_threads(h: ReturnType<typeof make_harness>) {
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	fireEvent.click(within(nav).getByRole("button", { name: "Threads" }));
+	const repliesFeed = await waitFor(() => {
+		const found = h.find_recent("replies");
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	const rootKey = `${CH1_KEY}:${inv(3000)}:missing`;
+	repliesFeed.onUpdate(
+		watch_update([
+			{
+				collection: "replies",
+				key: `${rootKey}:${inv(3600)}:reply`,
+				value: { text: "reply to unloaded root", attachments: [], editedAt: null, deletedAt: null },
+				revision: 1,
+				createdBy: "user_other",
+				updatedBy: "user_other",
+				ownership: "owned",
+				createdAt: 3600,
+				updatedAt: 3600,
+			},
+		]),
+	);
+	const view = await screen.findByRole("region", { name: "Threads" });
+	fireEvent.click(await waitFor(() => within(view).getByRole("button", { name: /^#general/ })));
+	await waitFor(() =>
+		expect(
+			within(nav)
+				.getByRole("button", { name: /^#general/ })
+				.getAttribute("aria-current"),
+		).toBe("page"),
+	);
+	expect(screen.queryByRole("region", { name: "Thread" })).toBeNull();
+	const app = document.querySelector(".chitchat")!;
+	expect(app.className).toBe("chitchat");
+	expect(app.querySelector(".thread")).toBeNull();
+	expect(app.querySelector(".app-bar > .drawer-toggle")).toBe(screen.getByRole("button", { name: "Channels" }));
+}
+
 test("a private channel the member is not in leaves nothing behind — no row, no name, no placeholder", async () => {
 	const h = make_harness();
 	// This is what a member outside the scope really receives. Every read door hides a scope's
@@ -2882,6 +4539,95 @@ test("a private channel the member is not in leaves nothing behind — no row, n
 	expect(nav.textContent).not.toMatch(/locked|hidden|private|no access|restricted/i);
 });
 
+test("a public p/ channel doc is dropped instead of being shown as private", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [
+		channel_doc(CH1_KEY, "general"),
+		channel_doc(PRIVATE_KEY, "forged-secret"),
+		channel_doc("p/not-a-uuid", "forged-malformed"),
+	]);
+
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	expect(within(nav).getByText("#general")).toBeTruthy();
+	expect(nav.textContent).not.toContain("forged-secret");
+	expect(nav.textContent).not.toContain("forged-malformed");
+	expect(nav.textContent).not.toContain("(private)");
+});
+
+test("private watches accept only the exact Chitchat scope and channel root", async () => {
+	const h = make_harness();
+	render(<App client={h.client} />);
+	h.find_watch("channels")!.onUpdate(watch_update([channel_doc(CH1_KEY, "general")]));
+	h.send_scopes([
+		{
+			scopeId: "p/not-a-uuid",
+			keyPrefix: "p/not-a-uuid",
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "manage",
+		},
+		{
+			scopeId: PRIVATE_KEY,
+			keyPrefix: PRIVATE_DM_KEY,
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "manage",
+		},
+		{
+			scopeId: PRIVATE_DM_KEY,
+			keyPrefix: PRIVATE_DM_KEY,
+			collections: ["channels", "messages", "replies"],
+			level: "manage",
+		},
+		{
+			scopeId: "p/cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+			keyPrefix: "p/cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS, "files"],
+			level: "manage",
+		},
+		{
+			scopeId: "p/dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+			keyPrefix: "p/dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "manage",
+			appendActivity: [{ collection: "messages", at: -1, createdByUserId: "user_other" }],
+		},
+		{
+			scopeId: "p/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+			keyPrefix: "p/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "manage",
+			appendActivity: [{ collection: "messages", at: 1, createdByUserId: "user_other", sequence: -1 }],
+		},
+	]);
+
+	expect(h.find_watch("channels", "p/not-a-uuid")).toBeUndefined();
+	expect(h.find_watch("channels", PRIVATE_KEY)).toBeUndefined();
+	expect(h.find_watch("channels", PRIVATE_DM_KEY)).toBeUndefined();
+	expect(h.find_watch("channels", "p/cccccccc-cccc-4ccc-8ccc-cccccccccccc")).toBeUndefined();
+	expect(h.find_watch("channels", "p/dddddddd-dddd-4ddd-8ddd-dddddddddddd")).toBeUndefined();
+	expect(h.find_watch("channels", "p/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")).toBeUndefined();
+
+	h.send_scopes([
+		{
+			scopeId: PRIVATE_KEY,
+			keyPrefix: PRIVATE_KEY,
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "manage",
+		},
+	]);
+	const privateWatch = await waitFor(() => {
+		const found = h.find_watch("channels", PRIVATE_KEY);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	privateWatch.onUpdate(
+		watch_update([channel_doc(`${PRIVATE_KEY}:child`, "forged-child"), channel_doc(PRIVATE_KEY, "secret-plans")]),
+	);
+
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	await waitFor(() => expect(within(nav).getByText("#secret-plans (private)")).toBeTruthy());
+	expect(nav.textContent).not.toContain("forged-child");
+});
+
 test("the same channel shows normally for a member who is in it", async () => {
 	const h = make_harness();
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
@@ -2894,7 +4640,7 @@ test("the same channel shows normally for a member who is in it", async () => {
 	expect(await open_channel_menu_item("secret-plans", "People in #secret-plans")).toBeTruthy();
 });
 
-test("a private channel arrives through its own scope read, and leaves when the member is taken out", async () => {
+test("a private channel leaves when the full scope list says the member was taken out", async () => {
 	const h = make_harness();
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general")]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
@@ -2912,11 +4658,528 @@ test("a private channel arrives through its own scope read, and leaves when the 
 		"#secret-plans (private)",
 	]);
 
-	// Being taken out kills that read. The channel goes with it, in the open page.
-	h.find_watch("channels", PRIVATE_KEY)!.onUpdate(null, { reason: "denied", message: "x" });
+	// A dead ranged read is not proof of departure. The full scope list is still live and still
+	// names this channel, so keep the row until that list changes.
+	h.find_watch("channels", PRIVATE_KEY)!.onUpdate(null, { reason: "unavailable", message: "x" });
+	expect(within(nav).getByText("#secret-plans (private)")).toBeTruthy();
+
+	// The full membership list is the departure signal. The ranged read may die for other reasons,
+	// and the SDK drops a late death after its subscription was already released.
+	h.send_scopes([]);
 	await waitFor(() => expect(nav.textContent).not.toContain("secret-plans"));
 	// And the public channel is untouched: one scope ending is not the page losing access.
 	expect(within(nav).getByText("#general")).toBeTruthy();
+});
+
+test("an unavailable private channel read restarts and applies its fresh channel and cursor", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const firstWatch = h.find_watch("channels", PRIVATE_KEY)!;
+	firstWatch.onUpdate(watch_update([channel_doc(PRIVATE_KEY, "secret-plans"), private_cursor_doc(PRIVATE_KEY, 5000)]));
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const cached = await waitFor(() => within(nav).getByRole("button", { name: "#secret-plans (private)" }));
+
+	vi.useFakeTimers();
+	try {
+		firstWatch.onUpdate(null, { reason: "unavailable", message: "Connection lost" });
+		expect(firstWatch.unsubscribed).toBe(true);
+		expect(cached.isConnected).toBe(true);
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(249);
+		});
+		expect(h.find_watch("channels", PRIVATE_KEY)).toBeUndefined();
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(1);
+		});
+		const restarted = h.find_watch("channels", PRIVATE_KEY);
+		expect(restarted).toBeTruthy();
+		expect(restarted).not.toBe(firstWatch);
+
+		await act(async () => {
+			restarted!.onUpdate(
+				watch_update([
+					{ ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 },
+					private_cursor_doc(PRIVATE_KEY, 8000, 2),
+				]),
+			);
+			await Promise.resolve();
+		});
+		const renamed = within(nav).getByRole("button", { name: "#renamed (private)" });
+		expect(renamed.classList.contains("is-unread")).toBe(false);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("a denied private channel read restarts when watchMine coalesces a fast remove and re-add", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const firstWatch = h.find_watch("channels", PRIVATE_KEY)!;
+	firstWatch.onUpdate(watch_update([channel_doc(PRIVATE_KEY, "secret-plans"), private_cursor_doc(PRIVATE_KEY, 5000)]));
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	await waitFor(() => expect(within(nav).getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy());
+
+	vi.useFakeTimers();
+	try {
+		// The ranged query sees the short removal, but the full list sees only the final re-add.
+		firstWatch.onUpdate(null, { reason: "denied", message: "Access changed" });
+		h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
+		expect(firstWatch.unsubscribed).toBe(true);
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(250);
+		});
+		const activePrivateWatches = h.watches.filter(
+			(sub) => !sub.unsubscribed && sub.opts.collection === "channels" && sub.opts.keyPrefix === PRIVATE_KEY,
+		);
+		expect(activePrivateWatches).toHaveLength(1);
+		expect(
+			h.watches.filter((sub) => sub.opts.collection === "channels" && sub.opts.keyPrefix === PRIVATE_KEY),
+		).toHaveLength(2);
+
+		await act(async () => {
+			activePrivateWatches[0]!.onUpdate(
+				watch_update([
+					{ ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 },
+					private_cursor_doc(PRIVATE_KEY, 8000, 2),
+				]),
+			);
+			await Promise.resolve();
+		});
+		expect(within(nav).getByRole("button", { name: "#renamed (private)" })).toBeTruthy();
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("an open private channel restarts its reads in place after a fast remove and re-add", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const rangedWatch = h.find_watch("channels", PRIVATE_KEY)!;
+	const rangedWatchCount = h.watches.length;
+	const firstWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "cached root" });
+	firstWindow.onUpdate(window_update([root]));
+	await wait_for_feeds(h, PRIVATE_KEY);
+	const firstFeeds = ["messages", "replies", "reactions"].map((collection) => h.find_changes(collection, PRIVATE_KEY)!);
+	const textarea = composer_box("Message #secret-plans");
+	type_in_composer(textarea, "keep this draft");
+	textarea.focus();
+
+	// The scoped reads see the short removal. Keep the mounted view and its draft until the full
+	// scope list delivers the re-added membership generation.
+	firstWindow.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	for (const feed of firstFeeds) {
+		feed.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	}
+	expect(textarea.isConnected).toBe(true);
+	expect(textarea.value).toBe("keep this draft");
+	expect(document.activeElement).toBe(textarea);
+
+	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
+	const replacementWindow = await waitFor(() => {
+		const active = h.windows.filter(
+			(sub) => !sub.unsubscribed && sub.opts.collection === "messages" && sub.opts.keyPrefix === `${PRIVATE_KEY}:`,
+		);
+		expect(active).toHaveLength(1);
+		expect(h.windows.filter((sub) => sub.opts.keyPrefix === `${PRIVATE_KEY}:`)).toHaveLength(2);
+		return active[0]!;
+	});
+	expect(replacementWindow).not.toBe(firstWindow);
+	expect(screen.getByText("cached root")).toBeTruthy();
+	expect(textarea.isConnected).toBe(true);
+	expect(textarea.value).toBe("keep this draft");
+	expect(document.activeElement).toBe(textarea);
+	expect(h.find_watch("channels", PRIVATE_KEY)).toBe(rangedWatch);
+	expect(h.watches).toHaveLength(rangedWatchCount);
+	await waitFor(() =>
+		expect(h.changes.filter((sub) => !sub.unsubscribed && sub.opts.scopeId === PRIVATE_KEY)).toHaveLength(0),
+	);
+
+	replacementWindow.onUpdate(window_update([root]));
+	await waitFor(() => {
+		const active = h.changes.filter((sub) => !sub.unsubscribed && sub.opts.scopeId === PRIVATE_KEY);
+		expect(active).toHaveLength(3);
+		expect(h.changes.filter((sub) => sub.opts.scopeId === PRIVATE_KEY)).toHaveLength(6);
+	});
+	const replacementMessages = h.find_changes("messages", PRIVATE_KEY)!;
+	const replacementReplies = h.find_changes("replies", PRIVATE_KEY)!;
+	const replacementReactions = h.find_changes("reactions", PRIVATE_KEY)!;
+	const editedRoot = {
+		...root,
+		value: { ...root.value, text: "fresh root", editedAt: 2_000 },
+		revision: 2,
+		updatedAt: 2_000,
+	};
+	const reply = {
+		...message_doc(3_000, { channelKey: PRIVATE_KEY, rand: "r001", text: "fresh reply" }),
+		collection: "replies",
+		key: `${root.key}:${inv(3_000)}:r001`,
+	};
+	replacementMessages.onUpdate(watch_update([editedRoot]));
+	replacementReplies.onUpdate(watch_update([reply]));
+	replacementReactions.onUpdate(watch_update([{ ...reaction_doc(root.key, "heart", "user_other"), updatedAt: 3_000 }]));
+
+	expect(await screen.findByText("fresh root")).toBeTruthy();
+	expect(await screen.findByRole("button", { name: /^1 reply/ })).toBeTruthy();
+	expect(await screen.findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+	await waitFor(() => expect(screen.queryAllByRole("alert")).toHaveLength(0));
+	expect(textarea.isConnected).toBe(true);
+	expect(textarea.value).toBe("keep this draft");
+	expect(document.activeElement).toBe(textarea);
+});
+
+test("a private read generation scans companion gaps from the beginning", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "cached root" });
+	const newerRoot = message_doc(3_000, { channelKey: PRIVATE_KEY, rand: "newr", text: "new root" });
+	const oldReply = {
+		...message_doc(1_500, { channelKey: PRIVATE_KEY, rand: "r001", text: "old reply" }),
+		collection: "replies",
+		key: `${root.key}:${inv(1_500)}:r001`,
+	};
+	const gapReply = {
+		...message_doc(2_000, { channelKey: PRIVATE_KEY, rand: "r002", text: "gap reply" }),
+		collection: "replies",
+		key: `${root.key}:${inv(2_000)}:r002`,
+	};
+	const oldReaction = { ...reaction_doc(root.key, "party", "user_other"), createdAt: 1_500, updatedAt: 1_500 };
+	const gapReaction = { ...reaction_doc(root.key, "heart", "user_third"), createdAt: 2_000, updatedAt: 2_000 };
+	let reactionLists = 0;
+	let replyLists = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			reactionLists += 1;
+			return http_page(reactionLists === 1 ? [oldReaction] : [gapReaction, oldReaction], true);
+		}
+		if (collection === "replies") {
+			replyLists += 1;
+			return http_page(replyLists === 1 ? [oldReply] : [gapReply, oldReply], true);
+		}
+		return http_page([], true);
+	});
+
+	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([root]));
+	expect(await screen.findByRole("button", { name: "Party, 1 reaction" })).toBeTruthy();
+	expect(await screen.findByRole("button", { name: /^1 reply/ })).toBeTruthy();
+	expect(list_calls(h, "reactions")).toHaveLength(1);
+	expect(list_calls(h, "replies")).toHaveLength(1);
+
+	// The gap companion rows are older than the new root's feed fence. Only a fresh HTTP scan
+	// from the channel prefix can recover them after access returns.
+	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
+	const replacementWindow = await waitFor(() => {
+		const active = h.windows.filter(
+			(sub) => !sub.unsubscribed && sub.opts.collection === "messages" && sub.opts.keyPrefix === `${PRIVATE_KEY}:`,
+		);
+		expect(active).toHaveLength(1);
+		expect(h.windows.filter((sub) => sub.opts.keyPrefix === `${PRIVATE_KEY}:`)).toHaveLength(2);
+		return active[0]!;
+	});
+	replacementWindow.onUpdate(window_update([newerRoot, root]));
+
+	expect(await screen.findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+	expect(await screen.findByRole("button", { name: /^2 replies/ })).toBeTruthy();
+	expect(list_calls(h, "reactions")).toHaveLength(2);
+	expect(list_calls(h, "replies")).toHaveLength(2);
+	for (const collection of ["reactions", "replies"] as const) {
+		const secondBody = list_calls(h, collection)[1]![1]?.body as { keyStartExclusive?: string };
+		expect(secondBody.keyStartExclusive).toBeUndefined();
+		const feed = h.find_changes(collection, PRIVATE_KEY)!;
+		expect(feed.opts.updatedSince).toBe(3_000);
+		expect(feed.opts.updatedSince).toBeGreaterThan(gapReaction.updatedAt);
+	}
+});
+
+test("a pending reactions refresh keeps cached groups without an unavailable warning", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "cached reactions" });
+	const heart = { ...reaction_doc(root.key, "heart", "user_other"), updatedAt: 1_000 };
+	const party = { ...reaction_doc(root.key, "party", "user_third"), updatedAt: 2_000 };
+	const refreshedReactions = deferred<unknown>();
+	let reactionLists = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			reactionLists += 1;
+			return reactionLists === 1 ? http_page([heart], true) : refreshedReactions.promise;
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([root]));
+	expect(await screen.findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+
+	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
+	const replacementWindow = await waitFor(() => {
+		const active = h.windows.filter(
+			(sub) => !sub.unsubscribed && sub.opts.collection === "messages" && sub.opts.keyPrefix === `${PRIVATE_KEY}:`,
+		);
+		expect(active).toHaveLength(1);
+		expect(h.windows.filter((sub) => sub.opts.keyPrefix === `${PRIVATE_KEY}:`)).toHaveLength(2);
+		return active[0]!;
+	});
+	replacementWindow.onUpdate(window_update([root]));
+	await waitFor(() => expect(list_calls(h, "reactions")).toHaveLength(2));
+	const row = row_of("cached reactions");
+	expect(within(row).getByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+	expect(within(row).queryByText("Reactions unavailable")).toBeNull();
+
+	await act(async () => {
+		refreshedReactions.resolve(http_page([party, heart], true));
+		await Promise.resolve();
+	});
+	expect(await within(row).findByRole("button", { name: "Party, 1 reaction" })).toBeTruthy();
+	expect(within(row).queryByText("Reactions unavailable")).toBeNull();
+});
+
+test("late companion results from an old private read generation are ignored", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "cached root" });
+	const oldReactions = deferred<unknown>();
+	const oldReplies = deferred<unknown>();
+	const currentReactions = deferred<unknown>();
+	const currentReplies = deferred<unknown>();
+	let reactionLists = 0;
+	let replyLists = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		if (collection === "reactions") {
+			reactionLists += 1;
+			return reactionLists === 1 ? oldReactions.promise : currentReactions.promise;
+		}
+		if (collection === "replies") {
+			replyLists += 1;
+			return replyLists === 1 ? oldReplies.promise : currentReplies.promise;
+		}
+		return http_page([], true);
+	});
+
+	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([root]));
+	await waitFor(() => {
+		expect(list_calls(h, "reactions")).toHaveLength(1);
+		expect(list_calls(h, "replies")).toHaveLength(1);
+	});
+	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
+	const replacementWindow = await waitFor(() => {
+		const active = h.windows.filter(
+			(sub) => !sub.unsubscribed && sub.opts.collection === "messages" && sub.opts.keyPrefix === `${PRIVATE_KEY}:`,
+		);
+		expect(active).toHaveLength(1);
+		expect(h.windows.filter((sub) => sub.opts.keyPrefix === `${PRIVATE_KEY}:`)).toHaveLength(2);
+		return active[0]!;
+	});
+	replacementWindow.onUpdate(window_update([root]));
+	await waitFor(() => {
+		expect(list_calls(h, "reactions")).toHaveLength(2);
+		expect(list_calls(h, "replies")).toHaveLength(2);
+	});
+
+	const currentReaction = { ...reaction_doc(root.key, "heart", "user_other"), updatedAt: 2_000 };
+	const currentReply = {
+		...message_doc(2_000, { channelKey: PRIVATE_KEY, rand: "r002", text: "current reply" }),
+		collection: "replies",
+		key: `${root.key}:${inv(2_000)}:r002`,
+	};
+	await act(async () => {
+		currentReactions.resolve(http_page([currentReaction], true));
+		currentReplies.resolve(http_page([currentReply], true));
+		await Promise.resolve();
+	});
+	expect(await screen.findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+	expect(await screen.findByRole("button", { name: /^1 reply/ })).toBeTruthy();
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			oldReactions.resolve(http_page([{ ...reaction_doc(root.key, "party", "user_third"), updatedAt: 1_500 }], false));
+			oldReplies.reject(new Error("old reply list failed"));
+			await Promise.resolve();
+			await Promise.resolve();
+			await vi.advanceTimersByTimeAsync(60_000);
+		});
+		expect(screen.queryByRole("button", { name: "Party, 1 reaction" })).toBeNull();
+		expect(screen.getByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
+		expect(screen.getByRole("button", { name: /^1 reply/ })).toBeTruthy();
+		expect(screen.queryByText("Some reactions and replies in this range could not be loaded.")).toBeNull();
+		expect(list_calls(h, "reactions")).toHaveLength(2);
+		expect(list_calls(h, "replies")).toHaveLength(2);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("an open private thread refreshes its exact reply list in place for a new read generation", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "thread root" });
+	const oldExact = deferred<unknown>();
+	const currentExact = deferred<unknown>();
+	let exactLists = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
+		if (body?.collection === "replies" && body.keyPrefix === `${root.key}:`) {
+			exactLists += 1;
+			return exactLists === 1 ? oldExact.promise : currentExact.promise;
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([root]));
+	await screen.findByText("thread root");
+
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+	const panel = await screen.findByRole("region", { name: "Thread" });
+	await waitFor(() => expect(exactLists).toBe(1));
+	const replyBox = within(panel).getByRole("combobox", { name: "Reply in thread" }) as HTMLTextAreaElement;
+	type_in_composer(replyBox, "keep this reply draft");
+	replyBox.focus();
+
+	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
+	await waitFor(() => expect(exactLists).toBe(2));
+	expect(screen.getByRole("region", { name: "Thread" })).toBe(panel);
+	expect(within(panel).getByRole("combobox", { name: "Reply in thread" })).toBe(replyBox);
+	expect(replyBox.value).toBe("keep this reply draft");
+	expect(document.activeElement).toBe(replyBox);
+
+	await act(async () => {
+		oldExact.reject(new Error("stale exact list failed"));
+		await Promise.resolve();
+	});
+	expect(within(panel).queryByText("stale exact list failed")).toBeNull();
+	expect(within(panel).getByText("Loading replies…")).toBeTruthy();
+
+	const freshReply = {
+		...message_doc(2_000, { channelKey: PRIVATE_KEY, rand: "r002", text: "fresh exact reply" }),
+		collection: "replies",
+		key: `${root.key}:${inv(2_000)}:r002`,
+	};
+	await act(async () => {
+		currentExact.resolve(http_page([freshReply], true));
+		await Promise.resolve();
+	});
+	expect(await within(panel).findByText("fresh exact reply")).toBeTruthy();
+	expect(within(panel).queryByText("Loading replies…")).toBeNull();
+	expect(within(panel).queryByRole("alert")).toBeNull();
+	expect(replyBox.hasAttribute("disabled")).toBe(false);
+	expect(replyBox.value).toBe("keep this reply draft");
+	expect(document.activeElement).toBe(replyBox);
+});
+
+test("a private thread keeps cached replies and focus while its exact list refreshes", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "thread root" });
+	const cachedReply = {
+		...message_doc(2_000, { channelKey: PRIVATE_KEY, rand: "r002", text: "cached exact reply" }),
+		collection: "replies",
+		key: `${root.key}:${inv(2_000)}:r002`,
+	};
+	const refreshedExact = deferred<unknown>();
+	let exactLists = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		if (path !== "/api/v1/plugin-data/list") {
+			throw new Error("fetchJson not stubbed");
+		}
+		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
+		if (body?.collection === "replies" && body.keyPrefix === `${root.key}:`) {
+			exactLists += 1;
+			return exactLists === 1 ? http_page([cachedReply], true) : refreshedExact.promise;
+		}
+		return http_page([], true);
+	});
+	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([root]));
+	await screen.findByText("thread root");
+
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+	const panel = await screen.findByRole("region", { name: "Thread" });
+	const replyRow = row_of("cached exact reply");
+	const reactionButton = within(replyRow).getByRole("button", { name: "Add reaction" });
+	reactionButton.focus();
+	expect(document.activeElement).toBe(reactionButton);
+
+	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
+	await waitFor(() => expect(exactLists).toBe(2));
+	expect(within(panel).getByText("Loading replies…")).toBeTruthy();
+	expect(row_of("cached exact reply")).toBe(replyRow);
+	expect(within(replyRow).getByRole("button", { name: "Add reaction" })).toBe(reactionButton);
+	expect(document.activeElement).toBe(reactionButton);
+
+	await act(async () => {
+		refreshedExact.resolve(http_page([cachedReply], true));
+		await Promise.resolve();
+	});
+	await waitFor(() => expect(within(panel).queryByText("Loading replies…")).toBeNull());
+	expect(row_of("cached exact reply")).toBe(replyRow);
+	expect(document.activeElement).toBe(reactionButton);
+});
+
+test("a private channel read restarts when the full scope list recovers after its retry", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const firstWatch = h.find_watch("channels", PRIVATE_KEY)!;
+	firstWatch.onUpdate(watch_update([channel_doc(PRIVATE_KEY, "secret-plans"), private_cursor_doc(PRIVATE_KEY, 5000)]));
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	await waitFor(() => expect(within(nav).getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy());
+
+	vi.useFakeTimers();
+	try {
+		// The ranged retry is queued first. It fires while the full scope list is still dead.
+		firstWatch.onUpdate(null, { reason: "unavailable", message: "Connection lost" });
+		h.send_scope_death("unavailable");
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(250);
+		});
+		expect(h.find_watch("channels", PRIVATE_KEY)).toBeUndefined();
+		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(2);
+
+		await act(async () => {
+			h.send_scopes([private_scope()]);
+			await Promise.resolve();
+		});
+		const activePrivateWatches = h.watches.filter(
+			(sub) => !sub.unsubscribed && sub.opts.collection === "channels" && sub.opts.keyPrefix === PRIVATE_KEY,
+		);
+		expect(activePrivateWatches).toHaveLength(1);
+		const restarted = activePrivateWatches[0]!;
+		expect(restarted).not.toBe(firstWatch);
+		expect(
+			h.watches.filter((sub) => sub.opts.collection === "channels" && sub.opts.keyPrefix === PRIVATE_KEY),
+		).toHaveLength(2);
+
+		await act(async () => {
+			restarted.onUpdate(
+				watch_update([
+					{ ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 },
+					private_cursor_doc(PRIVATE_KEY, 8000, 2),
+				]),
+			);
+			await Promise.resolve();
+		});
+		const renamed = within(nav).getByRole("button", { name: "#renamed (private)" });
+		expect(renamed.classList.contains("is-unread")).toBe(false);
+	} finally {
+		vi.useRealTimers();
+	}
 });
 
 test("a two-person direct message renders through the same component and store path as a bigger private channel", async () => {
@@ -2931,7 +5194,11 @@ test("a two-person direct message renders through the same component and store p
 		{ userId: "user_third", level: "member" },
 	]);
 	// "bob" sorts first, so the DM is the selected channel.
-	await boot_sidebar(h, [channel_doc(PRIVATE_DM_KEY, "bob"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_DM_KEY, PRIVATE_KEY]);
+	await boot_sidebar(
+		h,
+		[channel_doc(PRIVATE_DM_KEY, "bob"), channel_doc(PRIVATE_KEY, "secret-plans")],
+		[PRIVATE_DM_KEY, PRIVATE_KEY],
+	);
 
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 	const rows = [...nav.querySelectorAll(".channel-item")];
@@ -2941,7 +5208,9 @@ test("a two-person direct message renders through the same component and store p
 
 	// And the same store path: the same three collections, each keyed off the channel's own key.
 	await waitFor(() => expect(h.find_window("messages", `${PRIVATE_DM_KEY}:`)).toBeTruthy());
-	h.find_window("messages", `${PRIVATE_DM_KEY}:`)!.onUpdate(window_update([message_doc(1_000, { channelKey: PRIVATE_DM_KEY, rand: "dm1", text: "hi" })]));
+	h.find_window("messages", `${PRIVATE_DM_KEY}:`)!.onUpdate(
+		window_update([message_doc(1_000, { channelKey: PRIVATE_DM_KEY, rand: "dm1", text: "hi" })]),
+	);
 	await wait_for_feeds(h, PRIVATE_DM_KEY);
 	expect(h.find_changes("messages", PRIVATE_DM_KEY)?.opts.scopeId).toBe(PRIVATE_DM_KEY);
 	expect(h.find_changes("replies", PRIVATE_DM_KEY)?.opts.scopeId).toBe(PRIVATE_DM_KEY);
@@ -2951,7 +5220,9 @@ test("a two-person direct message renders through the same component and store p
 
 	fireEvent.click(screen.getByRole("button", { name: "#secret-plans (private)" }));
 	await waitFor(() => expect(h.find_window("messages", `${PRIVATE_KEY}:`)).toBeTruthy());
-	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "p1", text: "secret" })]));
+	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(
+		window_update([message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "p1", text: "secret" })]),
+	);
 	await wait_for_feeds(h, PRIVATE_KEY);
 	expect(h.find_changes("messages", PRIVATE_KEY)?.opts.scopeId).toBe(PRIVATE_KEY);
 	expect(h.find_window("reactions", `${PRIVATE_KEY}:`)).toBeUndefined();
@@ -2976,7 +5247,7 @@ test("a private channel names the organization owner as a reader, and a public o
 	expect(privacy.textContent).toContain("organization owner");
 });
 
-test("creating a private channel scopes every collection before the channel document exists", async () => {
+test("creating a private channel sends its whole setup through one atomic scope call", async () => {
 	const h = make_harness();
 	await boot(h);
 	const before = h.calls.length;
@@ -2989,18 +5260,446 @@ test("creating a private channel scopes every collection before the channel docu
 	fireEvent.click(await within(dialog).findByLabelText("Bob"));
 	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
 
-	await waitFor(() => expect(h.calls.length).toBeGreaterThan(before + 2));
+	await waitFor(() => expect(h.calls.length).toBe(before + 1));
 	const made = h.calls.slice(before);
-	// The scope first, then the people, then the document. A channel document written before its
-	// scope existed could never be made private: a scope refuses a key range that already holds
-	// documents, and the channel document is the one carrying the channel's name.
-	expect(made.map((call) => call.op)).toEqual(["scopes.create", "scopes.setPrincipal", "put"]);
-	// All four collections in one call. Three of four would leave the fourth readable by everybody.
+	expect(made.map((call) => call.op)).toEqual(["scopes.createWithDocument"]);
 	expect(made[0].args.collections).toEqual(["channels", "messages", "replies", "reactions"]);
 	expect(made[0].args.keyPrefix).toBe(made[0].args.scopeId);
 	expect(String(made[0].args.keyPrefix)).toMatch(/^p\//);
-	expect(made[1].args).toEqual({ scopeId: made[0].args.scopeId, userId: "user_other", level: "member" });
-	expect(made[2].args).toEqual({ collection: "channels", key: made[0].args.keyPrefix });
+	expect(made[0].args.principals).toEqual([{ userId: "user_other", level: "member" }]);
+	expect(made[0].args.document).toEqual({
+		collection: "channels",
+		key: made[0].args.scopeId,
+		value: { name: "secret-plans", archivedAt: null },
+	});
+	expect(h.raw.scopes.create).not.toHaveBeenCalled();
+	expect(h.raw.scopes.setPrincipal).not.toHaveBeenCalled();
+	expect(h.raw.data.put).not.toHaveBeenCalled();
+});
+
+test("a definite private-create refusal leaves the dialog open and unlocks its fields", async () => {
+	const h = make_harness();
+	h.raw.scopes.createWithDocument.mockResolvedValueOnce({
+		_nay: { name: "storage_full", message: "No document slots remain" },
+	});
+	await boot(h);
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "secret-plans" } });
+	fireEvent.click(within(dialog).getByLabelText("Private channel"));
+	fireEvent.click(await within(dialog).findByLabelText("Bob"));
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+	expect((await within(dialog).findByRole("alert")).textContent).toContain("No document slots remain");
+	expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(1);
+	expect((within(dialog).getByLabelText("Channel name") as HTMLInputElement).disabled).toBe(false);
+	expect((within(dialog).getByLabelText("Topic (optional)") as HTMLInputElement).disabled).toBe(false);
+	expect((within(dialog).getByLabelText("Private channel") as HTMLInputElement).disabled).toBe(false);
+	expect((within(dialog).getByLabelText("Bob") as HTMLInputElement).disabled).toBe(false);
+	expect(within(dialog).getByRole("button", { name: "Create" })).toBeTruthy();
+	expect(h.raw.scopes.create).not.toHaveBeenCalled();
+	expect(h.raw.scopes.setPrincipal).not.toHaveBeenCalled();
+	expect(h.raw.scopes.delete).not.toHaveBeenCalled();
+	expect(h.raw.data.put).not.toHaveBeenCalled();
+});
+
+test("a private exact retry conflict accepts a renamed exact read only after current principal proof", async () => {
+	const h = make_harness();
+	const pendingCreate = deferred<ScopeChangeResult>();
+	const exactRead = deferred<unknown>();
+	const exactPrincipals = deferred<BonoboUiScopePrincipalListResult>();
+	h.raw.scopes.createWithDocument
+		.mockReturnValueOnce(pendingCreate.promise)
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
+	h.raw.scopes.listPrincipals.mockReturnValueOnce(exactPrincipals.promise);
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return exactRead.promise;
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	await boot(h);
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	const dialog = await screen.findByRole("dialog");
+	const name = within(dialog).getByLabelText("Channel name") as HTMLInputElement;
+	const topic = within(dialog).getByLabelText("Topic (optional)") as HTMLInputElement;
+	const privacy = within(dialog).getByLabelText("Private channel") as HTMLInputElement;
+	fireEvent.input(name, { target: { value: "secret-plans" } });
+	fireEvent.input(topic, { target: { value: "Launch planning" } });
+	fireEvent.click(privacy);
+	const bob = (await within(dialog).findByLabelText("Bob")) as HTMLInputElement;
+	fireEvent.click(bob);
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Saving…" })).toBeTruthy());
+
+	expect(name.disabled).toBe(true);
+	expect(topic.disabled).toBe(true);
+	expect(privacy.disabled).toBe(true);
+	expect(bob.disabled).toBe(true);
+	fireEvent.keyDown(name, { key: "x" });
+	fireEvent.keyDown(topic, { key: "x" });
+	privacy.click();
+	expect(name.value).toBe("secret-plans");
+	expect(topic.value).toBe("Launch planning");
+	expect(privacy.checked).toBe(true);
+
+	pendingCreate.reject(new Error("Connection lost"));
+	expect((await within(dialog).findByRole("alert")).textContent).toContain("Connection lost");
+	expect(name.disabled).toBe(true);
+	expect(topic.disabled).toBe(true);
+	expect(privacy.disabled).toBe(true);
+	expect(bob.disabled).toBe(true);
+	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+	const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+	await waitFor(() => expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(2));
+
+	const retry = h.raw.scopes.createWithDocument.mock.calls[1]![0];
+	expect(retry).toEqual(first);
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
+	expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]?.body).toEqual({
+		collection: "channels",
+		key: first.scopeId,
+	});
+	expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
+	expect(screen.getByRole("dialog")).toBe(dialog);
+	expect(name.disabled).toBe(true);
+	expect((within(dialog).getByRole("button", { name: "Checking…" }) as HTMLButtonElement).disabled).toBe(true);
+	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+
+	// A restarted Convex watch would replay this cached absence first. It is not proof.
+	h.send_scopes([]);
+	expect(screen.getByRole("dialog")).toBe(dialog);
+	exactRead.resolve({ document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } });
+	await waitFor(() => expect(h.raw.scopes.listPrincipals).toHaveBeenCalledWith({ scopeId: first.scopeId }));
+	expect(screen.getByRole("dialog")).toBe(dialog);
+	exactPrincipals.resolve({ _yay: [{ userId: "user_me", level: "manage" }] });
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+	// The exact read selected the original key. The normal scope and ranged watches can catch up later.
+	h.send_scopes([private_scope([], first.scopeId)]);
+	const privateWatch = await waitFor(() => {
+		const found = h.find_watch("channels", first.scopeId);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	privateWatch.onUpdate(watch_update([{ ...channel_doc(first.scopeId, "renamed"), revision: 2 }]));
+	const row = await screen.findByRole("button", { name: "#renamed (private)" });
+	expect(row.getAttribute("aria-current")).toBe("page");
+});
+
+test("a null private create proof keeps the same key uncertain and locked", async () => {
+	const h = make_harness();
+	const exactRead = deferred<unknown>();
+	h.raw.scopes.createWithDocument
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } })
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost again" } });
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return exactRead.promise;
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	await boot(h);
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	const dialog = await screen.findByRole("dialog");
+	const name = within(dialog).getByLabelText("Channel name") as HTMLInputElement;
+	fireEvent.input(name, { target: { value: "secret-plans" } });
+	fireEvent.click(within(dialog).getByLabelText("Private channel"));
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+	await within(dialog).findByText("Connection lost");
+	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+	await waitFor(() => expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
+	expect((within(dialog).getByLabelText("Channel name") as HTMLInputElement).disabled).toBe(true);
+
+	const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+	// Cached presence is also not proof that the original create still exists now.
+	h.send_scopes([private_scope([], first.scopeId)]);
+	expect(within(dialog).getByRole("button", { name: "Checking…" })).toBeTruthy();
+	exactRead.resolve({ document: null });
+	await waitFor(() => expect(within(dialog).getByRole("alert").textContent).toContain("cannot confirm whether"));
+	expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
+	expect(h.raw.scopes.listPrincipals).not.toHaveBeenCalled();
+	expect(name.disabled).toBe(true);
+	expect((within(dialog).getByLabelText("Private channel") as HTMLInputElement).disabled).toBe(true);
+	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(10_000);
+		});
+		expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
+		expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(2);
+	} finally {
+		vi.useRealTimers();
+	}
+	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+
+	await waitFor(() => expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(3));
+	expect(h.raw.scopes.createWithDocument.mock.calls[2]![0]).toEqual(first);
+	expect((await within(dialog).findByRole("alert")).textContent).toContain("Connection lost again");
+	expect(name.disabled).toBe(true);
+	expect(screen.getByRole("dialog")).toBe(dialog);
+});
+
+test("an owner-readable private channel with an exact-null principal list keeps the same create key locked", async () => {
+	const h = make_harness();
+	h.raw.scopes.createWithDocument
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } })
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost again" } });
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+			return { document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } };
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	h.raw.scopes.listPrincipals.mockResolvedValueOnce({ _yay: null });
+	await boot(h);
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	const dialog = await screen.findByRole("dialog");
+	const name = within(dialog).getByLabelText("Channel name") as HTMLInputElement;
+	fireEvent.input(name, { target: { value: "secret-plans" } });
+	fireEvent.click(within(dialog).getByLabelText("Private channel"));
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+	await within(dialog).findByText("Connection lost");
+	const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+
+	await waitFor(() =>
+		expect(within(dialog).getByRole("alert").textContent).toContain("not in its current access list"),
+	);
+	expect(h.raw.scopes.listPrincipals).toHaveBeenCalledWith({ scopeId: first.scopeId });
+	expect(name.disabled).toBe(true);
+	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(10_000);
+		});
+		expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
+		expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(1);
+	} finally {
+		vi.useRealTimers();
+	}
+	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+	await waitFor(() => expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(3));
+	expect(h.raw.scopes.createWithDocument.mock.calls[2]![0]).toEqual(first);
+	expect(screen.getByRole("dialog")).toBe(dialog);
+});
+
+test("private create exact-read failures retry with exponential backoff capped at four seconds", async () => {
+	const h = make_harness();
+	let readAttempts = 0;
+	h.raw.scopes.listPrincipals.mockResolvedValue({ _yay: [{ userId: "user_me", level: "manage" }] });
+	h.raw.scopes.createWithDocument
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			readAttempts += 1;
+			if (readAttempts === 1 || readAttempts === 4 || readAttempts === 6) {
+				throw new Error("Connection lost");
+			}
+			if (readAttempts === 2 || readAttempts === 5) {
+				return {};
+			}
+			if (readAttempts === 3) {
+				return { document: channel_doc(CH1_KEY, "wrong channel") };
+			}
+			const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+			return { document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } };
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	await boot(h);
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "secret-plans" } });
+	fireEvent.click(within(dialog).getByLabelText("Private channel"));
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+	await within(dialog).findByText("Connection lost");
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(readAttempts).toBe(1);
+		expect((within(dialog).getByLabelText("Channel name") as HTMLInputElement).disabled).toBe(true);
+
+		for (const [index, delayMs] of [250, 500, 1000, 2000, 4000, 4000].entries()) {
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(delayMs - 1);
+			});
+			expect(readAttempts).toBe(index + 1);
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(1);
+			});
+		}
+		expect(readAttempts).toBe(7);
+		expect(screen.queryByRole("dialog")).toBeNull();
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("private create unavailable and malformed principal reads retry until an exact list includes this member", async () => {
+	const h = make_harness();
+	h.raw.scopes.createWithDocument
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+			return { document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } };
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	h.raw.scopes.listPrincipals
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _yay: "not a principal list" } as unknown as BonoboUiScopePrincipalListResult)
+		.mockResolvedValueOnce({ _yay: [{ userId: "user_me", level: "manage" }] });
+	await boot(h);
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "secret-plans" } });
+	fireEvent.click(within(dialog).getByLabelText("Private channel"));
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+	await within(dialog).findByText("Connection lost");
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(1);
+		expect(screen.getByRole("dialog")).toBe(dialog);
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(250);
+		});
+		expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(2);
+		expect(screen.getByRole("dialog")).toBe(dialog);
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(500);
+		});
+		expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(3);
+		expect(screen.queryByRole("dialog")).toBeNull();
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("cancelling private create reconciliation clears its retry timer", async () => {
+	const h = make_harness();
+	h.raw.scopes.createWithDocument
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return {};
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	await boot(h);
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "secret-plans" } });
+	fireEvent.click(within(dialog).getByLabelText("Private channel"));
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+	await within(dialog).findByText("Connection lost");
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
+		fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(10_000);
+		});
+		expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("a late private create exact read cannot settle a new dialog after Cancel", async () => {
+	const h = make_harness();
+	const exactRead = deferred<unknown>();
+	h.raw.scopes.createWithDocument
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return exactRead.promise;
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	await boot(h);
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	let dialog = await screen.findByRole("dialog");
+	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "secret-plans" } });
+	fireEvent.click(within(dialog).getByLabelText("Private channel"));
+	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+	await within(dialog).findByText("Connection lost");
+	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
+	const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+	fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
+	dialog = await screen.findByRole("dialog");
+	exactRead.resolve({ document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } });
+	await act(async () => {
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	expect(screen.getByRole("dialog")).toBe(dialog);
+	expect((within(dialog).getByLabelText("Channel name") as HTMLInputElement).disabled).toBe(false);
 });
 
 test("the people dialog shows who is in a private channel and can take somebody out again", async () => {
@@ -3030,9 +5729,1780 @@ test("the people dialog shows who is in a private channel and can take somebody 
 	expect(h.calls.some((call) => call.op === "scopes.removePrincipal" && call.args.userId === "user_other")).toBe(true);
 });
 
+test("an unavailable add reloads and shows a committed member before ending the busy state", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_me", level: "manage" }]);
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
+	const dialog = await screen.findByRole("dialog");
+	const bob = await within(dialog).findByLabelText("Bob");
+	const reload = deferred<BonoboUiScopePrincipalListResult>();
+	h.raw.scopes.setPrincipal.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "Connection lost after send" },
+	});
+	h.raw.scopes.listPrincipals.mockReturnValueOnce(reload.promise);
+
+	fireEvent.click(bob);
+	await waitFor(() => expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(2));
+	expect((within(dialog).getByRole("button", { name: "Close" }) as HTMLButtonElement).disabled).toBe(true);
+	reload.resolve({
+		_yay: [
+			{ userId: "user_me", level: "manage" },
+			{ userId: "user_other", level: "member" },
+		],
+	});
+
+	await waitFor(() => expect(dialog.querySelector(".current-people")?.textContent).toContain("Bob"));
+	expect((await within(dialog).findByRole("alert")).textContent).toBe(
+		"We could not confirm the change. The current people list is shown.",
+	);
+	await waitFor(() =>
+		expect((within(dialog).getByRole("button", { name: "Close" }) as HTMLButtonElement).disabled).toBe(false),
+	);
+});
+
+test("an unavailable remove reloads and hides a committed removal before ending the busy state", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
+	const dialog = await screen.findByRole("dialog");
+	const remove = await within(dialog).findByRole("button", { name: "Remove" });
+	const reload = deferred<BonoboUiScopePrincipalListResult>();
+	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "Connection lost after send" },
+	});
+	h.raw.scopes.listPrincipals.mockReturnValueOnce(reload.promise);
+
+	fireEvent.click(remove);
+	await waitFor(() => expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(2));
+	expect((within(dialog).getByRole("button", { name: "Close" }) as HTMLButtonElement).disabled).toBe(true);
+	reload.resolve({ _yay: [{ userId: "user_me", level: "manage" }] });
+
+	await waitFor(() => expect(dialog.querySelector(".current-people")?.textContent).not.toContain("Bob"));
+	expect((await within(dialog).findByRole("alert")).textContent).toBe(
+		"We could not confirm the change. The current people list is shown.",
+	);
+	await waitFor(() =>
+		expect((within(dialog).getByRole("button", { name: "Close" }) as HTMLButtonElement).disabled).toBe(false),
+	);
+});
+
+test("an unavailable people read shows Retry and does not look like exact lost access", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_me", level: "manage" }]);
+	h.raw.scopes.listPrincipals.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "Failed to read who can access this" },
+	});
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
+	const dialog = await screen.findByRole("dialog");
+	expect((await within(dialog).findByRole("alert")).textContent).toBe("Failed to read who can access this");
+	expect(within(dialog).queryByText(/no longer readable/)).toBeNull();
+
+	const retry = within(dialog).getByRole("button", { name: "Retry" });
+	expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Close" }));
+	fireEvent.click(retry);
+	await waitFor(() => expect(dialog.querySelector(".current-people")?.textContent).toContain("Me"));
+	expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(2);
+});
+
+test("an exact-null people read shows the no-longer-readable state without Retry", async () => {
+	const h = make_harness();
+	h.raw.scopes.listPrincipals.mockResolvedValueOnce({ _yay: null });
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
+	const dialog = await screen.findByRole("dialog");
+	expect((await within(dialog).findByRole("alert")).textContent).toContain("no longer readable");
+	expect(within(dialog).queryByRole("button", { name: "Retry" })).toBeNull();
+	expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Close" }));
+});
+
+test("a definite people refusal keeps the current list and does not reload", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_me", level: "manage" }]);
+	h.raw.scopes.setPrincipal.mockResolvedValueOnce({ _nay: { name: "denied", message: "Not allowed" } });
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.click(await within(dialog).findByLabelText("Bob"));
+
+	expect((await within(dialog).findByRole("alert")).textContent).toBe("Not allowed");
+	expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(1);
+	expect(dialog.querySelector(".current-people")?.textContent).not.toContain("Bob");
+});
+
+test("Escape cannot dismiss the people dialog while a membership change is pending", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const pendingRemove = deferred<ScopeChangeResult>();
+	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingRemove.promise);
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Remove" }));
+	await waitFor(() =>
+		expect(within(dialog).getByRole("button", { name: "Close" }).hasAttribute("disabled")).toBe(true),
+	);
+
+	fireEvent.keyDown(dialog, { key: "Escape" });
+	expect(screen.getByRole("dialog")).toBe(dialog);
+	pendingRemove.resolve({ _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } });
+	await waitFor(() =>
+		expect(within(dialog).getByRole("button", { name: "Close" }).hasAttribute("disabled")).toBe(false),
+	);
+});
+
+test("a pending people change blocks a second picker change and keeps Escape locked", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_me", level: "manage" }]);
+	const pendingAdd = deferred<ScopeChangeResult>();
+	h.raw.scopes.setPrincipal.mockReturnValueOnce(pendingAdd.promise);
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
+	const dialog = await screen.findByRole("dialog");
+	const bob = await within(dialog).findByLabelText("Bob");
+	const cleo = within(dialog).getByLabelText("Cleo");
+	fireEvent.click(bob);
+	await waitFor(() => expect((cleo as HTMLInputElement).disabled).toBe(true));
+	fireEvent.click(cleo);
+	expect(h.raw.scopes.setPrincipal).toHaveBeenCalledTimes(1);
+	fireEvent.keyDown(dialog, { key: "Escape" });
+	expect(screen.getByRole("dialog")).toBe(dialog);
+
+	pendingAdd.resolve({ _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } });
+	await waitFor(() =>
+		expect(within(dialog).getByRole("button", { name: "Close" }).hasAttribute("disabled")).toBe(false),
+	);
+});
+
+test("a selected eighth private channel keeps its draft and focus when an earlier ninth scope arrives", async () => {
+	const h = make_harness();
+	const keys = Array.from({ length: 8 }, (_, index) => `p/60000000-0000-4000-8000-00000000000${index + 1}`);
+	const docs = keys.map((key, index) => channel_doc(key, `room-${index + 1}`));
+	const earlierKey = "p/10000000-0000-4000-8000-000000000000";
+	const earlierDoc = channel_doc(earlierKey, "room-0");
+	const utils = await boot_sidebar(h, docs, keys);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+
+	fireEvent.click(within(nav).getByRole("button", { name: "#room-8 (private)" }));
+	const selectedWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${keys[7]}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	selectedWindow.onUpdate(window_update([]));
+	const composer = await waitFor(() => composer_box("Message #room-8"));
+	type_in_composer(composer, "unsent draft");
+	composer.focus();
+	await waitFor(() => expect(announcer_text(utils.container)).toContain("#room-8"));
+	const announcementBeforeReorder = announcer_text(utils.container);
+
+	const fullScopes = [earlierKey, ...keys].map((key) => ({
+		scopeId: key,
+		keyPrefix: key,
+		collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+		level: "manage" as const,
+	}));
+	h.send_scopes(fullScopes);
+	const earlierWatch = await waitFor(() => {
+		const found = h.find_watch("channels", earlierKey);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	earlierWatch.onUpdate(watch_update([earlierDoc]));
+
+	await waitFor(() => {
+		const privateNames = [...nav.querySelectorAll(".channel-list .channel-name")].filter((node) =>
+			node.textContent?.includes("(private)"),
+		);
+		expect(privateNames).toHaveLength(8);
+		expect(nav.textContent).toContain("#room-8 (private)");
+		expect(nav.textContent).not.toContain("#room-7 (private)");
+	});
+	expect(screen.getByText(/8 private channels at a time; 1 more is hidden/)).toBeTruthy();
+	expect(composer_box("Message #room-8")).toBe(composer);
+	expect(composer.value).toBe("unsent draft");
+	expect(document.activeElement).toBe(composer);
+	expect(announcer_text(utils.container)).toBe(announcementBeforeReorder);
+
+	// A real loss comes from the full live list even though a strict lexical budget would have
+	// hidden this selected scope. The clear then lets the normal auto-select choose another row.
+	h.send_scopes(fullScopes.filter((scope) => scope.scopeId !== keys[7]));
+	await waitFor(() => expect(nav.textContent).not.toContain("#room-8 (private)"));
+	await waitFor(() => expect(announcer_text(utils.container)).toContain("You were removed from #room-8."));
+	await waitFor(() => expect(document.activeElement).toBe(nav));
+	await waitFor(() => {
+		const selected = nav.querySelector('[aria-current="page"]');
+		expect(selected).toBeTruthy();
+		expect(selected?.textContent).not.toContain("room-8");
+	});
+});
+
+test("an involuntary background departure keeps the current channel and composer focus", async () => {
+	const h = make_harness();
+	const utils = await boot_sidebar(
+		h,
+		[channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")],
+		[PRIVATE_KEY],
+	);
+	const composer = await waitFor(() => composer_box("Message #general"));
+	type_in_composer(composer, "current draft");
+	composer.focus();
+
+	h.send_scopes([]);
+
+	await waitFor(() => expect(screen.queryByText("#secret-plans (private)")).toBeNull());
+	await waitFor(() => expect(announcer_text(utils.container)).toContain("You were removed from #secret-plans."));
+	expect(composer_box("Message #general")).toBe(composer);
+	expect(composer.value).toBe("current draft");
+	expect(document.activeElement).toBe(composer);
+});
+
+test("Leave freezes its count, starts on Cancel, and sends the reviewed count", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const leaveItem = await open_channel_menu_item("secret-plans", "Leave #secret-plans");
+	expect(leaveItem.textContent).toBe("Leave #secret-plans");
+	fireEvent.click(leaveItem);
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+	await waitFor(() => expect(document.activeElement).toBe(cancel));
+	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Leave channel" })).toBeTruthy());
+
+	// The promise result is the consent snapshot. A harmless parent render cannot change the copy
+	// or the count later sent to the host.
+	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_me", level: "manage" }]);
+	h.send_scopes([
+		{
+			scopeId: PRIVATE_KEY,
+			keyPrefix: PRIVATE_KEY,
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "manage",
+		},
+	]);
+	expect(within(dialog).getByRole("button", { name: "Leave channel" })).toBeTruthy();
+	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
+		_nay: { name: "conflict", message: "Principal count changed" },
+	});
+	fireEvent.click(within(dialog).getByRole("button", { name: "Leave channel" }));
+	await waitFor(() =>
+		expect(h.raw.scopes.removePrincipal).toHaveBeenLastCalledWith({
+			scopeId: PRIVATE_KEY,
+			userId: "user_me",
+			expectedPrincipalCount: 2,
+		}),
+	);
+	expect((await within(dialog).findByRole("alert")).textContent).toBe(
+		"Who is in this channel changed. Close it and try again.",
+	);
+
+	// The frozen value belongs to this dialog only. Reopening reads the new one-person result.
+	fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const reopened = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	expect(await within(reopened).findByText(/You are the only person in this channel/)).toBeTruthy();
+	expect(within(reopened).getByRole("button", { name: "Leave and delete channel" })).toBeTruthy();
+});
+
+test("Delete is manager-only, uses its own copy, and sends the frozen count", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Delete #secret-plans for everyone"));
+	const dialog = await screen.findByRole("dialog", { name: "Delete #secret-plans for everyone?" });
+	expect((await within(dialog).findByText(/This deletes the channel for all 2 people in it/)).textContent).toBe(
+		"This deletes the channel for all 2 people in it. Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone.",
+	);
+	h.raw.scopes.delete.mockResolvedValueOnce({ _nay: { message: "Try again" } });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Delete channel" }));
+	await waitFor(() =>
+		expect(h.raw.scopes.delete).toHaveBeenCalledWith({
+			scopeId: PRIVATE_KEY,
+			expectedPrincipalCount: 2,
+		}),
+	);
+	await within(dialog).findByText("Try again");
+	fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+	// A member still gets Leave, but never a Delete control that the host will always refuse.
+	h.send_scopes([
+		{
+			scopeId: PRIVATE_KEY,
+			keyPrefix: PRIVATE_KEY,
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "member",
+		},
+	]);
+	const leave = await open_channel_menu_item("secret-plans", "Leave #secret-plans");
+	expect(leave).toBeTruthy();
+	expect(screen.queryByRole("menuitem", { name: "Delete #secret-plans for everyone" })).toBeNull();
+});
+
+test.each([
+	{
+		action: "Leave" as const,
+		menuName: "Leave #secret-plans",
+		confirmName: "Leave channel",
+		body: "We could not read who else is in this channel. If other people remain, they keep the channel and somebody who can add people has to add you back. If you are the only person left, leaving deletes it. Then nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files.",
+	},
+	{
+		action: "Delete" as const,
+		menuName: "Delete #secret-plans for everyone",
+		confirmName: "Delete channel",
+		body: "We could not read how many people are in this channel. Deleting it will remove the channel for everyone who is in it. Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone.",
+	},
+])("unknown-count $action uses its exact copy and omits expectedPrincipalCount", async (testCase) => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", testCase.menuName));
+	const dialog = await screen.findByRole("dialog");
+	expect((await within(dialog).findByText(testCase.body)).textContent).toBe(testCase.body);
+
+	if (testCase.action === "Leave") {
+		h.raw.scopes.removePrincipal.mockResolvedValueOnce({ _nay: { message: "Try again" } });
+	} else {
+		h.raw.scopes.delete.mockResolvedValueOnce({ _nay: { message: "Try again" } });
+	}
+	fireEvent.click(within(dialog).getByRole("button", { name: testCase.confirmName }));
+	await waitFor(() => {
+		const call =
+			testCase.action === "Leave"
+				? h.raw.scopes.removePrincipal.mock.calls.at(-1)?.[0]
+				: h.raw.scopes.delete.mock.calls.at(-1)?.[0];
+		expect(call).toBeTruthy();
+		expect(call).not.toHaveProperty("expectedPrincipalCount");
+	});
+});
+
+test("an unavailable principal count keeps Delete disabled until Retry gets an exact count", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	h.raw.scopes.listPrincipals.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "Failed to read who can access this" },
+	});
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Delete #secret-plans for everyone"));
+	const dialog = await screen.findByRole("dialog");
+	expect((await within(dialog).findByRole("alert")).textContent).toBe("Failed to read who can access this");
+	const confirm = within(dialog).getByRole("button", { name: "Delete channel" }) as HTMLButtonElement;
+	expect(confirm.disabled).toBe(true);
+	fireEvent.click(confirm);
+	expect(h.raw.scopes.delete).not.toHaveBeenCalled();
+
+	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+	expect(await within(dialog).findByText(/This deletes the channel for all 2 people in it/)).toBeTruthy();
+	expect(confirm.disabled).toBe(false);
+});
+
+test.each([
+	{ action: "Leave" as const, document: channel_doc(PRIVATE_KEY, "renamed"), announcement: null },
+	{ action: "Leave" as const, document: null, announcement: "Left #secret-plans" },
+	{ action: "Delete" as const, document: channel_doc(PRIVATE_KEY, "renamed"), announcement: null },
+	{
+		action: "Delete" as const,
+		document: null,
+		announcement: "The Delete request could not be confirmed.",
+	},
+])("a lost-response $action waits for an exact read when document=$document", async (testCase) => {
+	const h = make_harness();
+	const exactRead = deferred<unknown>();
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return exactRead.promise;
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const scopeResult = { _nay: { name: "unavailable", message: "Connection lost after send" } } as const;
+	if (testCase.action === "Leave") {
+		h.raw.scopes.removePrincipal.mockResolvedValueOnce(scopeResult);
+	} else {
+		h.raw.scopes.delete.mockResolvedValueOnce(scopeResult);
+	}
+
+	const menuName = testCase.action === "Leave" ? "Leave #secret-plans" : "Delete #secret-plans for everyone";
+	fireEvent.click(await open_channel_menu_item("secret-plans", menuName));
+	const dialog = await screen.findByRole("dialog");
+	const confirmName = testCase.action === "Leave" ? "Leave channel" : "Delete channel";
+	fireEvent.click(await within(dialog).findByRole("button", { name: confirmName }));
+	await within(dialog).findByRole("alert");
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
+	expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]?.body).toEqual({
+		collection: "channels",
+		key: PRIVATE_KEY,
+	});
+	// The request stays locked. Retrying before the exact read settles it could issue the same
+	// destructive action twice.
+	expect(within(dialog).getByRole("button", { name: "Checking…" })).toBeTruthy();
+
+	// A restarted watch can replay either cached state. Neither state settles the request.
+	h.send_scopes(testCase.document === null ? [private_scope([])] : []);
+	expect(screen.getByRole("dialog")).toBe(dialog);
+	exactRead.resolve({ document: testCase.document });
+
+	if (testCase.document !== null) {
+		await waitFor(() => expect(within(dialog).getByRole("button", { name: confirmName })).toBeTruthy());
+		fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+	} else {
+		await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+		await waitFor(() => expect(announcer_text(utils.container)).toContain(testCase.announcement));
+		const announcement = announcer_text(utils.container);
+		expect(announcement).not.toContain("Deleted #secret-plans");
+		await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("navigation", { name: "Channels" })));
+	}
+});
+
+test("an owner Leave settles from the exact principal list when one member remains", async () => {
+	const h = make_harness();
+	const exactRead = deferred<unknown>();
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return exactRead.promise;
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "Connection lost after send" },
+	});
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
+
+	// The owner can still read the channel after leaving. The live principal list is the membership proof.
+	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_other", level: "manage" }]);
+	h.raw.scopes.listPrincipals.mockResolvedValueOnce({ _yay: null });
+	exactRead.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	expect(h.raw.scopes.listPrincipals).toHaveBeenCalledWith({ scopeId: PRIVATE_KEY });
+	await waitFor(() => expect(announcer_text(utils.container)).toContain("Left #secret-plans"));
+	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
+});
+
+test("a re-add candidate delivered before a late exact-null Leave result waits for fresh exact proof", async () => {
+	const h = make_harness();
+	const exitRead = deferred<unknown>();
+	const malformedRead = deferred<unknown>();
+	const lateRead = deferred<unknown>();
+	const readdRead = deferred<unknown>();
+	let readIndex = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return [exitRead.promise, malformedRead.promise, lateRead.promise, readdRead.promise][readIndex++]!;
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "Connection lost after send" },
+	});
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	h.send_scopes([{ ...private_scope([]), membershipRevision: 7 }]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
+
+	// The first read may have observed departure before this candidate reached the client. Its late
+	// null result cannot decide whether the newer candidate includes this member now.
+	h.send_scopes([{ ...private_scope([]), membershipRevision: 8 }]);
+	exitRead.resolve({ document: null });
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(2));
+	malformedRead.resolve({});
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(3));
+
+	// A full-list removal cancels this proof. Its late success cannot restore the departed scope.
+	h.send_scopes([]);
+	lateRead.resolve({ document: { ...channel_doc(PRIVATE_KEY, "stale"), revision: 2 } });
+	await Promise.resolve();
+	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
+
+	// A later candidate starts a new proof with a new identity.
+	h.send_scopes([{ ...private_scope([]), membershipRevision: 9 }]);
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(4));
+	readdRead.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
+	await waitFor(() => expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy());
+	expect(h.raw.scopes.listPrincipals).toHaveBeenLastCalledWith({ scopeId: PRIVATE_KEY });
+	expect(announcer_text(utils.container)).toContain("Left #secret-plans");
+});
+
+test.each([
+	{ action: "Leave" as const, menuName: "Leave #secret-plans", confirmName: "Leave channel" },
+	{
+		action: "Delete" as const,
+		menuName: "Delete #secret-plans for everyone",
+		confirmName: "Delete channel",
+	},
+])("uncertain $action ignores higher presence until exact principals prove a re-add", async (testCase) => {
+	const h = make_harness();
+	const exitResult = deferred<ScopeChangeResult>();
+	const reads = [deferred<unknown>(), deferred<unknown>(), deferred<unknown>(), deferred<unknown>()];
+	let readIndex = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return reads[readIndex++]!.promise;
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	if (testCase.action === "Leave") {
+		h.raw.scopes.removePrincipal.mockImplementationOnce(() => exitResult.promise);
+	} else {
+		h.raw.scopes.delete.mockImplementationOnce(() => exitResult.promise);
+	}
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	h.send_scopes([{ ...private_scope([]), membershipRevision: 10 }]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", testCase.menuName));
+	const dialog = await screen.findByRole("dialog");
+	fireEvent.click(await within(dialog).findByRole("button", { name: testCase.confirmName }));
+
+	// Another principal's level changes at revision 11 before this member's departure commits at 12.
+	// That count-neutral revision is not proof that this member was added back.
+	h.send_scopes([{ ...private_scope([]), membershipRevision: 11 }]);
+	exitResult.resolve({ _nay: { name: "unavailable", message: "Connection lost after commit" } });
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
+	reads[0]!.resolve({ document: null });
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
+
+	// Recheck the candidate because it arrived before the exact departure result. A fresh null keeps
+	// the departure fence in place.
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(2));
+	reads[1]!.resolve({ document: null });
+	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
+
+	// Even a later, higher scope row stays hidden when the exact principal list excludes this member.
+	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_other", level: "manage" }]);
+	h.send_scopes([{ ...private_scope([]), membershipRevision: 12 }]);
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(3));
+	h.raw.scopes.listPrincipals.mockResolvedValueOnce({ _yay: null });
+	reads[2]!.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
+	await waitFor(() => expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(2));
+	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
+
+	// A real re-add is restored only after both exact reads now include this member.
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	h.send_scopes([{ ...private_scope([]), membershipRevision: 13 }]);
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(4));
+	reads[3]!.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed-again"), revision: 3 } });
+	await waitFor(() => expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy());
+});
+
+test.each([
+	{ kind: "returned unavailable", rejects: false },
+	{ kind: "rejected promise", rejects: true },
+])("an exact readable channel unlocks Leave after a $kind", async (testCase) => {
+	const h = make_harness();
+	const exactRead = deferred<unknown>();
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return exactRead.promise;
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	if (testCase.rejects) {
+		h.raw.scopes.removePrincipal.mockRejectedValueOnce(new Error("Connection lost after send"));
+	} else {
+		h.raw.scopes.removePrincipal.mockResolvedValueOnce({
+			_nay: { name: "unavailable", message: "Connection lost after send" },
+		});
+	}
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+	await within(dialog).findByRole("alert");
+
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
+	expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
+	expect(within(dialog).getByRole("button", { name: "Checking…" })).toBeTruthy();
+	h.send_scopes([
+		{
+			scopeId: PRIVATE_KEY,
+			keyPrefix: PRIVATE_KEY,
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "manage",
+			membershipRevision: 1,
+		},
+	]);
+	expect(within(dialog).getByRole("button", { name: "Checking…" })).toBeTruthy();
+	exactRead.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
+
+	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Leave channel" })).toBeTruthy());
+	expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy();
+	fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+});
+
+test("uncertain Delete exact-read failures back off to four seconds", async () => {
+	const h = make_harness();
+	let readAttempts = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			readAttempts += 1;
+			if (readAttempts === 1 || readAttempts === 4) {
+				throw new Error("Connection lost");
+			}
+			if (readAttempts === 2 || readAttempts === 5) {
+				return {};
+			}
+			if (readAttempts === 3 || readAttempts === 6) {
+				return { document: channel_doc(CH1_KEY, "wrong channel") };
+			}
+			return { document: null };
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	h.raw.scopes.delete.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "Connection lost after send" },
+	});
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Delete #secret-plans for everyone"));
+	const dialog = await screen.findByRole("dialog", { name: "Delete #secret-plans for everyone?" });
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			fireEvent.click(within(dialog).getByRole("button", { name: "Delete channel" }));
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(readAttempts).toBe(1);
+		expect(within(dialog).getByRole("button", { name: "Checking…" })).toBeTruthy();
+
+		for (const [index, delayMs] of [250, 500, 1000, 2000, 4000, 4000].entries()) {
+			if (index === 5) {
+				h.send_scopes([]);
+			}
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(delayMs - 1);
+			});
+			expect(readAttempts).toBe(index + 1);
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(1);
+			});
+		}
+		expect(readAttempts).toBe(7);
+		expect(screen.queryByRole("dialog")).toBeNull();
+		expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]?.body).toEqual({
+			collection: "channels",
+			key: PRIVATE_KEY,
+		});
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("Cancel ignores a late uncertain Leave exact read", async () => {
+	const h = make_harness();
+	const exactRead = deferred<unknown>();
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return exactRead.promise;
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "Connection lost after send" },
+	});
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
+	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+	fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+	exactRead.resolve({ document: null });
+	await act(async () => {
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy();
+	expect(announcer_text(utils.container)).not.toContain("Left #secret-plans");
+	expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
+});
+
+test("an unavailable scope-watch death after a confirmed Leave result restarts and settles", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
+		_yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 },
+	});
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Leaving…" })).toBeTruthy());
+	await waitFor(() => expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1));
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			h.send_scope_death("unavailable");
+			await Promise.resolve();
+		});
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(249);
+		});
+		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(1);
+		});
+		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(2);
+
+		await act(async () => {
+			h.send_scopes([]);
+			await Promise.resolve();
+		});
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(20);
+		});
+		expect(screen.queryByRole("dialog")).toBeNull();
+		expect(screen.queryByText("#secret-plans (private)")).toBeNull();
+		expect(announcer_text(utils.container)).toContain("Left #secret-plans");
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("scope-watch unavailable retries back off to four seconds and reset after a live delivery", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general")]);
+	expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
+
+	vi.useFakeTimers();
+	try {
+		let expectedCalls = 1;
+		for (const delayMs of [250, 500, 1000, 2000, 4000, 4000]) {
+			h.send_scope_death("unavailable");
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(delayMs - 1);
+			});
+			expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(expectedCalls);
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(1);
+			});
+			expectedCalls += 1;
+			expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(expectedCalls);
+		}
+
+		await act(async () => {
+			h.send_scopes([]);
+			await Promise.resolve();
+		});
+		h.send_scope_death("unavailable");
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(249);
+		});
+		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(expectedCalls);
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(1);
+		});
+		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(expectedCalls + 1);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test.each(["denied", "session_expired", "capacity", "invalid"])(
+	"scope-watch %s death does not restart inside the frame",
+	async (reason) => {
+		const h = make_harness();
+		await boot_sidebar(h, [channel_doc(CH1_KEY, "general")]);
+		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
+
+		vi.useFakeTimers();
+		try {
+			h.send_scope_death(reason);
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(10_000);
+			});
+			expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	},
+);
+
+test("a successful Leave announces the server's deleted result and repairs focus after the row leaves", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const pendingLeave = deferred<ScopeChangeResult>();
+	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog");
+	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Leave channel" })).toBeTruthy());
+	fireEvent.click(within(dialog).getByRole("button", { name: "Leave channel" }));
+
+	// Keep focus in the still-open modal until the host tells the page whether this was a leave or a
+	// delete. Do not send a scope-watch update: success itself must remove the stale row.
+	expect(dialog.contains(document.activeElement)).toBe(true);
+
+	pendingLeave.resolve({ _yay: { scopeId: PRIVATE_KEY, deleted: true, membershipRevision: 2 } });
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	await waitFor(() => expect(screen.queryByText("#secret-plans (private)")).toBeNull());
+	await waitFor(() => expect(announcer_text(utils.container)).toContain("Deleted #secret-plans"));
+	await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("navigation", { name: "Channels" })));
+});
+
+test("unrelated and older target scope updates keep a successful Leave pending", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const pendingLeave = deferred<ScopeChangeResult>();
+	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+
+	await act(async () => {
+		h.send_scopes([
+			{
+				scopeId: PRIVATE_KEY,
+				keyPrefix: PRIVATE_KEY,
+				collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+				level: "manage",
+			},
+			{
+				scopeId: PRIVATE_DM_KEY,
+				keyPrefix: PRIVATE_DM_KEY,
+				collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+				level: "manage",
+			},
+		]);
+		await Promise.resolve();
+	});
+	expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy();
+
+	pendingLeave.resolve({ _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } });
+	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Leaving…" })).toBeTruthy());
+	expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy();
+	h.send_scopes([
+		{
+			scopeId: PRIVATE_KEY,
+			keyPrefix: PRIVATE_KEY,
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "manage",
+			membershipRevision: 1,
+		},
+		{
+			scopeId: PRIVATE_DM_KEY,
+			keyPrefix: PRIVATE_DM_KEY,
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "manage",
+			membershipRevision: 2,
+		},
+	]);
+	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Leaving…" })).toBeTruthy());
+	expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy();
+
+	h.send_scopes([
+		{
+			scopeId: PRIVATE_DM_KEY,
+			keyPrefix: PRIVATE_DM_KEY,
+			collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+			level: "manage",
+		},
+	]);
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	await waitFor(() => expect(screen.queryByText("#secret-plans (private)")).toBeNull());
+	await waitFor(() => expect(announcer_text(utils.container)).toContain("Left #secret-plans"));
+	await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("navigation", { name: "Channels" })));
+});
+
+test("a coalesced newer scope revision wins over an older successful Leave", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const pendingLeave = deferred<ScopeChangeResult>();
+	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const messageWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	const leaveItem = await open_channel_menu_item("secret-plans", "Leave #secret-plans");
+	const announcementBefore = announcer_text(utils.container);
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			messageWindow.onUpdate(
+				window_update([message_doc(5_000, { channelKey: PRIVATE_KEY, rand: "pending", text: "visible" })]),
+			);
+			await Promise.resolve();
+		});
+		fireEvent.click(leaveItem);
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		const dialog = screen.getByRole("dialog", { name: "Leave #secret-plans?" });
+		fireEvent.click(within(dialog).getByRole("button", { name: "Leave channel" }));
+
+		// The Leave result is newer than the last full scope list, so it cannot settle the row yet.
+		pendingLeave.resolve({ _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } });
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(within(dialog).getByRole("button", { name: "Leaving…" })).toBeTruthy();
+		expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy();
+
+		// The server may coalesce the absent and re-added states into one direct present delivery.
+		// Its strictly newer target revision proves that the re-add won.
+		await act(async () => {
+			h.send_scopes([
+				{
+					scopeId: PRIVATE_KEY,
+					keyPrefix: PRIVATE_KEY,
+					collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+					level: "manage",
+					membershipRevision: 3,
+				},
+			]);
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(screen.queryByRole("dialog")).toBeNull();
+		const row = screen.getByRole("button", { name: "#secret-plans (private)" });
+		expect(row.getAttribute("aria-current")).toBe("page");
+		expect(composer_box("Message #secret-plans")).toBeTruthy();
+		expect(document.activeElement).toBe(screen.getByRole("button", { name: "Actions for #secret-plans" }));
+		expect(announcer_text(utils.container)).toBe(announcementBefore);
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(2_500);
+		});
+		const cursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+			.map(([opts]) => opts)
+			.filter((opts) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`);
+		expect(cursorWrites).toHaveLength(1);
+		expect(cursorWrites[0]?.value).toEqual({ at: 5_000, activity: { messages: 0, replies: 0 } });
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("a background channel re-add focuses that channel's action trigger", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const pendingLeave = deferred<ScopeChangeResult>();
+	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	const utils = await boot_sidebar(
+		h,
+		[channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")],
+		[PRIVATE_KEY],
+	);
+	const selected = screen.getByRole("button", { name: "#general" });
+	expect(selected.getAttribute("aria-current")).toBe("page");
+	const announcementBefore = announcer_text(utils.container);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+
+	pendingLeave.resolve({ _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } });
+	await act(async () => {
+		h.send_scopes([
+			{
+				scopeId: PRIVATE_KEY,
+				keyPrefix: PRIVATE_KEY,
+				collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+				level: "manage",
+				membershipRevision: 3,
+			},
+		]);
+		await Promise.resolve();
+	});
+
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	expect(selected.getAttribute("aria-current")).toBe("page");
+	expect(document.activeElement).toBe(screen.getByRole("button", { name: "Actions for #secret-plans" }));
+	expect(announcer_text(utils.container)).toBe(announcementBefore);
+});
+
+test("a background channel re-add after a narrow resize focuses the open thread", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const pendingLeave = deferred<ScopeChangeResult>();
+	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	set_viewport_narrow(false);
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const root = message_doc(5_000, { channelKey: CH1_KEY, rand: "thread", text: "public thread root" });
+	const messageWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${CH1_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	messageWindow.onUpdate(window_update([root]));
+	await screen.findByText("public thread root");
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+	const thread = await screen.findByRole("region", { name: "Thread" });
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+
+	await act(async () => {
+		set_viewport_narrow(true);
+		await Promise.resolve();
+	});
+	const back = await within(thread).findByRole("button", { name: "Back to messages" });
+	pendingLeave.resolve({ _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } });
+	await act(async () => {
+		h.send_scopes([
+			{
+				scopeId: PRIVATE_KEY,
+				keyPrefix: PRIVATE_KEY,
+				collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+				level: "manage",
+				membershipRevision: 3,
+			},
+		]);
+		await Promise.resolve();
+	});
+
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	await waitFor(() => expect(document.activeElement).toBe(back));
+	expect(screen.getByRole("region", { name: "Thread" })).toBe(thread);
+});
+
+test("a background channel re-add after a narrow resize falls back when the thread root is missing", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const pendingLeave = deferred<ScopeChangeResult>();
+	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	set_viewport_narrow(false);
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	await open_missing_general_thread_from_threads(h);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+
+	await act(async () => {
+		set_viewport_narrow(true);
+		pendingLeave.resolve({ _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } });
+		h.send_scopes([
+			{
+				scopeId: PRIVATE_KEY,
+				keyPrefix: PRIVATE_KEY,
+				collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+				level: "manage",
+				membershipRevision: 3,
+			},
+		]);
+		await Promise.resolve();
+	});
+
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy();
+	expect(screen.queryByRole("region", { name: "Thread" })).toBeNull();
+	const drawerToggle = screen.getByRole("button", { name: "Channels" });
+	expect(document.querySelector(".chitchat:has(.thread)")).toBeNull();
+	expect(document.querySelector(".chitchat .app-bar > .drawer-toggle")).toBe(drawerToggle);
+	await waitFor(() => expect(document.activeElement).toBe(drawerToggle));
+});
+
+test("leaving a background channel repairs desktop focus while another channel's thread stays open", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const root = message_doc(5_000, { channelKey: CH1_KEY, rand: "thread", text: "public thread root" });
+	const messageWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${CH1_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	messageWindow.onUpdate(window_update([root]));
+	await screen.findByText("public thread root");
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+	const thread = await screen.findByRole("region", { name: "Thread" });
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	const leave = await within(dialog).findByRole("button", { name: "Leave channel" });
+	fireEvent.click(leave);
+	h.send_scopes([]);
+
+	await waitFor(() => expect(screen.queryByText("#secret-plans (private)")).toBeNull());
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	await waitFor(() => expect(document.activeElement).toBe(nav));
+	expect(screen.getByRole("region", { name: "Thread" })).toBe(thread);
+
+	// Closing the unrelated thread returns to its row. A focus repair left pending would jump to nav.
+	fireEvent.click(within(thread).getByRole("button", { name: "Close thread" }));
+	await waitFor(() => expect(screen.queryByRole("region", { name: "Thread" })).toBeNull());
+	expect(document.activeElement?.textContent).toContain("Reply in thread");
+});
+
+test("a background Leave resized to narrow focuses the open thread without a late repair", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const pendingLeave = deferred<ScopeChangeResult>();
+	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	set_viewport_narrow(false);
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const root = message_doc(5_000, { channelKey: CH1_KEY, rand: "thread", text: "public thread root" });
+	const messageWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${CH1_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	messageWindow.onUpdate(window_update([root]));
+	await screen.findByText("public thread root");
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+	const thread = await screen.findByRole("region", { name: "Thread" });
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+	set_viewport_narrow(true);
+	const back = await within(thread).findByRole("button", { name: "Back to messages" });
+
+	pendingLeave.resolve({ _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } });
+	h.send_scopes([]);
+	await waitFor(() => expect(screen.queryByText("#secret-plans (private)")).toBeNull());
+	await waitFor(() => expect(document.activeElement).toBe(back));
+	expect(screen.getByRole("region", { name: "Thread" })).toBe(thread);
+
+	// Closing the unrelated thread returns to its row. A delayed repair would steal focus afterward.
+	fireEvent.click(back);
+	await waitFor(() => expect(screen.queryByRole("region", { name: "Thread" })).toBeNull());
+	expect(document.activeElement?.textContent).toContain("Reply in thread");
+});
+
+test("a background Leave resized to narrow falls back when the thread root is missing", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const pendingLeave = deferred<ScopeChangeResult>();
+	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	set_viewport_narrow(false);
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	await open_missing_general_thread_from_threads(h);
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
+
+	await act(async () => {
+		set_viewport_narrow(true);
+		pendingLeave.resolve({ _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } });
+		h.send_scopes([]);
+		await Promise.resolve();
+	});
+
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+	expect(screen.queryByText("#secret-plans (private)")).toBeNull();
+	expect(screen.queryByRole("region", { name: "Thread" })).toBeNull();
+	const drawerToggle = screen.getByRole("button", { name: "Channels" });
+	expect(document.querySelector(".chitchat:has(.thread)")).toBeNull();
+	expect(document.querySelector(".chitchat .app-bar > .drawer-toggle")).toBe(drawerToggle);
+	await waitFor(() => expect(document.activeElement).toBe(drawerToggle));
+});
+
+test("selected scope loss closes a narrow thread before focusing the visible Channels toggle", async () => {
+	const h = make_harness();
+	set_viewport_narrow(true);
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	fireEvent.click(screen.getByRole("button", { name: "Channels" }));
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	fireEvent.click(within(nav).getByRole("button", { name: "#secret-plans (private)" }));
+	const messageWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	messageWindow.onUpdate(
+		window_update([message_doc(5_000, { channelKey: PRIVATE_KEY, rand: "thread", text: "thread root" })]),
+	);
+	await screen.findByText("thread root");
+	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+	await screen.findByRole("region", { name: "Thread" });
+
+	h.send_scopes([]);
+
+	await waitFor(() => expect(screen.queryByRole("region", { name: "Thread" })).toBeNull());
+	const drawerToggle = screen.getByRole("button", { name: "Channels" });
+	await waitFor(() => expect(document.activeElement).toBe(drawerToggle));
+});
+
+test.each([
+	{ action: "Leave" as const, resultDeleted: false },
+	{ action: "Delete" as const, resultDeleted: true },
+])(
+	"a pending selected-channel mark-read cannot write after $action starts and the scope departs",
+	async ({ action, resultDeleted }) => {
+		const h = make_harness();
+		h.scopePrincipals.set(PRIVATE_KEY, [
+			{ userId: "user_me", level: "manage" },
+			{ userId: "user_other", level: "member" },
+		]);
+		await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+		const messageWindow = await waitFor(() => {
+			const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+			expect(found).toBeTruthy();
+			return found!;
+		});
+		const menuItem = await open_channel_menu_item(
+			"secret-plans",
+			action === "Leave" ? "Leave #secret-plans" : "Delete #secret-plans for everyone",
+		);
+		const pendingChange = deferred<ScopeChangeResult>();
+		if (action === "Leave") {
+			h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingChange.promise);
+		} else {
+			h.raw.scopes.delete.mockReturnValueOnce(pendingChange.promise);
+		}
+
+		vi.useFakeTimers();
+		try {
+			await act(async () => {
+				messageWindow.onUpdate(
+					window_update([message_doc(5_000, { channelKey: PRIVATE_KEY, rand: "pending", text: "visible" })]),
+				);
+				await Promise.resolve();
+			});
+			fireEvent.click(menuItem);
+			await act(async () => {
+				await Promise.resolve();
+				await Promise.resolve();
+			});
+			const dialog = screen.getByRole("dialog");
+			const confirmName = action === "Leave" ? "Leave channel" : "Delete channel";
+			fireEvent.click(within(dialog).getByRole("button", { name: confirmName }));
+			await act(async () => {
+				await Promise.resolve();
+				await Promise.resolve();
+			});
+			dialog.focus();
+			expect(document.activeElement).toBe(dialog);
+			fireEvent.keyDown(dialog, { key: "Tab" });
+			expect(document.activeElement).toBe(dialog);
+			fireEvent.keyDown(dialog, { key: "Escape" });
+			expect(screen.getByRole("dialog")).toBe(dialog);
+
+			// The true departure also cancels the matching key as a backstop. Keep the mutation pending
+			// while timers pass, so the busy-state render cannot re-arm the old channel's timer.
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(5_000);
+			});
+			const privateCursorWrites = () =>
+				(h.raw.data.putOwned.mock.calls as [PutOpts][]).filter(
+					([opts]) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`,
+				);
+			expect(privateCursorWrites()).toHaveLength(0);
+			expect(dialog.contains(document.activeElement)).toBe(true);
+
+			// A later full-list departure is a second backstop. No timer can write after that point either.
+			await act(async () => {
+				h.send_scopes([]);
+				await vi.advanceTimersByTimeAsync(5_000);
+			});
+			expect(privateCursorWrites()).toHaveLength(0);
+
+			pendingChange.resolve({
+				_yay: { scopeId: PRIVATE_KEY, deleted: resultDeleted, membershipRevision: 2 },
+			});
+			await act(async () => {
+				await Promise.resolve();
+				await Promise.resolve();
+				await vi.advanceTimersByTimeAsync(5_000);
+			});
+			expect(privateCursorWrites()).toHaveLength(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	},
+);
+
+test.each([
+	{ action: "Leave" as const, mode: "unavailable" as const },
+	{ action: "Leave" as const, mode: "throw" as const },
+	{ action: "Delete" as const, mode: "unavailable" as const },
+	{ action: "Delete" as const, mode: "throw" as const },
+])("an exact null after a watch-first $action and $mode settles safely", async ({ action, mode }) => {
+	const h = make_harness();
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			return { document: null };
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const messageWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	const pendingChange = deferred<ScopeChangeResult>();
+	if (action === "Leave") {
+		h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingChange.promise);
+	} else {
+		h.raw.scopes.delete.mockReturnValueOnce(pendingChange.promise);
+	}
+	const menuItem = await open_channel_menu_item(
+		"secret-plans",
+		action === "Leave" ? "Leave #secret-plans" : "Delete #secret-plans for everyone",
+	);
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			messageWindow.onUpdate(
+				window_update([message_doc(5_000, { channelKey: PRIVATE_KEY, rand: "pending", text: "visible" })]),
+			);
+			await Promise.resolve();
+		});
+		fireEvent.click(menuItem);
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		const dialog = screen.getByRole("dialog");
+		fireEvent.click(
+			within(dialog).getByRole("button", { name: action === "Leave" ? "Leave channel" : "Delete channel" }),
+		);
+		await act(async () => {
+			h.send_scopes([]);
+			await Promise.resolve();
+		});
+
+		if (mode === "unavailable") {
+			pendingChange.resolve({ _nay: { name: "unavailable", message: "Try again" } });
+		} else {
+			pendingChange.reject(new Error("Network failed"));
+		}
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+			await vi.advanceTimersByTimeAsync(5_000);
+		});
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(20);
+		});
+		expect(screen.queryByRole("dialog")).toBeNull();
+		expect(screen.queryByText("#secret-plans (private)")).toBeNull();
+		const announcement = announcer_text(utils.container);
+		expect(announcement).toContain(
+			action === "Leave" ? "Left #secret-plans" : "The Delete request could not be confirmed.",
+		);
+		expect(announcement).not.toContain("Deleted #secret-plans");
+		expect(document.activeElement).toBe(screen.getByRole("navigation", { name: "Channels" }));
+		const privateCursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][]).filter(
+			([opts]) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`,
+		);
+		expect(privateCursorWrites).toHaveLength(0);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("a late exit refusal after unmount does not restart a private cursor timer", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const messageWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	const pendingLeave = deferred<ScopeChangeResult>();
+	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	const leaveItem = await open_channel_menu_item("secret-plans", "Leave #secret-plans");
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			messageWindow.onUpdate(
+				window_update([message_doc(5_000, { channelKey: PRIVATE_KEY, rand: "pending", text: "visible" })]),
+			);
+			await Promise.resolve();
+		});
+		fireEvent.click(leaveItem);
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Leave channel" }));
+		utils.unmount();
+
+		pendingLeave.resolve({ _nay: { name: "unavailable", message: "Try again" } });
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+			await vi.advanceTimersByTimeAsync(5_000);
+		});
+		const privateCursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][]).filter(
+			([opts]) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`,
+		);
+		expect(privateCursorWrites).toHaveLength(0);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("remote scope loss cancels a pending selected-channel mark-read", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const messageWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			messageWindow.onUpdate(
+				window_update([message_doc(5_000, { channelKey: PRIVATE_KEY, rand: "pending", text: "visible" })]),
+			);
+			await Promise.resolve();
+		});
+		// Another manager removes this member. No local Leave/Delete handler runs first.
+		await act(async () => {
+			h.send_scopes([]);
+			await Promise.resolve();
+		});
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(5_000);
+		});
+		const privateCursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][]).filter(
+			([opts]) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`,
+		);
+		expect(privateCursorWrites).toHaveLength(0);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test.each(["unavailable", "throw"] as const)(
+	"a %s resumes two channel timers without replacing either key",
+	async (mode) => {
+		const h = make_harness();
+		const secondPrivateKey = "p/20000000-0000-4000-8000-000000000000";
+		h.raw.fetchJson.mockImplementation(async (path: string) => {
+			if (path === "/api/v1/plugin-data/read") {
+				return { document: channel_doc(PRIVATE_KEY, "secret-a") };
+			}
+			if (path === "/api/v1/plugin-data/list") {
+				return { documents: [], cursor: null, isDone: true };
+			}
+			throw new Error("fetchJson not stubbed");
+		});
+		h.scopePrincipals.set(PRIVATE_KEY, [
+			{ userId: "user_me", level: "manage" },
+			{ userId: "user_other", level: "member" },
+		]);
+		await boot_sidebar(
+			h,
+			[channel_doc(PRIVATE_KEY, "secret-a"), channel_doc(secondPrivateKey, "secret-b")],
+			[PRIVATE_KEY, secondPrivateKey],
+		);
+		const nav = screen.getByRole("navigation", { name: "Channels" });
+		const firstWindow = await waitFor(() => {
+			const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+			expect(found).toBeTruthy();
+			return found!;
+		});
+
+		vi.useFakeTimers();
+		try {
+			await act(async () => {
+				firstWindow.onUpdate(
+					window_update([message_doc(5_000, { channelKey: PRIVATE_KEY, rand: "first", text: "first" })]),
+				);
+				await Promise.resolve();
+			});
+			fireEvent.click(within(nav).getByRole("button", { name: "#secret-b (private)" }));
+			await act(async () => {
+				await Promise.resolve();
+				await Promise.resolve();
+			});
+			const secondWindow = h.find_window("messages", `${secondPrivateKey}:`);
+			expect(secondWindow).toBeTruthy();
+			await act(async () => {
+				secondWindow!.onUpdate(
+					window_update([message_doc(9_000, { channelKey: secondPrivateKey, rand: "second", text: "second" })]),
+				);
+				await Promise.resolve();
+			});
+
+			fireEvent.click(screen.getByRole("button", { name: "Actions for #secret-a" }));
+			const leaveItem = screen.getByRole("menuitem", { name: "Leave #secret-a" });
+			const pendingLeave = deferred<ScopeChangeResult>();
+			h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+			fireEvent.click(leaveItem);
+			await act(async () => {
+				await Promise.resolve();
+				await Promise.resolve();
+			});
+			const dialog = screen.getByRole("dialog");
+			fireEvent.click(within(dialog).getByRole("button", { name: "Leave channel" }));
+
+			if (mode === "unavailable") {
+				pendingLeave.resolve({ _nay: { name: "unavailable", message: "Try again" } });
+			} else {
+				pendingLeave.reject(new Error("Network failed"));
+			}
+			await act(async () => {
+				await Promise.resolve();
+				await Promise.resolve();
+				h.send_scopes(
+					[PRIVATE_KEY, secondPrivateKey].map((scopeId) => ({
+						scopeId,
+						keyPrefix: scopeId,
+						collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+						level: "manage" as const,
+					})),
+				);
+				await Promise.resolve();
+				await vi.advanceTimersByTimeAsync(2_500);
+			});
+			dialog.focus();
+			fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+			expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Leave channel" }));
+			const cursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+				.map(([opts]) => opts)
+				.filter((opts) => opts.collection === "channels" && opts.key.endsWith(":read"));
+			expect(Object.fromEntries(cursorWrites.map((opts) => [opts.key, opts.value]))).toEqual({
+				[`${PRIVATE_KEY}:read`]: { at: 5_000, activity: { messages: 0, replies: 0 } },
+				[`${secondPrivateKey}:read`]: { at: 9_000, activity: { messages: 0, replies: 0 } },
+			});
+		} finally {
+			vi.useRealTimers();
+		}
+	},
+);
+
+test.each(["unavailable", "throw"] as const)(
+	"a %s resumes only the guarded channel's newest buffered mark-read after StrictMode replays effects",
+	async (mode) => {
+		const h = make_harness();
+		h.raw.fetchJson.mockImplementation(async (path: string) => {
+			if (path === "/api/v1/plugin-data/read") {
+				return { document: channel_doc(PRIVATE_KEY, "secret-plans") };
+			}
+			if (path === "/api/v1/plugin-data/list") {
+				return { documents: [], cursor: null, isDone: true };
+			}
+			throw new Error("fetchJson not stubbed");
+		});
+		h.scopePrincipals.set(PRIVATE_KEY, [
+			{ userId: "user_me", level: "manage" },
+			{ userId: "user_other", level: "member" },
+		]);
+		await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY], true);
+		const messageWindow = await waitFor(() => {
+			const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+			expect(found).toBeTruthy();
+			return found!;
+		});
+		const leaveItem = await open_channel_menu_item("secret-plans", "Leave #secret-plans");
+		const pendingLeave = deferred<ScopeChangeResult>();
+		h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+
+		vi.useFakeTimers();
+		try {
+			await act(async () => {
+				messageWindow.onUpdate(
+					window_update([message_doc(5_000, { channelKey: PRIVATE_KEY, rand: "first", text: "first" })]),
+				);
+				await Promise.resolve();
+			});
+			fireEvent.click(leaveItem);
+			await act(async () => {
+				await Promise.resolve();
+				await Promise.resolve();
+			});
+			const dialog = screen.getByRole("dialog");
+			fireEvent.click(within(dialog).getByRole("button", { name: "Leave channel" }));
+			await act(async () => {
+				await Promise.resolve();
+				messageWindow.onUpdate(
+					window_update([message_doc(7_000, { channelKey: PRIVATE_KEY, rand: "latest", text: "latest" })]),
+				);
+				await Promise.resolve();
+			});
+
+			if (mode === "unavailable") {
+				pendingLeave.resolve({ _nay: { name: "unavailable", message: "Try again" } });
+			} else {
+				pendingLeave.reject(new Error("Network failed"));
+			}
+			await act(async () => {
+				await Promise.resolve();
+				await Promise.resolve();
+				h.send_scopes([
+					{
+						scopeId: PRIVATE_KEY,
+						keyPrefix: PRIVATE_KEY,
+						collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+						level: "manage",
+					},
+				]);
+				await Promise.resolve();
+			});
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(2_500);
+			});
+			const cursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+				.map(([opts]) => opts)
+				.filter((opts) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`);
+			expect(cursorWrites).toHaveLength(1);
+			expect(cursorWrites[0]?.value).toEqual({ at: 7_000, activity: { messages: 0, replies: 0 } });
+		} finally {
+			vi.useRealTimers();
+		}
+	},
+);
+
 // #endregion private channels
 
 // #region unreads, views, mentions
+
+test("the public cursor watch ignores foreign prefix docs and non-owned exact docs", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const randomRow = () => within(nav).getByRole("button", { name: /^#random/ });
+	const cursors = h.find_watch("cursors", "me:user_me")!;
+
+	h.find_recent("messages")!.onUpdate(
+		watch_update([message_doc(2_000, { channelKey: CH2_KEY, createdBy: "user_other" })]),
+	);
+	cursors.onUpdate(
+		watch_update([{ ...cursor_doc({ [CH2_KEY]: 3_000 }, 3), key: "me:user_me:user_other", createdBy: "user_other" }]),
+	);
+	await waitFor(() => expect(randomRow().className).toContain("is-unread"));
+
+	cursors.onUpdate(watch_update([{ ...cursor_doc({ [CH2_KEY]: 3_000 }, 4), ownership: "shared" }]));
+	expect(randomRow().className).toContain("is-unread");
+	cursors.onUpdate(watch_update([{ ...cursor_doc({ [CH2_KEY]: 3_000 }, 5), createdBy: "user_other" }]));
+	expect(randomRow().className).toContain("is-unread");
+
+	// Only the exact owned row stamped for this member may clear the unread mark.
+	cursors.onUpdate(watch_update([cursor_doc({ [CH2_KEY]: 3_000 }, 6)]));
+	await waitFor(() => expect(randomRow().className).not.toContain("is-unread"));
+});
 
 test("a message newer than the cursor marks its channel unread, and a newer cursor clears it", async () => {
 	const h = make_harness();
@@ -3112,6 +7582,168 @@ test("opening an unread channel marks where reading stopped, and the mark surviv
 	expect(document.querySelectorAll(".new-divider").length).toBe(1);
 });
 
+test("opening a public channel uses the observed message time when the device clock is ahead", async () => {
+	const now = vi.spyOn(Date, "now").mockReturnValue(90_000);
+	try {
+		const h = make_harness();
+		await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+		const nav = screen.getByRole("navigation", { name: "Channels" });
+		h.find_recent("messages")!.onUpdate(
+			watch_update([message_doc(2_000, { channelKey: CH2_KEY, createdBy: "user_other" })]),
+		);
+		h.find_watch("cursors", "me:user_me")!.onUpdate(watch_update([cursor_doc({ [CH2_KEY]: 1_000 }, 3)]));
+		const row = () => within(nav).getByRole("button", { name: /^#random/ });
+		await waitFor(() => expect(row().className).toContain("is-unread"));
+
+		fireEvent.click(row());
+		const write = await waitFor(() => {
+			const found = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+				.map(([opts]) => opts)
+				.find((opts) => opts.collection === "cursors");
+			expect(found).toBeTruthy();
+			return found!;
+		});
+		expect((write.value.channels as Record<string, number>)[CH2_KEY]).toBe(2_000);
+	} finally {
+		now.mockRestore();
+	}
+});
+
+test("unavailable public cursor writes retry the same revision and keep concurrent maxima", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	h.find_recent("messages")!.onUpdate(
+		watch_update([message_doc(300, { channelKey: CH1_KEY }), message_doc(200, { channelKey: CH2_KEY })]),
+	);
+	h.find_watch("cursors", "me:user_me")!.onUpdate(watch_update([cursor_doc({}, 3)]));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
+	h.raw.data.putOwned
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _yay: { key: "me:user_me", revision: 4 } });
+
+	vi.useFakeTimers();
+	try {
+		fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+		const first = h.raw.data.putOwned.mock.calls[0]![0] as PutOpts;
+		const second = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(250);
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
+		const retry = h.raw.data.putOwned.mock.calls[2]![0] as PutOpts;
+		const firstChannels = first.value.channels as Record<string, number>;
+		const secondChannels = second.value.channels as Record<string, number>;
+		expect(retry.expectedRevision).toBe(3);
+		expect(retry.value.channels).toEqual({
+			[CH1_KEY]: secondChannels[CH1_KEY],
+			[CH2_KEY]: firstChannels[CH2_KEY],
+		});
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("a compacted unavailable cursor retry keeps a new channel's wanted maximum", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const cursors = h.find_watch("cursors", "me:user_me")!;
+	const channels = h.find_watch("channels")!;
+	const recent = h.find_recent("messages")!;
+	const staleCursors = Object.fromEntries(Array.from({ length: 300 }, (_, index) => [`stale-${index}`, index]));
+	h.raw.data.putOwned
+		.mockResolvedValueOnce({ _nay: { name: "storage_full", message: "Cursor map is too large" } })
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockResolvedValueOnce({ _yay: { key: "me:user_me", revision: 4 } });
+	recent.onUpdate(watch_update([message_doc(200, { channelKey: CH2_KEY })]));
+	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 100, ...staleCursors }, 3)]));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
+
+	vi.useFakeTimers();
+	try {
+		fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+		const firstWanted = h.raw.data.putOwned.mock.calls[0]![0].value.channels as Record<string, number>;
+
+		// The compacted call is waiting to retry. Add a channel now, then queue its mark into the
+		// same flight. The timer must read this render's channel keys, not the older callback's list.
+		await act(async () => {
+			channels.onUpdate(
+				watch_update([
+					channel_doc(CH1_KEY, "general"),
+					channel_doc(CH2_KEY, "random"),
+					channel_doc(CH3_KEY, "project"),
+				]),
+			);
+			recent.onUpdate(
+				watch_update([message_doc(400, { channelKey: CH3_KEY }), message_doc(200, { channelKey: CH2_KEY })]),
+			);
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		const project = within(nav).getByRole("button", { name: /^#project/ });
+		expect(project.className).toContain("is-unread");
+		fireEvent.click(project);
+		await act(async () => {
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
+		const projectWanted = h.raw.data.putOwned.mock.calls[2]![0].value.channels as Record<string, number>;
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(250);
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(4);
+		const retryChannels = h.raw.data.putOwned.mock.calls[3]![0].value.channels as Record<string, number>;
+		expect(retryChannels[CH2_KEY]).toBe(firstWanted[CH2_KEY]);
+		expect(retryChannels[CH3_KEY]).toBe(projectWanted[CH3_KEY]);
+		expect(Object.keys(retryChannels).some((key) => key.startsWith("stale-"))).toBe(false);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("a definite public cursor refusal does not start a retry loop", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	h.find_recent("messages")!.onUpdate(watch_update([message_doc(200, { channelKey: CH2_KEY })]));
+	h.find_watch("cursors", "me:user_me")!.onUpdate(watch_update([cursor_doc({}, 3)]));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
+	h.raw.data.putOwned.mockResolvedValueOnce({ _nay: { name: "denied", message: "Write refused" } });
+
+	vi.useFakeTimers();
+	try {
+		fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
+		await act(async () => {
+			await Promise.resolve();
+			await vi.advanceTimersByTimeAsync(10_000);
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
 test("a channel with nothing unread opens without the mark", async () => {
 	const h = make_harness();
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
@@ -3122,7 +7754,7 @@ test("a channel with nothing unread opens without the mark", async () => {
 		watch_update([message_doc(2000, { channelKey: CH2_KEY, createdBy: "user_other", rand: "u1" })]),
 	);
 	h.find_watch("cursors", "me:user_me")!.onUpdate(watch_update([cursor_doc({ [CH2_KEY]: 5000 }, 3)]));
-	const randomRow = within(nav).getByRole("button", { name: /^#random/ });
+	const randomRow = await waitFor(() => within(nav).getByRole("button", { name: /^#random/ }));
 	await waitFor(() => expect(randomRow.className).not.toContain("is-unread"));
 
 	fireEvent.click(randomRow);
@@ -3171,7 +7803,11 @@ test("unread mentions of this member show as an amber count, on the row and on t
 	// Choosing the row opens the channel.
 	fireEvent.click(row);
 	await waitFor(() =>
-		expect(within(nav).getByRole("button", { name: /^#random/ }).getAttribute("aria-current")).toBe("page"),
+		expect(
+			within(nav)
+				.getByRole("button", { name: /^#random/ })
+				.getAttribute("aria-current"),
+		).toBe("page"),
 	);
 });
 
@@ -3211,20 +7847,310 @@ test("a conflicted cursor write retries once and carries BOTH cursors — the wi
 	expect(retryChannels[CH2_KEY]).toBeGreaterThanOrEqual(2000);
 });
 
+test("a newer cursor watch wins over an older successful write", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const cursors = h.find_watch("cursors", "me:user_me")!;
+	const oldSuccess = deferred<WriteResult>();
+	h.raw.data.putOwned
+		.mockReturnValueOnce(oldSuccess.promise)
+		.mockImplementationOnce(async (opts) =>
+			opts.expectedRevision === 7
+				? { _yay: { key: "me:user_me", revision: 8 } }
+				: { _nay: { name: "conflict", message: "Revision mismatch" } },
+		);
+
+	h.find_recent("messages")!.onUpdate(watch_update([message_doc(200, { channelKey: CH2_KEY })]));
+	cursors.onUpdate(watch_update([cursor_doc({ [CH3_KEY]: 500 }, 3)]));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
+	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
+	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
+	const first = h.raw.data.putOwned.mock.calls[0]![0] as PutOpts;
+	expect(first.expectedRevision).toBe(3);
+
+	// A different page advances the same map before this older success arrives. Keep the newer
+	// revision and every cursor it carried when the next channel queues its own mark.
+	const firstChannels = first.value.channels as Record<string, number>;
+	cursors.onUpdate(watch_update([cursor_doc({ ...firstChannels, [CH3_KEY]: 900 }, 7)]));
+	oldSuccess.resolve({ _yay: { key: "me:user_me", revision: 4 } });
+	await act(async () => {
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+
+	h.find_recent("messages")!.onUpdate(
+		watch_update([
+			message_doc(300, { channelKey: CH1_KEY, rand: "general-unread" }),
+			message_doc(200, { channelKey: CH2_KEY }),
+		]),
+	);
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#general/ }).className).toContain("is-unread"));
+	fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
+	const next = await waitFor(() => {
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+		return h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+	});
+	expect(next.expectedRevision).toBe(7);
+	const nextChannels = next.value.channels as Record<string, number>;
+	expect(nextChannels[CH3_KEY]).toBe(900);
+	expect(nextChannels[CH2_KEY]).toBe(firstChannels[CH2_KEY]);
+	expect(nextChannels[CH1_KEY]).toBeGreaterThanOrEqual(300);
+	expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+});
+
+test("concurrent public cursor conflicts keep every pending channel at its newest cursor", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const cursors = h.find_watch("cursors", "me:user_me")!;
+	const firstConflict = deferred<WriteResult>();
+	const secondConflict = deferred<WriteResult>();
+	h.raw.data.putOwned.mockReturnValueOnce(firstConflict.promise).mockReturnValueOnce(secondConflict.promise);
+
+	// Both rows are unread. The stored #general cursor also makes the first wanted map overlap the
+	// second one, so the retry must keep both channel keys and the larger #general value.
+	h.find_recent("messages")!.onUpdate(
+		watch_update([
+			message_doc(300, { channelKey: CH1_KEY, rand: "general-unread" }),
+			message_doc(200, { channelKey: CH2_KEY, rand: "random-unread" }),
+		]),
+	);
+	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 100 }, 3)]));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
+
+	// Keep both writes open until they have read the same revision.
+	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#general/ }).className).toContain("is-unread"));
+	fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
+	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2));
+	const first = h.raw.data.putOwned.mock.calls[0]![0] as PutOpts;
+	const second = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+	expect(first.expectedRevision).toBe(3);
+	expect(second.expectedRevision).toBe(3);
+	const firstChannels = first.value.channels as Record<string, number>;
+	const secondChannels = second.value.channels as Record<string, number>;
+	expect(secondChannels[CH2_KEY]).toBeUndefined();
+	expect(secondChannels[CH1_KEY]).toBeGreaterThan(firstChannels[CH1_KEY]!);
+
+	await act(async () => {
+		firstConflict.resolve({ _nay: { name: "conflict", message: "Revision mismatch" } });
+		secondConflict.resolve({ _nay: { name: "conflict", message: "Revision mismatch" } });
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+
+	// One winner delivery releases one retry. Its map must include both pending writes, with the
+	// largest value for each channel, plus the winner's unrelated channel.
+	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 150, [CH3_KEY]: 900 }, 7)]));
+	const retry = await waitFor(() => {
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
+		return h.raw.data.putOwned.mock.calls[2]![0] as PutOpts;
+	});
+	expect(retry.expectedRevision).toBe(7);
+	expect(retry.value.channels).toEqual({
+		[CH1_KEY]: secondChannels[CH1_KEY],
+		[CH2_KEY]: firstChannels[CH2_KEY],
+		[CH3_KEY]: 900,
+	});
+});
+
+test("watch-first public cursor conflicts keep all wants through another conflict", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const cursors = h.find_watch("cursors", "me:user_me")!;
+	const firstConflict = deferred<WriteResult>();
+	const secondConflict = deferred<WriteResult>();
+	const retryConflict = deferred<WriteResult>();
+	h.raw.data.putOwned
+		.mockReturnValueOnce(firstConflict.promise)
+		.mockReturnValueOnce(secondConflict.promise)
+		.mockReturnValueOnce(retryConflict.promise)
+		.mockResolvedValueOnce({ _yay: { key: "me:user_me", revision: 9 } });
+
+	h.find_recent("messages")!.onUpdate(
+		watch_update([message_doc(300, { channelKey: CH1_KEY }), message_doc(200, { channelKey: CH2_KEY })]),
+	);
+	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 100 }, 3)]));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
+
+	// Start two writes from the same revision, then deliver the other tab's winner before either
+	// conflict result. The retry runner must keep the second wanted map while the first retry runs.
+	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#general/ }).className).toContain("is-unread"));
+	fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
+	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2));
+	const first = h.raw.data.putOwned.mock.calls[0]![0] as PutOpts;
+	const second = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+	const firstChannels = first.value.channels as Record<string, number>;
+	const secondChannels = second.value.channels as Record<string, number>;
+	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 150, [CH3_KEY]: 900 }, 7)]));
+	await act(async () => {
+		firstConflict.resolve({ _nay: { name: "conflict", message: "Revision mismatch" } });
+		secondConflict.resolve({ _nay: { name: "conflict", message: "Revision mismatch" } });
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	const firstRetry = await waitFor(() => {
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
+		return h.raw.data.putOwned.mock.calls[2]![0] as PutOpts;
+	});
+	expect(firstRetry.expectedRevision).toBe(7);
+	expect(firstRetry.value.channels).toEqual({
+		[CH1_KEY]: 150,
+		[CH2_KEY]: firstChannels[CH2_KEY],
+		[CH3_KEY]: 900,
+	});
+
+	// A newer winner arrives while that one retry is open. Its conflict must put the in-flight map
+	// back beside the queued map, then continue from the latest revision with every per-key maximum.
+	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 175, [CH3_KEY]: 950 }, 8)]));
+	await act(async () => {
+		retryConflict.resolve({ _nay: { name: "conflict", message: "Revision mismatch" } });
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	const finalRetry = await waitFor(() => {
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(4);
+		return h.raw.data.putOwned.mock.calls[3]![0] as PutOpts;
+	});
+	expect(finalRetry.expectedRevision).toBe(8);
+	expect(finalRetry.value.channels).toEqual({
+		[CH1_KEY]: secondChannels[CH1_KEY],
+		[CH2_KEY]: firstChannels[CH2_KEY],
+		[CH3_KEY]: 950,
+	});
+});
+
+test("a conflicted public cursor retry compacts after storage_full without losing queued marks", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [
+		channel_doc(CH1_KEY, "general"),
+		channel_doc(CH2_KEY, "random"),
+		channel_doc(CH3_KEY, "project"),
+	]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const cursors = h.find_watch("cursors", "me:user_me")!;
+	const retryCapacity = deferred<WriteResult>();
+	h.raw.data.putOwned
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Revision mismatch" } })
+		.mockReturnValueOnce(retryCapacity.promise)
+		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Revision mismatch" } })
+		.mockResolvedValueOnce({ _yay: { key: "me:user_me", revision: 8 } });
+	const staleCursors = Object.fromEntries(Array.from({ length: 300 }, (_, index) => [`stale-${index}`, index]));
+
+	h.find_recent("messages")!.onUpdate(
+		watch_update([message_doc(300, { channelKey: CH1_KEY }), message_doc(200, { channelKey: CH2_KEY })]),
+	);
+	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 100, ...staleCursors }, 3)]));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
+
+	// The first mark conflicts. Its winner is still near the value limit, so the queued retry is
+	// allowed to reach the server and fail with storage_full.
+	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
+	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
+	const firstWanted = h.raw.data.putOwned.mock.calls[0]![0].value.channels as Record<string, number>;
+	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 150, [CH3_KEY]: 900, ...staleCursors }, 7)]));
+	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2));
+
+	// Queue another channel while that oversized retry is open. Cleanup must carry both wanted
+	// maxima, keep the winner's live channel, and remove only stale channel keys.
+	fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
+	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3));
+	const secondWanted = h.raw.data.putOwned.mock.calls[2]![0].value.channels as Record<string, number>;
+	await act(async () => {
+		retryCapacity.resolve({ _nay: { name: "storage_full", message: "Cursor map is too large" } });
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+
+	const compactedRetry = await waitFor(() => {
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(4);
+		return h.raw.data.putOwned.mock.calls[3]![0] as PutOpts;
+	});
+	expect(compactedRetry.expectedRevision).toBe(7);
+	expect(compactedRetry.value.channels).toEqual({
+		[CH1_KEY]: secondWanted[CH1_KEY],
+		[CH2_KEY]: firstWanted[CH2_KEY],
+		[CH3_KEY]: 900,
+	});
+});
+
+test("concurrent capacity cleanup keeps both channel marks after a conflict", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const cursors = h.find_watch("cursors", "me:user_me")!;
+	const firstCapacity = deferred<WriteResult>();
+	const secondCapacity = deferred<WriteResult>();
+	const compactedConflict = deferred<WriteResult>();
+	h.raw.data.putOwned
+		.mockReturnValueOnce(firstCapacity.promise)
+		.mockReturnValueOnce(secondCapacity.promise)
+		.mockReturnValueOnce(compactedConflict.promise)
+		.mockResolvedValueOnce({ _yay: { key: "me:user_me", revision: 5 } });
+	const staleCursors = Object.fromEntries(Array.from({ length: 300 }, (_, index) => [`stale-${index}`, index]));
+
+	h.find_recent("messages")!.onUpdate(
+		watch_update([message_doc(300, { channelKey: CH1_KEY }), message_doc(200, { channelKey: CH2_KEY })]),
+	);
+	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 100, ...staleCursors }, 3)]));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
+
+	// Start two maps from the same oversized revision. Each map wants a different unread channel.
+	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
+	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#general/ }).className).toContain("is-unread"));
+	fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
+	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2));
+	const firstWanted = h.raw.data.putOwned.mock.calls[0]![0].value.channels as Record<string, number>;
+	const secondWanted = h.raw.data.putOwned.mock.calls[1]![0].value.channels as Record<string, number>;
+
+	// Both first writes hit the size ceiling. One single-flight cleanup holds both wanted maps.
+	firstCapacity.resolve({ _nay: { name: "storage_full", message: "Cursor map is too large" } });
+	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3));
+	secondCapacity.resolve({ _nay: { name: "storage_full", message: "Cursor map is too large" } });
+	await act(async () => {
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
+	const firstClean = h.raw.data.putOwned.mock.calls[2]![0] as PutOpts;
+	expect(firstClean.expectedRevision).toBe(3);
+	expect(firstClean.value.channels).toEqual({ [CH1_KEY]: firstWanted[CH1_KEY], [CH2_KEY]: firstWanted[CH2_KEY] });
+
+	// A conflict puts that cleanup back beside the second wanted map. The winner watch then releases
+	// one compacted retry with the newest mark for each channel.
+	await act(async () => {
+		compactedConflict.resolve({ _nay: { name: "conflict", message: "Revision mismatch" } });
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
+	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 150 }, 4)]));
+	const finalRetry = await waitFor(() => {
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(4);
+		return h.raw.data.putOwned.mock.calls[3]![0] as PutOpts;
+	});
+	expect(finalRetry.expectedRevision).toBe(4);
+	expect(finalRetry.value.channels).toEqual({
+		[CH1_KEY]: secondWanted[CH1_KEY],
+		[CH2_KEY]: firstWanted[CH2_KEY],
+	});
+});
+
 test("a private channel's cursor is written inside its scope range, and the public map never holds a p/ key", async () => {
 	const h = make_harness();
 	await boot_sidebar(
 		h,
-		[
-			channel_doc(CH1_KEY, "general"),
-			channel_doc(CH2_KEY, "random"),
-			channel_doc(PRIVATE_KEY, "secret-plans", null, { lastMessageAt: 5000 }),
-		],
+		[channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random"), channel_doc(PRIVATE_KEY, "secret-plans")],
 		[PRIVATE_KEY],
 	);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
-	// Somebody stamped the private channel at t=5000 and this member has no cursor for it yet.
+	// Durable scope activity is newer than this member's missing cursor.
+	h.send_scopes([private_scope([{ collection: "messages", at: 5_000, createdByUserId: "user_other" }])]);
 	const privateRow = () => within(nav).getByRole("button", { name: /^#secret-plans/ });
 	await waitFor(() => expect(privateRow().className).toContain("is-unread"));
 
@@ -3236,9 +8162,7 @@ test("a private channel's cursor is written inside its scope range, and the publ
 	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
 	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
 	await waitFor(() =>
-		expect((h.raw.data.putOwned.mock.calls as [PutOpts][]).some(([opts]) => opts.collection === "cursors")).toBe(
-			true,
-		),
+		expect((h.raw.data.putOwned.mock.calls as [PutOpts][]).some(([opts]) => opts.collection === "cursors")).toBe(true),
 	);
 
 	// Now open the private channel.
@@ -3260,7 +8184,257 @@ test("a private channel's cursor is written inside its scope range, and the publ
 	}
 });
 
-test("a private channel goes unread and back to read through lastMessageAt and its scope cursor", async () => {
+test("two private mark-reads use the returned revision and keep the newest timestamp", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const messageWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	const firstWrite = deferred<WriteResult>();
+	h.raw.data.putOwned.mockReturnValueOnce(firstWrite.promise);
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			messageWindow.onUpdate(
+				window_update([message_doc(5_000, { channelKey: PRIVATE_KEY, rand: "first", text: "first" })]),
+			);
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(2_500);
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			messageWindow.onUpdate(
+				window_update([message_doc(7_000, { channelKey: PRIVATE_KEY, rand: "latest", text: "latest" })]),
+			);
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(2_500);
+		});
+		// The second mark waits. It must not reuse revision 0 while the first write is open.
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			firstWrite.resolve({ _yay: { key: `${PRIVATE_KEY}:read`, revision: 11 } });
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+		const second = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+		expect(second.expectedRevision).toBe(11);
+		expect(second.value).toEqual({ at: 7_000, activity: { messages: 0, replies: 0 } });
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test.each(["unavailable", "throw"] as const)(
+	"a private cursor %s retries without a watch and keeps the newest timestamp",
+	async (mode) => {
+		const h = make_harness();
+		await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+		const messageWindow = await waitFor(() => {
+			const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+			expect(found).toBeTruthy();
+			return found!;
+		});
+		const firstWrite = deferred<WriteResult>();
+		h.raw.data.putOwned
+			.mockReturnValueOnce(firstWrite.promise)
+			.mockResolvedValueOnce({ _yay: { key: `${PRIVATE_KEY}:read`, revision: 1 } });
+
+		vi.useFakeTimers();
+		try {
+			for (const at of [5_000, 7_000]) {
+				await act(async () => {
+					messageWindow.onUpdate(
+						window_update([message_doc(at, { channelKey: PRIVATE_KEY, rand: String(at), text: String(at) })]),
+					);
+					await Promise.resolve();
+					await Promise.resolve();
+				});
+				await act(async () => {
+					await vi.advanceTimersByTimeAsync(2_500);
+				});
+			}
+			expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+
+			await act(async () => {
+				if (mode === "unavailable") {
+					firstWrite.resolve({ _nay: { name: "unavailable", message: "Connection lost" } });
+				} else {
+					firstWrite.reject(new Error("Connection lost"));
+				}
+				await Promise.resolve();
+				await Promise.resolve();
+				await vi.advanceTimersByTimeAsync(250);
+			});
+			expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+			const retry = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+			expect(retry.expectedRevision).toBe(0);
+			expect(retry.value).toEqual({ at: 7_000, activity: { messages: 0, replies: 0 } });
+		} finally {
+			vi.useRealTimers();
+		}
+	},
+);
+
+test("a conflicted private mark-read merges both sequence components from the scope watch", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const firstWrite = deferred<WriteResult>();
+	h.raw.data.putOwned.mockReturnValueOnce(firstWrite.promise);
+
+	vi.useFakeTimers();
+	try {
+		await act(async () => {
+			h.send_scopes([
+				private_scope([
+					{ collection: "messages", at: 7_000, createdByUserId: "user_other", sequence: 2 },
+					{ collection: "replies", at: 6_500, createdByUserId: "user_other", sequence: 3 },
+				]),
+			]);
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(2_500);
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			firstWrite.resolve({ _nay: { name: "conflict", message: "Document changed" } });
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			h.find_watch("channels", PRIVATE_KEY)!.onUpdate(
+				watch_update([
+					channel_doc(PRIVATE_KEY, "secret-plans"),
+					private_cursor_doc(PRIVATE_KEY, 6_000, 11, { messages: 5, replies: 1 }),
+				]),
+			);
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+		const retry = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+		expect(retry.expectedRevision).toBe(11);
+		expect(retry.value).toEqual({ at: 7_000, activity: { messages: 5, replies: 3 } });
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("a conflicted private mark-read refreshes after its ninth-scope watch closes", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	h.send_scopes([private_scope([{ collection: "messages", at: 7_000, createdByUserId: "user_other" }])]);
+
+	// Eight earlier ids make the selected channel ninth. Selection keeps its ranged read only until
+	// navigation returns the watch budget to the stable first eight.
+	const earlierKeys = Array.from({ length: 8 }, (_, index) => `p/00000000-0000-4000-8000-00000000000${index}`);
+	const firstWrite = deferred<WriteResult>();
+	h.raw.data.putOwned
+		.mockReturnValueOnce(firstWrite.promise)
+		.mockResolvedValueOnce({ _yay: { key: `${PRIVATE_KEY}:read`, revision: 22 } });
+	let readAttempts = 0;
+	h.raw.fetchJson.mockImplementation(async (path: string) => {
+		if (path === "/api/v1/plugin-data/read") {
+			readAttempts += 1;
+			if (readAttempts === 1) {
+				throw new Error("Connection lost");
+			}
+			return {
+				document: private_cursor_doc(PRIVATE_KEY, 6_000, 11, { messages: 0, replies: 4 }),
+			};
+		}
+		if (path === "/api/v1/plugin-data/list") {
+			return { documents: [], cursor: null, isDone: true };
+		}
+		throw new Error("fetchJson not stubbed");
+	});
+
+	vi.useFakeTimers();
+	try {
+		vi.setSystemTime(7_000);
+		await act(async () => {
+			fireEvent.click(within(nav).getByRole("button", { name: /^#secret-plans/ }));
+			await Promise.resolve();
+			await Promise.resolve();
+			h.send_scopes(
+				[...earlierKeys, PRIVATE_KEY].map((key) => ({
+					scopeId: key,
+					keyPrefix: key,
+					collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+					level: "manage" as const,
+				})),
+			);
+			await Promise.resolve();
+			await Promise.resolve();
+			const selectedWatch = h.find_watch("channels", PRIVATE_KEY);
+			expect(selectedWatch).toBeTruthy();
+			selectedWatch!.onUpdate(watch_update([channel_doc(PRIVATE_KEY, "secret-plans")]));
+			await vi.advanceTimersByTimeAsync(2_000);
+		});
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			fireEvent.click(within(nav).getByRole("button", { name: "#general" }));
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(h.find_watch("channels", PRIVATE_KEY)).toBeUndefined();
+		expect(
+			h.watches.filter(
+				(sub) => !sub.unsubscribed && sub.opts.collection === "channels" && sub.opts.keyPrefix !== undefined,
+			),
+		).toHaveLength(8);
+
+		await act(async () => {
+			firstWrite.resolve({ _nay: { name: "conflict", message: "Document changed" } });
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
+		expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]?.body).toEqual({
+			collection: "channels",
+			key: `${PRIVATE_KEY}:read:user_me`,
+		});
+
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(249);
+		});
+		expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(1);
+		});
+
+		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+		expect(h.raw.data.putOwned.mock.calls[1]![0]).toEqual({
+			collection: "channels",
+			key: `${PRIVATE_KEY}:read`,
+			value: { at: 7_000, activity: { messages: 1, replies: 4 } },
+			expectedRevision: 11,
+		});
+		expect(h.find_watch("channels", PRIVATE_KEY)).toBeUndefined();
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("a legacy private cursor upgrades by CAS and cannot hide durable sequence activity", async () => {
 	const h = make_harness();
 	await boot_sidebar(
 		h,
@@ -3269,18 +8443,34 @@ test("a private channel goes unread and back to read through lastMessageAt and i
 	);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 	const privateRow = () => within(nav).getByRole("button", { name: /^#secret-plans/ });
+	// Old channel values are opaque. Only the scope marker can make this row unread.
+	await waitFor(() => expect(privateRow().className).not.toContain("is-unread"));
+	h.send_scopes([private_scope([{ collection: "messages", at: 5_000, createdByUserId: "user_other" }])]);
 	await waitFor(() => expect(privateRow().className).toContain("is-unread"));
 
-	// The scope's channels read delivers this member's cursor doc beside the channel doc. The
-	// cursor is newer than the stamp, so the row reads as read — and the cursor doc itself must
-	// never appear as a channel row.
+	// A legacy time-only cursor maps to zero sequences. Its later time cannot hide the append.
 	h.find_watch("channels", PRIVATE_KEY)!.onUpdate(
 		watch_update([
 			channel_doc(PRIVATE_KEY, "secret-plans", null, { lastMessageAt: 5000 }),
-			private_cursor_doc(PRIVATE_KEY, 6000),
+			legacy_private_cursor_doc(PRIVATE_KEY, 6000),
 		]),
 	);
-	await waitFor(() => expect(privateRow().className).not.toContain("is-unread"));
+	await waitFor(() => expect(privateRow().className).toContain("is-unread"));
+
+	// Opening upgrades the old doc at its current revision. Keep its later divider time while the
+	// durable sequence becomes covered.
+	fireEvent.click(privateRow());
+	const upgrade = await waitFor(() => {
+		const found = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+			.map(([opts]) => opts)
+			.find((opts) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`);
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	expect(upgrade).toMatchObject({
+		expectedRevision: 1,
+		value: { at: 6_000, activity: { messages: 1, replies: 0 } },
+	});
 	expect([...nav.querySelectorAll(".channel-list .channel-name")].map((name) => name.textContent)).toEqual([
 		"#general",
 		"#secret-plans (private)",
@@ -3336,7 +8526,11 @@ test("the Threads view reads the replies feed only while it is open, and a row o
 	// Choosing the row opens the channel, and the view's feed subscription is released with it.
 	fireEvent.click(row);
 	await waitFor(() =>
-		expect(within(nav).getByRole("button", { name: /^#random/ }).getAttribute("aria-current")).toBe("page"),
+		expect(
+			within(nav)
+				.getByRole("button", { name: /^#random/ })
+				.getAttribute("aria-current"),
+		).toBe("page"),
 	);
 	expect(h.find_recent("replies")).toBeUndefined();
 });
@@ -3367,6 +8561,29 @@ test("the Activity view groups the public feed by channel and emphasises mention
 	expect(within(view).getByText("plain").closest(".view-row")!.className).not.toContain("mention-self");
 	// The view says its own boundary out loud.
 	expect(within(view).getByText(/Private channels are not shown here/)).toBeTruthy();
+});
+
+test("terminal Unreads, Activity, and Threads feeds tell the member to reload", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	h.find_recent("messages")!.onUpdate(null, { reason: "unavailable" } satisfies WatchDeathInfo);
+
+	for (const name of ["Unreads", "Activity"] as const) {
+		fireEvent.click(within(nav).getByRole("button", { name }));
+		const view = await screen.findByRole("region", { name });
+		expect(within(view).getByRole("alert").textContent).toMatch(/reload/iu);
+	}
+
+	fireEvent.click(within(nav).getByRole("button", { name: "Threads" }));
+	const repliesFeed = await waitFor(() => {
+		const found = h.find_recent("replies");
+		expect(found).toBeTruthy();
+		return found!;
+	});
+	repliesFeed.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	const threads = await screen.findByRole("region", { name: "Threads" });
+	expect(within(threads).getByRole("alert").textContent).toMatch(/reload/iu);
 });
 
 test("the sidebar watches at most 8 private scopes and says how many are hidden", async () => {
@@ -3490,6 +8707,47 @@ test("a roster refusal is not cached for later composers", async () => {
 	expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual(["Bob", "Cleo"]);
 });
 
+test("a later roster-page refusal shows no partial roster and retries from page one", async () => {
+	const h = make_harness();
+	h.raw.members.list
+		.mockResolvedValueOnce({
+			_yay: { members: [{ userId: "user_a", displayName: "Ada" }], cursor: "page_2" },
+		})
+		.mockResolvedValueOnce({
+			_nay: { name: "unavailable", message: "The member list is unavailable right now" },
+		})
+		.mockResolvedValueOnce({
+			_yay: {
+				members: [
+					{ userId: "user_a", displayName: "Ada" },
+					{ userId: "user_b", displayName: "Bea" },
+				],
+				cursor: null,
+			},
+		});
+	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const textarea = composer_box("Message #general");
+
+	type_in_composer(textarea, "@");
+	await waitFor(() => expect(h.raw.members.list).toHaveBeenCalledTimes(2));
+	const menu = await screen.findByRole("listbox", { name: "Mention somebody" });
+	await waitFor(() =>
+		expect(within(menu).getByRole("status").textContent).toBe(chat_mention_roster_refusal_copy("unavailable")),
+	);
+	expect(within(menu).queryAllByRole("option")).toHaveLength(0);
+
+	// A new composer must start from page one instead of caching Ada from the failed attempt.
+	fireEvent.click(screen.getByRole("button", { name: "#random" }));
+	const reopened = composer_box("Message #random");
+	type_in_composer(reopened, "@");
+	expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual(["Ada", "Bea"]);
+	expect(h.raw.members.list.mock.calls.map((call) => call[0])).toEqual([
+		{ limit: 100 },
+		{ limit: 100, cursor: "page_2" },
+		{ limit: 100 },
+	]);
+});
+
 test("the @-menu shows a short explanation when the roster is not_consented, and the send carries no mentions", async () => {
 	const h = make_harness();
 	h.raw.members.list.mockResolvedValueOnce({
@@ -3557,7 +8815,10 @@ test("the roster is paged once per session and not fetched again on later @ keys
 	type_in_composer(textarea, "@");
 	const options = await screen.findAllByRole("option");
 	expect(options.map((option) => option.textContent)).toEqual(["Ada", "Bea"]);
-	expect(h.raw.members.list.mock.calls.map((call) => call[0])).toEqual([{ limit: 100 }, { limit: 100, cursor: "page_2" }]);
+	expect(h.raw.members.list.mock.calls.map((call) => call[0])).toEqual([
+		{ limit: 100 },
+		{ limit: 100, cursor: "page_2" },
+	]);
 
 	fireEvent.keyDown(textarea, { key: "Escape" });
 	type_in_composer(textarea, "later @");
@@ -3585,52 +8846,362 @@ test("a mention renders as a span, and a mention of this member takes the amber 
 	expect(mentions[1]!.className).not.toContain("mention-self");
 });
 
-test("sending in a private channel stamps lastMessageAt on the channel doc, debounced", async () => {
-	const h = make_harness();
-	// The channel was last stamped 16s before the send the append mock answers (t=50,000), so the
-	// first send stamps; the second send lands 1s later, inside the 15s debounce, and does not.
-	const staleStamp = 50_000 - 16_000;
-	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans", null, { lastMessageAt: staleStamp })], [PRIVATE_KEY]);
+function private_scope(appendActivity: ScopeFixture["appendActivity"] = [], scopeId = PRIVATE_KEY): ScopeFixture {
+	return {
+		scopeId,
+		keyPrefix: scopeId,
+		collections: [...chat_PRIVATE_CHANNEL_COLLECTIONS],
+		level: "manage",
+		appendActivity,
+	};
+}
+
+async function open_private_composer(h: ReturnType<typeof make_harness>) {
+	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 	fireEvent.click(within(nav).getByRole("button", { name: /^#secret-plans/ }));
-	await waitFor(() => expect(h.find_window("messages", `${PRIVATE_KEY}:`)).toBeTruthy());
-	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([]));
-
-	h.raw.data.append.mockResolvedValueOnce({
-		_yay: { key: `${PRIVATE_KEY}:${inv(50_000)}:sent`, revision: 1 },
-	});
-	const textarea = screen.getByRole("combobox", { name: "Message #secret-plans" }) as HTMLTextAreaElement;
-	type_in_composer(textarea, "psst");
-	fireEvent.keyDown(textarea, { key: "Enter" });
-
-	// The sender stamps the channel doc so members with the channel closed can see unread state —
-	// a rangeless read never sees a private scope, and this doc is all they get.
-	const stamp = await waitFor(() => {
-		const found = (h.raw.data.put.mock.calls as [PutOpts][])
-			.map(([opts]) => opts)
-			.find((opts) => opts.collection === "channels" && opts.key === PRIVATE_KEY);
+	const messageWindow = await waitFor(() => {
+		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
 		expect(found).toBeTruthy();
 		return found!;
 	});
-	expect(stamp.value.lastMessageAt).toBe(50_000);
-	expect(stamp.value.name).toBe("secret-plans");
-	expect(stamp.expectedRevision).toBe(1);
+	messageWindow.onUpdate(window_update([]));
+	return {
+		unmount: utils.unmount,
+		textarea: screen.getByRole("combobox", { name: "Message #secret-plans" }) as HTMLTextAreaElement,
+	};
+}
 
-	// The watch echoes the fresh stamp back into the channel doc; a send 1s later sits inside
-	// the debounce, so no second stamp is written.
-	h.find_watch("channels", PRIVATE_KEY)!.onUpdate(
-		watch_update([channel_doc(PRIVATE_KEY, "secret-plans", null, { lastMessageAt: 50_000 })]),
-	);
-	h.raw.data.append.mockResolvedValueOnce({
-		_yay: { key: `${PRIVATE_KEY}:${inv(51_000)}:sen2`, revision: 1 },
-	});
-	type_in_composer(textarea, "again");
-	fireEvent.keyDown(textarea, { key: "Enter" });
-	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(2));
-	const stamps = (h.raw.data.put.mock.calls as [PutOpts][])
-		.map(([opts]) => opts)
-		.filter((opts) => opts.collection === "channels" && opts.key === PRIVATE_KEY);
-	expect(stamps).toHaveLength(1);
+test("durable private message activity updates unread without replacing its ranged watch", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const privateWatch = h.find_watch("channels", PRIVATE_KEY)!;
+	const watchCount = h.watches.length;
+
+	h.send_scopes([private_scope([{ collection: "messages", at: 5_000, createdByUserId: "user_other" }])]);
+
+	const privateRow = await waitFor(() => within(nav).getByRole("button", { name: /^#secret-plans/ }));
+	await waitFor(() => expect(privateRow.className).toContain("is-unread"));
+	expect(h.find_watch("channels", PRIVATE_KEY)).toBe(privateWatch);
+	expect(h.watches).toHaveLength(watchCount);
+	expect(h.raw.data.put).not.toHaveBeenCalled();
+
+	fireEvent.click(within(nav).getByRole("button", { name: /^Unreads/ }));
+	const unreads = await screen.findByRole("region", { name: "Unreads" });
+	expect(within(unreads).getByRole("button", { name: /^#secret-plans/ })).toBeTruthy();
 });
 
+test("a same-millisecond message sequence advance becomes unread", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const privateRow = () => within(nav).getByRole("button", { name: /^#secret-plans/ });
+	h.find_watch("channels", PRIVATE_KEY)!.onUpdate(
+		watch_update([
+			channel_doc(PRIVATE_KEY, "secret-plans"),
+			private_cursor_doc(PRIVATE_KEY, 5_000, 1, { messages: 4, replies: 0 }),
+		]),
+	);
+	h.send_scopes([private_scope([{ collection: "messages", at: 5_000, createdByUserId: "user_other", sequence: 4 }])]);
+	await waitFor(() => expect(privateRow().className).not.toContain("is-unread"));
+
+	// The second append can have the same timestamp and a lexically lower hidden key. Sequence is
+	// the durable order, so it must still reopen unread state.
+	h.send_scopes([private_scope([{ collection: "messages", at: 5_000, createdByUserId: "user_other", sequence: 5 }])]);
+	await waitFor(() => expect(privateRow().className).toContain("is-unread"));
+});
+
+test("private message and reply sequences advance independently", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const privateRow = () => within(nav).getByRole("button", { name: /^#secret-plans/ });
+	h.find_watch("channels", PRIVATE_KEY)!.onUpdate(
+		watch_update([
+			channel_doc(PRIVATE_KEY, "secret-plans"),
+			private_cursor_doc(PRIVATE_KEY, 7_500, 1, { messages: 4, replies: 1 }),
+		]),
+	);
+
+	h.send_scopes([
+		private_scope([
+			{ collection: "channels", at: 10_000, createdByUserId: "user_other" },
+			{ collection: "reactions", at: 9_000, createdByUserId: "user_other" },
+			{ collection: "files", at: 8_500, createdByUserId: "user_other" },
+			{ collection: "messages", at: 7_500, createdByUserId: "user_other", sequence: 4 },
+			{ collection: "replies", at: 7_000, createdByUserId: "user_other", sequence: 1 },
+		]),
+	]);
+	await waitFor(() => expect(privateRow().className).not.toContain("is-unread"));
+
+	h.send_scopes([
+		private_scope([
+			{ collection: "channels", at: 10_000, createdByUserId: "user_other" },
+			{ collection: "reactions", at: 9_000, createdByUserId: "user_other" },
+			{ collection: "messages", at: 7_500, createdByUserId: "user_other", sequence: 4 },
+			{ collection: "replies", at: 8_000, createdByUserId: "user_other", sequence: 2 },
+		]),
+	]);
+	await waitFor(() => expect(privateRow().className).toContain("is-unread"));
+
+	h.find_watch("channels", PRIVATE_KEY)!.onUpdate(
+		watch_update([
+			channel_doc(PRIVATE_KEY, "secret-plans"),
+			private_cursor_doc(PRIVATE_KEY, 8_000, 2, { messages: 4, replies: 2 }),
+		]),
+	);
+	await waitFor(() => expect(privateRow().className).not.toContain("is-unread"));
+	h.send_scopes([
+		private_scope([
+			{ collection: "messages", at: 8_000, createdByUserId: "user_other", sequence: 5 },
+			{ collection: "replies", at: 8_000, createdByUserId: "user_other", sequence: 2 },
+		]),
+	]);
+	await waitFor(() => expect(privateRow().className).toContain("is-unread"));
+	expect(h.raw.data.put).not.toHaveBeenCalled();
+});
+
+test("same-time own then other private activity is not hidden after the cursor covers the own append", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const privateRow = () => within(nav).getByRole("button", { name: /^#secret-plans/ });
+
+	h.send_scopes([private_scope([{ collection: "messages", at: 7_000, createdByUserId: "user_me", sequence: 1 }])]);
+	await waitFor(() => expect(privateRow().className).toContain("is-unread"));
+
+	h.find_watch("channels", PRIVATE_KEY)!.onUpdate(
+		watch_update([
+			channel_doc(PRIVATE_KEY, "secret-plans"),
+			private_cursor_doc(PRIVATE_KEY, 7_000, 1, { messages: 1, replies: 0 }),
+		]),
+	);
+	await waitFor(() => expect(privateRow().className).not.toContain("is-unread"));
+
+	h.send_scopes([private_scope([{ collection: "messages", at: 7_000, createdByUserId: "user_other", sequence: 2 }])]);
+	await waitFor(() => expect(privateRow().className).toContain("is-unread"));
+});
+
+test.each([
+	["ahead", 90_000, 5_000],
+	["behind", 1_000, 5_000],
+] as const)(
+	"opening a private channel uses durable reply time when the device clock is %s",
+	async (_, deviceAt, replyAt) => {
+		const now = vi.spyOn(Date, "now").mockReturnValue(deviceAt);
+		try {
+			const h = make_harness();
+			await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+			h.send_scopes([
+				private_scope([{ collection: "replies", at: replyAt, createdByUserId: "user_other", sequence: 1 }]),
+			]);
+			const nav = screen.getByRole("navigation", { name: "Channels" });
+			const privateRow = () => within(nav).getByRole("button", { name: /^#secret-plans/ });
+			await waitFor(() => expect(privateRow().className).toContain("is-unread"));
+
+			fireEvent.click(privateRow());
+			const cursorWrite = await waitFor(() => {
+				const found = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+					.map(([opts]) => opts)
+					.find((opts) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`);
+				expect(found).toBeTruthy();
+				return found!;
+			});
+			expect(cursorWrite.value).toEqual({ at: replyAt, activity: { messages: 0, replies: 1 } });
+			expect(h.raw.data.put).not.toHaveBeenCalled();
+		} finally {
+			now.mockRestore();
+		}
+	},
+);
+
+test("a private append with a lost response remains unread after the sender reloads", async () => {
+	const first = make_harness();
+	first.raw.data.append.mockResolvedValueOnce({
+		_nay: { name: "unavailable", message: "The message may have been stored" },
+	});
+	const { textarea, unmount } = await open_private_composer(first);
+	type_in_composer(textarea, "stored before reload");
+	await act(async () => {
+		fireEvent.keyDown(textarea, { key: "Enter" });
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	expect(first.raw.data.append).toHaveBeenCalledTimes(1);
+	const request = first.raw.data.append.mock.calls[0]![0];
+	unmount();
+
+	const second = make_harness();
+	await boot_sidebar(
+		second,
+		[channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")],
+		[PRIVATE_KEY],
+	);
+	second.send_scopes([private_scope([{ collection: "messages", at: 50_000, createdByUserId: "user_me" }])]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	await waitFor(() =>
+		expect(within(nav).getByRole("button", { name: /^#secret-plans/ }).className).toContain("is-unread"),
+	);
+	expect(request.clientRequestId).toMatch(/^[0-9a-f-]{36}$/);
+	expect(first.raw.data.put).not.toHaveBeenCalled();
+	expect(second.raw.data.put).not.toHaveBeenCalled();
+});
+
+test("activity from a removed sender remains unread for a member after reload", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	h.send_scopes([private_scope([{ collection: "replies", at: 6_000, createdByUserId: "user_removed" }])]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	await waitFor(() =>
+		expect(within(nav).getByRole("button", { name: /^#secret-plans/ }).className).toContain("is-unread"),
+	);
+	expect(nav.textContent).not.toContain("user_removed");
+});
+
+test("an unavailable private send replays one request while navigation and Leave stay blocked", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const replay = deferred<{ _yay: { key: string; revision: number } }>();
+	h.raw.data.append
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "The reply may have been lost" } })
+		.mockReturnValueOnce(replay.promise);
+	const { textarea } = await open_private_composer(h);
+
+	type_in_composer(textarea, "uncertain private message");
+	await act(async () => {
+		fireEvent.keyDown(textarea, { key: "Enter" });
+		await Promise.resolve();
+	});
+	expect(h.raw.data.append).toHaveBeenCalledTimes(1);
+	const firstAppend = h.raw.data.append.mock.calls[0]![0];
+
+	const unreads = screen.getByRole("button", { name: "Unreads" });
+	expect(unreads.hasAttribute("disabled")).toBe(true);
+	fireEvent.click(unreads);
+	expect(screen.getByRole("combobox", { name: "Message #secret-plans" })).toBeTruthy();
+
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	const leave = await within(dialog).findByRole("button", { name: "Leave channel" });
+	fireEvent.click(leave);
+	expect((await within(dialog).findByRole("alert")).textContent).toBe(
+		"Wait for pending message changes to finish before leaving this channel or thread.",
+	);
+	expect(h.raw.scopes.removePrincipal).not.toHaveBeenCalled();
+
+	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(2), { timeout: 2_500 });
+	expect(h.raw.data.append.mock.calls[1]![0]).toEqual(firstAppend);
+	expect(unreads.hasAttribute("disabled")).toBe(true);
+	fireEvent.click(leave);
+	expect(h.raw.scopes.removePrincipal).not.toHaveBeenCalled();
+
+	await act(async () => {
+		replay.resolve({ _yay: { key: `${PRIVATE_KEY}:${inv(50_000)}:sent`, revision: 1 } });
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	expect(h.raw.data.put).not.toHaveBeenCalled();
+	expect(unreads.hasAttribute("disabled")).toBe(false);
+	expect(screen.queryByText("Sending…")).toBeNull();
+	expect(screen.getAllByText("uncertain private message")).toHaveLength(1);
+});
+
+test("an unavailable private reply replays one request and unlocks its thread after success", async () => {
+	const h = make_harness();
+	await open_private_composer(h);
+	const rootA = message_doc(49_000, { channelKey: PRIVATE_KEY, rand: "root", text: "private root a" });
+	const rootB = message_doc(48_000, { channelKey: PRIVATE_KEY, rand: "roo2", text: "private root b" });
+	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([rootA, rootB]));
+	await screen.findByText("private root a");
+
+	const replay = deferred<{ _yay: { key: string; revision: number } }>();
+	h.raw.data.append
+		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "The reply may have been lost" } })
+		.mockReturnValueOnce(replay.promise);
+	const rowA = screen.getByText("private root a").closest("[data-key]") as HTMLElement;
+	fireEvent.click(within(rowA).getByRole("button", { name: "Reply in thread" }));
+	const panel = await screen.findByRole("region", { name: "Thread" });
+
+	const replyBox = within(panel).getByRole("combobox", { name: "Reply in thread" }) as HTMLTextAreaElement;
+	type_in_composer(replyBox, "uncertain private reply");
+	await act(async () => {
+		fireEvent.keyDown(replyBox, { key: "Enter" });
+		await Promise.resolve();
+	});
+	expect(h.raw.data.append).toHaveBeenCalledTimes(1);
+	const firstAppend = h.raw.data.append.mock.calls[0]![0];
+	expect(firstAppend.collection).toBe("replies");
+	expect(firstAppend.keyPrefix).toBe(`${rootA.key}:`);
+
+	const close = within(panel).getByRole("button", { name: "Close thread" });
+	const rowB = screen.getByText("private root b").closest("[data-key]") as HTMLElement;
+	const switchThread = within(rowB).getByRole("button", { name: "Reply in thread" });
+	expect(close.hasAttribute("disabled")).toBe(true);
+	expect(switchThread.hasAttribute("disabled")).toBe(true);
+	fireEvent.click(close);
+	fireEvent.click(switchThread);
+	expect(screen.getByRole("region", { name: "Thread" })).toBe(panel);
+
+	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(2), { timeout: 2_500 });
+	expect(h.raw.data.append.mock.calls[1]![0]).toEqual(firstAppend);
+	expect(close.hasAttribute("disabled")).toBe(true);
+
+	await act(async () => {
+		replay.resolve({ _yay: { key: `${rootA.key}:${inv(51_000)}:repl`, revision: 1 } });
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	expect(h.raw.data.put).not.toHaveBeenCalled();
+	expect(close.hasAttribute("disabled")).toBe(false);
+	expect(switchThread.hasAttribute("disabled")).toBe(false);
+	expect(within(panel).getAllByText("uncertain private reply")).toHaveLength(1);
+});
+
+test("Leave waits for a delayed send, then removes the member without a channel put", async () => {
+	const h = make_harness();
+	h.scopePrincipals.set(PRIVATE_KEY, [
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
+	const append = deferred<{ _yay: { key: string; revision: number } }>();
+	const events: string[] = [];
+	h.raw.data.append.mockImplementationOnce(() => {
+		events.push("append");
+		return append.promise;
+	});
+	h.raw.scopes.removePrincipal.mockImplementationOnce(async () => {
+		events.push("scopes.removePrincipal");
+		return { _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } };
+	});
+	const { textarea } = await open_private_composer(h);
+
+	type_in_composer(textarea, "committed before leave");
+	fireEvent.keyDown(textarea, { key: "Enter" });
+	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(1));
+	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
+	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
+	const leave = await within(dialog).findByRole("button", { name: "Leave channel" });
+	fireEvent.click(leave);
+	expect((await within(dialog).findByRole("alert")).textContent).toBe(
+		"Wait for pending message changes to finish before leaving this channel or thread.",
+	);
+	expect(h.raw.scopes.removePrincipal).not.toHaveBeenCalled();
+
+	await act(async () => {
+		append.resolve({ _yay: { key: `${PRIVATE_KEY}:${inv(50_000)}:sent`, revision: 1 } });
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+	await waitFor(() => expect(screen.queryByText("Sending…")).toBeNull());
+	expect(h.raw.data.put).not.toHaveBeenCalled();
+
+	fireEvent.click(leave);
+	await waitFor(() => expect(h.raw.scopes.removePrincipal).toHaveBeenCalledTimes(1));
+	expect(events).toEqual(["append", "scopes.removePrincipal"]);
+	expect(h.raw.data.put).not.toHaveBeenCalled();
+});
 // #endregion unreads, views, mentions

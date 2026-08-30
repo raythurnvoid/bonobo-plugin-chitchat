@@ -12,13 +12,24 @@ import { memo } from "react";
  * One 28px trigger and a floating menu costs the row almost nothing, and the actions get real menu
  * keyboard behaviour instead of being extra tab stops inside a list item.
  */
-export type ChannelRowMenu_Item = {
-	id: string;
-	label: string;
-	onSelect: () => void;
-};
+export type ChannelRowMenu_Item =
+	| {
+			id: string;
+			label: string;
+			onSelect: () => void;
+			danger?: boolean;
+	  }
+	| {
+			id: string;
+			separator: true;
+	  };
 
-type ChannelRowMenu_ClassNames = "ChannelRowMenu-trigger" | "ChannelRowMenu-popover" | "ChannelRowMenu-item";
+type ChannelRowMenu_ClassNames =
+	| "ChannelRowMenu-trigger"
+	| "ChannelRowMenu-popover"
+	| "ChannelRowMenu-item"
+	| "ChannelRowMenu-item-danger"
+	| "ChannelRowMenu-separator";
 
 type ChannelRowMenu_Props = {
 	channelName: string;
@@ -49,15 +60,26 @@ export const ChannelRowMenu = memo(function ChannelRowMenu(props: ChannelRowMenu
 				className={"ChannelRowMenu-popover" satisfies ChannelRowMenu_ClassNames}
 				aria-label={`Actions for #${channelName}`}
 			>
-				{items.map((item) => (
-					<Ariakit.MenuItem
-						key={item.id}
-						className={"ChannelRowMenu-item" satisfies ChannelRowMenu_ClassNames}
-						onClick={item.onSelect}
-					>
-						{item.label}
-					</Ariakit.MenuItem>
-				))}
+				{items.map((item) =>
+					"separator" in item ? (
+						<Ariakit.MenuSeparator
+							key={item.id}
+							className={"ChannelRowMenu-separator" satisfies ChannelRowMenu_ClassNames}
+						/>
+					) : (
+						<Ariakit.MenuItem
+							key={item.id}
+							className={
+								item.danger
+									? `${"ChannelRowMenu-item" satisfies ChannelRowMenu_ClassNames} ${"ChannelRowMenu-item-danger" satisfies ChannelRowMenu_ClassNames}`
+									: ("ChannelRowMenu-item" satisfies ChannelRowMenu_ClassNames)
+							}
+							onClick={item.onSelect}
+						>
+							{item.label}
+						</Ariakit.MenuItem>
+					),
+				)}
 			</Ariakit.Menu>
 		</Ariakit.MenuProvider>
 	);

@@ -3,10 +3,11 @@ import type {
 	BonoboUiMember,
 	BonoboUiScope,
 	BonoboUiScopePrincipal,
+	BonoboUiScopePrincipalListResult,
 	BonoboUiScopeResult,
 	BonoboUiTheme,
 } from "bonobo-plugin-sdk/frontend";
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
 	chat_CHANNEL_NAME_MAX_LENGTH,
 	chat_CHANNEL_TOPIC_MAX_LENGTH,
@@ -21,7 +22,8 @@ import {
 	chat_mention_roster_refusal_copy,
 	chat_merge_cursor_maps,
 	chat_message_channel_key,
-	chat_parse_private_cursor_key,
+	chat_plugin_data_read_response_schema,
+	chat_private_channel_key_is_valid,
 	chat_private_cursor_caller_key,
 	chat_PRIVATE_CHANNEL_COLLECTIONS,
 	chat_PRIVATE_CHANNEL_DISCLOSURE,
@@ -31,9 +33,11 @@ import {
 	chat_validate_message_doc,
 	chat_validate_private_cursor_doc,
 	type chat_ChannelValue,
+	type chat_CursorMapDoc,
 	type chat_CursorMapValue,
 	type chat_Doc,
 	type chat_MessageValue,
+	type chat_PrivateActivityCursor,
 	type chat_PrivateCursorDoc,
 	type chat_PublicUnread,
 } from "./chat-data";
@@ -63,7 +67,8 @@ const MEMBER_NAME_MAX_AGE_MS = 5 * 60 * 1000;
 
 function use_member_names(client: BonoboUiFrontendClient): chat_MemberNamesApi {
 	const namesRef = useRef(new Map<string, string | null>());
-	const requestedRef = useRef(new Map<string, number>());
+	const resolvedAtRef = useRef(new Map<string, number>());
+	const inflightRef = useRef(new Map<string, Promise<void>>());
 	// The value is never read; setting it re-renders consumers after names land.
 	const [, setResolutionCount] = useState(0);
 
@@ -74,31 +79,53 @@ function use_member_names(client: BonoboUiFrontendClient): chat_MemberNamesApi {
 	const resolve = useCallback(
 		async (userIds: string[]) => {
 			const now = Date.now();
-			const missing = [...new Set(userIds)].filter((id) => {
-				const requestedAt = requestedRef.current.get(id);
-				return requestedAt === undefined || now - requestedAt >= MEMBER_NAME_MAX_AGE_MS;
-			});
-			if (missing.length === 0) {
-				return;
-			}
-			for (const id of missing) {
-				requestedRef.current.set(id, now);
+			const missing: string[] = [];
+			const requests = new Set<Promise<void>>();
+			for (const id of new Set(userIds)) {
+				const request = inflightRef.current.get(id);
+				if (request !== undefined) {
+					// A second message from this author must wait for the lookup already in progress.
+					requests.add(request);
+					continue;
+				}
+				const resolvedAt = resolvedAtRef.current.get(id);
+				if (resolvedAt === undefined || now - resolvedAt >= MEMBER_NAME_MAX_AGE_MS) {
+					missing.push(id);
+				}
 			}
 			// The server resolves at most 50 ids per request.
 			for (let start = 0; start < missing.length; start += 50) {
 				const batch = missing.slice(start, start + 50);
-				try {
-					const members = await client.members.resolve(batch);
-					for (const id of batch) {
-						namesRef.current.set(id, members[id] ?? null);
-					}
-				} catch {
-					// Allow a later retry for this batch.
-					for (const id of batch) {
-						requestedRef.current.delete(id);
-					}
+				const request = client.members
+					.resolve(batch)
+					.then((members) => {
+						for (const id of batch) {
+							namesRef.current.set(id, members[id] ?? null);
+							resolvedAtRef.current.set(id, Date.now());
+						}
+					})
+					.catch(() => {
+						// Allow a later retry for this batch.
+						for (const id of batch) {
+							resolvedAtRef.current.delete(id);
+						}
+					});
+				for (const id of batch) {
+					inflightRef.current.set(id, request);
 				}
+				void request.then(() => {
+					for (const id of batch) {
+						if (inflightRef.current.get(id) === request) {
+							inflightRef.current.delete(id);
+						}
+					}
+				});
+				requests.add(request);
 			}
+			if (requests.size === 0) {
+				return;
+			}
+			await Promise.all(requests);
 			setResolutionCount((current) => current + 1);
 		},
 		[client],
@@ -154,6 +181,7 @@ function MemberPicker(props: {
 	client: BonoboUiFrontendClient;
 	selfUserId: string;
 	selected: string[];
+	disabled?: boolean;
 	onToggle: (userId: string, selected: boolean) => void;
 }) {
 	// Mounted only while a dialog is really showing the picker, so the roster is read then and not
@@ -191,6 +219,7 @@ function MemberPicker(props: {
 							<input
 								type="checkbox"
 								checked={props.selected.includes(member.userId)}
+								disabled={props.disabled}
 								onChange={(event) => props.onToggle(member.userId, event.currentTarget.checked)}
 							/>
 							{chat_member_label(member.displayName)}
@@ -214,6 +243,8 @@ function ChannelNameDialog(props: {
 	 */
 	privacy: { client: BonoboUiFrontendClient; selfUserId: string } | null;
 	busy: boolean;
+	waiting: boolean;
+	fieldsLocked: boolean;
 	error: string | null;
 	onSubmit: (name: string, topic: string, people: { isPrivate: boolean; userIds: string[] }) => void;
 	onClose: () => void;
@@ -227,9 +258,10 @@ function ChannelNameDialog(props: {
 	const [isPrivate, setIsPrivate] = useState(false);
 	const [invited, setInvited] = useState<string[]>([]);
 	const [validationError, setValidationError] = useState<string | null>(null);
+	const fieldsLocked = props.busy || props.fieldsLocked;
 
 	const handle_submit = () => {
-		if (props.busy) {
+		if (props.busy || props.waiting) {
 			return;
 		}
 		const trimmed = name.trim();
@@ -247,9 +279,15 @@ function ChannelNameDialog(props: {
 	};
 
 	const error = validationError ?? props.error;
+	const handle_close = () => {
+		// Keep the dialog mounted until the active write finishes.
+		if (!props.busy) {
+			props.onClose();
+		}
+	};
 
 	return (
-		<Dialog labelledBy={titleId} onClose={props.onClose}>
+		<Dialog labelledBy={titleId} onClose={handle_close}>
 			<h2 id={titleId} className="dialog-title">
 				{props.title}
 			</h2>
@@ -261,6 +299,7 @@ function ChannelNameDialog(props: {
 					type="text"
 					value={name}
 					maxLength={chat_CHANNEL_NAME_MAX_LENGTH}
+					disabled={fieldsLocked}
 					onInput={(event) => setName(event.currentTarget.value)}
 					onKeyDown={(event) => {
 						if (event.key === "Enter") {
@@ -277,6 +316,7 @@ function ChannelNameDialog(props: {
 					type="text"
 					value={topic}
 					maxLength={chat_CHANNEL_TOPIC_MAX_LENGTH}
+					disabled={fieldsLocked}
 					onInput={(event) => setTopic(event.currentTarget.value)}
 					onKeyDown={(event) => {
 						if (event.key === "Enter") {
@@ -293,6 +333,7 @@ function ChannelNameDialog(props: {
 							id={privateId}
 							type="checkbox"
 							checked={isPrivate}
+							disabled={fieldsLocked}
 							onChange={(event) => setIsPrivate(event.currentTarget.checked)}
 						/>
 						Private channel
@@ -307,10 +348,9 @@ function ChannelNameDialog(props: {
 								client={props.privacy.client}
 								selfUserId={props.privacy.selfUserId}
 								selected={invited}
+								disabled={fieldsLocked}
 								onToggle={(userId, selected) =>
-									setInvited((current) =>
-										selected ? [...current, userId] : current.filter((id) => id !== userId),
-									)
+									setInvited((current) => (selected ? [...current, userId] : current.filter((id) => id !== userId)))
 								}
 							/>
 						</>
@@ -323,11 +363,16 @@ function ChannelNameDialog(props: {
 				</p>
 			) : null}
 			<div className="dialog-actions">
-				<button type="button" className="button" disabled={props.busy} onClick={props.onClose}>
+				<button type="button" className="button" disabled={props.busy} onClick={handle_close}>
 					Cancel
 				</button>
-				<button type="button" className="button button-primary" disabled={props.busy} onClick={handle_submit}>
-					{props.busy ? "Saving…" : props.submitLabel}
+				<button
+					type="button"
+					className="button button-primary"
+					disabled={props.busy || props.waiting}
+					onClick={handle_submit}
+				>
+					{props.busy ? "Saving…" : props.waiting ? "Checking…" : props.fieldsLocked ? "Retry" : props.submitLabel}
 				</button>
 			</div>
 		</Dialog>
@@ -348,38 +393,97 @@ function ChannelPeopleDialog(props: {
 	onClose: () => void;
 }) {
 	const titleId = useId();
-	const [principals, setPrincipals] = useState<BonoboUiScopePrincipal[] | null>(null);
+	const [principals, setPrincipals] = useState<BonoboUiScopePrincipal[] | null | undefined>(undefined);
 	const [loaded, setLoaded] = useState(false);
+	const [principalReadError, setPrincipalReadError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const busyRef = useRef(false);
+	const mountedRef = useRef(true);
+	const readGenerationRef = useRef(0);
+
+	useEffect(() => {
+		mountedRef.current = true;
+		return () => {
+			mountedRef.current = false;
+			readGenerationRef.current += 1;
+		};
+	}, []);
 
 	const reload = useCallback(() => {
-		return props.client.scopes.listPrincipals({ scopeId: props.channel.key }).then((result) => {
-			setPrincipals(result);
-			setLoaded(true);
-			if (result !== null) {
-				props.memberNames.resolve(result.map((principal) => principal.userId));
-			}
-			return result;
-		});
+		const generation = (readGenerationRef.current += 1);
+		setLoaded(false);
+		setPrincipalReadError(null);
+		return Promise.resolve()
+			.then(() => props.client.scopes.listPrincipals({ scopeId: props.channel.key }))
+			.then((rawResult) => {
+				if (!mountedRef.current || readGenerationRef.current !== generation) {
+					return { kind: "cancelled" } as const;
+				}
+				const result = private_scope_principal_result(rawResult);
+				setLoaded(true);
+				if (result === null || "_nay" in result) {
+					setPrincipals(undefined);
+					setPrincipalReadError(
+						result !== null && "_nay" in result ? result._nay.message : "The people list response was invalid.",
+					);
+					return { kind: "unavailable" } as const;
+				}
+				setPrincipals(result._yay);
+				if (result._yay !== null) {
+					props.memberNames.resolve(result._yay.map((principal) => principal.userId));
+				}
+				return { kind: "exact", principals: result._yay } as const;
+			})
+			.catch(() => {
+				if (!mountedRef.current || readGenerationRef.current !== generation) {
+					return { kind: "cancelled" } as const;
+				}
+				setLoaded(true);
+				setPrincipals(undefined);
+				setPrincipalReadError("Failed to read who can access this");
+				return { kind: "unavailable" } as const;
+			});
 	}, [props.client, props.channel.key, props.memberNames]);
 
 	useEffect(() => {
 		void reload();
 	}, [reload]);
 
-	const change = (action: Promise<BonoboUiScopeResult>) => {
+	const change = (start: () => Promise<BonoboUiScopeResult>) => {
+		if (busyRef.current) {
+			return;
+		}
+		busyRef.current = true;
 		setBusy(true);
 		setError(null);
-		action
+		start()
 			.then((result) => {
 				if ("_nay" in result) {
+					if (result._nay.name === "unavailable") {
+						// The change may have reached the server. Reload before showing access as current.
+						return reload().then((current) => {
+							if (current.kind === "cancelled") {
+								return;
+							}
+							setError(
+								current.kind === "unavailable"
+									? "We could not confirm the change, and the current people list could not be loaded."
+									: current.principals === null
+										? "We could not confirm the change, and this people list is no longer readable."
+										: "We could not confirm the change. The current people list is shown.",
+							);
+						});
+					}
 					setError(result._nay.message);
 					return;
 				}
 				return reload().then(() => undefined);
 			})
-			.finally(() => setBusy(false));
+			.finally(() => {
+				busyRef.current = false;
+				setBusy(false);
+			});
 	};
 
 	const inScope = new Set((principals ?? []).map((principal) => principal.userId));
@@ -388,14 +492,28 @@ function ChannelPeopleDialog(props: {
 	const canManage = (principals ?? []).some(
 		(principal) => principal.userId === props.selfUserId && principal.level === "manage",
 	);
+	const handle_close = () => {
+		// Do not make a membership change look cancelled while the host is still applying it.
+		if (!busy) {
+			props.onClose();
+		}
+	};
 
 	return (
-		<Dialog labelledBy={titleId} onClose={props.onClose}>
+		<Dialog labelledBy={titleId} onClose={handle_close}>
 			<h2 id={titleId} className="dialog-title">
 				People in #{props.channel.value.name}
 			</h2>
 			<p className="field-note">{chat_PRIVATE_CHANNEL_DISCLOSURE}</p>
 			{!loaded ? (
+				<p className="channel-status" role="status">
+					Loading people…
+				</p>
+			) : principalReadError !== null ? (
+				<p className="form-error" role="alert">
+					{principalReadError}
+				</p>
+			) : principals === undefined ? (
 				<p className="channel-status" role="status">
 					Loading people…
 				</p>
@@ -417,7 +535,7 @@ function ChannelPeopleDialog(props: {
 									className="button channel-item-action"
 									disabled={busy}
 									onClick={() =>
-										change(
+										change(() =>
 											props.client.scopes.removePrincipal({
 												scopeId: props.channel.key,
 												userId: principal.userId,
@@ -432,7 +550,7 @@ function ChannelPeopleDialog(props: {
 					))}
 				</ul>
 			)}
-			{loaded && principals !== null && canManage ? (
+			{loaded && principals !== undefined && principals !== null && canManage ? (
 				<div className="field">
 					{/* Not a <label>: it names a group of checkboxes, and a label with no control of its
 					    own is a control assistive tech announces and nobody can operate. */}
@@ -441,8 +559,9 @@ function ChannelPeopleDialog(props: {
 						client={props.client}
 						selfUserId={props.selfUserId}
 						selected={[...inScope]}
+						disabled={busy}
 						onToggle={(userId, selected) =>
-							change(
+							change(() =>
 								selected
 									? props.client.scopes.setPrincipal({
 											scopeId: props.channel.key,
@@ -461,7 +580,18 @@ function ChannelPeopleDialog(props: {
 				</p>
 			) : null}
 			<div className="dialog-actions">
-				<button type="button" className="button" data-dialog-initial onClick={props.onClose}>
+				{loaded && principalReadError !== null ? (
+					<button type="button" className="button" data-dialog-initial disabled={busy} onClick={() => void reload()}>
+						Retry
+					</button>
+				) : null}
+				<button
+					type="button"
+					className="button"
+					data-dialog-initial={principalReadError === null ? true : undefined}
+					disabled={busy}
+					onClick={handle_close}
+				>
 					Close
 				</button>
 			</div>
@@ -472,13 +602,20 @@ function ChannelPeopleDialog(props: {
 function ArchiveChannelDialog(props: {
 	channelName: string;
 	busy: boolean;
+	retry: boolean;
 	error: string | null;
 	onConfirm: () => void;
 	onClose: () => void;
 }) {
 	const titleId = useId();
+	const handle_close = () => {
+		// Keep the result dialog mounted until the archive write finishes.
+		if (!props.busy) {
+			props.onClose();
+		}
+	};
 	return (
-		<Dialog labelledBy={titleId} onClose={props.onClose}>
+		<Dialog labelledBy={titleId} onClose={handle_close}>
 			<h2 id={titleId} className="dialog-title">
 				Archive #{props.channelName}?
 			</h2>
@@ -489,11 +626,140 @@ function ArchiveChannelDialog(props: {
 				</p>
 			) : null}
 			<div className="dialog-actions">
-				<button type="button" className="button" data-dialog-initial disabled={props.busy} onClick={props.onClose}>
+				<button type="button" className="button" data-dialog-initial disabled={props.busy} onClick={handle_close}>
 					Cancel
 				</button>
 				<button type="button" className="button button-danger" disabled={props.busy} onClick={props.onConfirm}>
-					{props.busy ? "Archiving…" : "Archive channel"}
+					{props.busy ? "Archiving…" : props.retry ? "Retry" : "Archive channel"}
+				</button>
+			</div>
+		</Dialog>
+	);
+}
+
+function ExitChannelDialog(props: {
+	client: BonoboUiFrontendClient;
+	channel: chat_Doc<chat_ChannelValue>;
+	action: "leave" | "delete";
+	busy: boolean;
+	waiting: boolean;
+	error: string | null;
+	onConfirm: (expectedPrincipalCount: number | undefined) => void;
+	onClose: () => void;
+}) {
+	const titleId = useId();
+	const [principalCount, setPrincipalCount] = useState<number | null | undefined>(undefined);
+	const [principalReadError, setPrincipalReadError] = useState<string | null>(null);
+	const [readAttempt, setReadAttempt] = useState(0);
+
+	useEffect(() => {
+		let cancelled = false;
+		setPrincipalCount(undefined);
+		setPrincipalReadError(null);
+		Promise.resolve()
+			.then(() => props.client.scopes.listPrincipals({ scopeId: props.channel.key }))
+			.then((rawResult) => {
+				if (cancelled) {
+					return;
+				}
+				const result = private_scope_principal_result(rawResult);
+				if (result === null || "_nay" in result) {
+					setPrincipalReadError(
+						result !== null && "_nay" in result ? result._nay.message : "The people list response was invalid.",
+					);
+					return;
+				}
+				setPrincipalCount(result._yay?.length ?? null);
+			})
+			.catch(() => {
+				if (!cancelled) {
+					setPrincipalReadError("Failed to read who can access this");
+				}
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [props.client, props.channel.key, readAttempt]);
+
+	const deleting = props.action === "delete" || principalCount === 1;
+	const handle_close = () => {
+		// Keep the result dialog mounted while the host call decides whether the channel still exists.
+		if (!props.busy) {
+			props.onClose();
+		}
+	};
+	const body =
+		principalCount === undefined
+			? ""
+			: props.action === "delete"
+				? principalCount === null
+					? "We could not read how many people are in this channel. Deleting it will remove the channel for everyone who is in it. Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone."
+					: `${principalCount === 1 ? "This deletes the channel for the one person in it." : `This deletes the channel for all ${principalCount} people in it.`} Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone.`
+				: principalCount === null
+					? "We could not read who else is in this channel. If other people remain, they keep the channel and somebody who can add people has to add you back. If you are the only person left, leaving deletes it. Then nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files."
+					: principalCount === 1
+						? "You are the only person in this channel, so leaving deletes it. Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone."
+						: `You stop seeing this channel and its messages here. If you are not the organization owner, you also lose access to its files. ${principalCount === 2 ? "The other person keeps it." : `The other ${principalCount - 1} people keep it.`} Somebody who can add people has to add you back.`;
+
+	return (
+		<Dialog labelledBy={titleId} onClose={handle_close}>
+			<h2 id={titleId} className="dialog-title">
+				{props.action === "delete"
+					? `Delete #${props.channel.value.name} for everyone?`
+					: `Leave #${props.channel.value.name}?`}
+			</h2>
+			{principalReadError !== null ? (
+				<p className="form-error" role="alert">
+					{principalReadError}
+				</p>
+			) : principalCount === undefined ? (
+				<p role="status">Reading who is in this channel…</p>
+			) : (
+				<p>{body}</p>
+			)}
+			{props.error !== null ? (
+				<p className="form-error" role="alert">
+					{props.error}
+				</p>
+			) : null}
+			<div className="dialog-actions">
+				<button
+					type="button"
+					className="button"
+					data-dialog-initial={principalReadError === null ? true : undefined}
+					disabled={props.busy}
+					onClick={handle_close}
+				>
+					Cancel
+				</button>
+				{principalReadError !== null ? (
+					<button
+						type="button"
+						className="button"
+						data-dialog-initial
+						disabled={props.busy}
+						onClick={() => setReadAttempt((current) => current + 1)}
+					>
+						Retry
+					</button>
+				) : null}
+				<button
+					type="button"
+					className="button button-danger"
+					disabled={props.busy || props.waiting || principalCount === undefined || principalReadError !== null}
+					onClick={() => props.onConfirm(principalCount ?? undefined)}
+				>
+					{props.waiting
+						? "Checking…"
+						: props.busy
+							? deleting
+								? "Deleting…"
+								: "Leaving…"
+							: props.action === "delete"
+								? "Delete channel"
+								: principalCount === 1
+									? "Leave and delete channel"
+									: "Leave channel"}
 				</button>
 			</div>
 		</Dialog>
@@ -538,18 +804,20 @@ function UnreadsView(props: {
 	channels: chat_Doc<chat_ChannelValue>[];
 	publicUnreads: Map<string, chat_PublicUnread>;
 	privateCursors: Map<string, chat_PrivateCursorDoc>;
+	privateActivity: Map<string, PrivateChannelActivity>;
 	recentDead: boolean;
 	memberNames: chat_MemberNamesApi;
 	onSelectChannel: (channel: chat_Doc<chat_ChannelValue>) => void;
 }) {
 	const rows: UnreadRow[] = [];
 	for (const channel of props.channels) {
-		// A closed private channel can only say "something is newer than your cursor" — the
-		// stamp on its own doc — so its row has no preview and no mention count.
+		// A closed private channel can only say "something is newer than your cursor", so its row
+		// has no preview and no mention count.
 		if (chat_channel_is_private(channel.key)) {
-			const last = channel.value.lastMessageAt;
-			if (last !== undefined && last > (props.privateCursors.get(channel.key)?.at ?? 0)) {
-				rows.push({ channel, at: last, mentionCount: 0, preview: null });
+			const last = props.privateActivity.get(channel.key);
+			const cursor = props.privateCursors.get(channel.key)?.activity ?? EMPTY_PRIVATE_ACTIVITY;
+			if (last !== undefined && !private_activity_covers(cursor, last.activity)) {
+				rows.push({ channel, at: last.at, mentionCount: 0, preview: null });
 			}
 			continue;
 		}
@@ -582,7 +850,8 @@ function UnreadsView(props: {
 			</p>
 			{props.recentDead ? (
 				<div className="channel-status is-error" role="alert">
-					The recent-messages feed stopped, so unread state for public channels is not updating.
+					The recent-messages feed stopped, so unread state for public channels is not updating. Reload the page to try
+					again.
 				</div>
 			) : null}
 			{rows.length === 0 ? (
@@ -663,7 +932,7 @@ function ActivityView(props: {
 			<p className="view-note">The newest public messages. Private channels are not shown here.</p>
 			{props.recentDead ? (
 				<div className="channel-status is-error" role="alert">
-					The recent-messages feed stopped, so this view is not updating.
+					The recent-messages feed stopped, so this view is not updating. Reload the page to try again.
 				</div>
 			) : null}
 			{groups.length === 0 ? (
@@ -673,11 +942,7 @@ function ActivityView(props: {
 					{groups.map((group, index) => (
 						<section key={`${group.channel.key}:${index}`} className="view-group">
 							<h3 className="view-group-title">
-								<button
-									type="button"
-									className="view-group-link"
-									onClick={() => props.onSelectChannel(group.channel)}
-								>
+								<button type="button" className="view-group-link" onClick={() => props.onSelectChannel(group.channel)}>
 									#{group.channel.value.name}
 								</button>
 							</h3>
@@ -685,9 +950,7 @@ function ActivityView(props: {
 								{group.messages.map((doc) => (
 									<li
 										key={doc.key}
-										className={
-											doc.value.mentions?.includes(props.selfUserId) ? "view-row mention-self" : "view-row"
-										}
+										className={doc.value.mentions?.includes(props.selfUserId) ? "view-row mention-self" : "view-row"}
 									>
 										<span className="view-row-title">{author_label(memberNames.get(doc.createdBy))}</span>
 										<span className="view-row-time">{chat_format_recency(doc.timestamp, now)}</span>
@@ -772,12 +1035,11 @@ function ThreadsView(props: {
 				<h2 className="view-title">Threads</h2>
 			</header>
 			<p className="view-note">
-				The newest public reply activity; counts read the newest 100 replies. Private channels are not shown
-				here.
+				The newest public reply activity; counts read the newest 100 replies. Private channels are not shown here.
 			</p>
 			{dead ? (
 				<div className="channel-status is-error" role="alert">
-					The replies feed stopped, so this view is not updating.
+					The replies feed stopped, so this view is not updating. Reload the page to try again.
 				</div>
 			) : null}
 			{!loaded ? (
@@ -831,7 +1093,7 @@ function channels_death_message(reason: string | undefined): string {
 		return "This Chitchat session expired. Reload the page to continue.";
 	}
 	if (reason === "unavailable") {
-		return "Chitchat cannot reach its data right now. Nothing will update until the connection returns.";
+		return "Chitchat cannot reach its data right now. Check your connection and reload the page.";
 	}
 	if (reason === "capacity") {
 		return "Chitchat has too many live views open. Reload the page.";
@@ -855,11 +1117,255 @@ const MAX_WATCHED_SCOPES = 8;
 /** How long the page waits after new messages render before it moves the read cursor. */
 const MARK_READ_DEBOUNCE_MS = 2000;
 
+/** Retry uncertain cursor writes without spinning while the data connection is down. */
+const CURSOR_RETRY_INITIAL_MS = 250;
+const CURSOR_RETRY_MAX_MS = 4000;
+
+/** Retry only a dead scope-list connection. Other watch deaths need the host page to recover. */
+const SCOPE_WATCH_RETRY_INITIAL_MS = 250;
+const SCOPE_WATCH_RETRY_MAX_MS = 4000;
+
+/** Retry a private-create proof without spinning while the data connection is down. */
+const PRIVATE_CREATE_RETRY_INITIAL_MS = 250;
+const PRIVATE_CREATE_RETRY_MAX_MS = 4000;
+
+const PRIVATE_CREATE_READ_ABSENT_MESSAGE =
+	"Chitchat cannot confirm whether this private channel was created because no channel is readable at its saved key. Retry checks the same key, or Cancel.";
+const PRIVATE_CREATE_PRINCIPAL_MISSING_MESSAGE =
+	"This private channel exists, but you are not in its current access list. Retry checks the same key, or Cancel.";
+
+/** Retry an uncertain Leave or Delete proof without spinning while the data connection is down. */
+const EXIT_READ_RETRY_INITIAL_MS = 250;
+const EXIT_READ_RETRY_MAX_MS = 4000;
+
+/** Retry one private channel read only while the full scope list stays live. */
+const PRIVATE_CHANNEL_WATCH_RETRY_INITIAL_MS = 250;
+const PRIVATE_CHANNEL_WATCH_RETRY_MAX_MS = 4000;
+
+const MESSAGE_CHANGE_IN_FLIGHT_NAVIGATION_MESSAGE =
+	"Wait for pending message changes to finish before leaving this channel or thread.";
+
+type PrivateScopeAppendActivity = {
+	collection: string;
+	at: number;
+	createdByUserId: string;
+	sequence: number;
+};
+
+type PrivateChannelScope = BonoboUiScope & {
+	appendActivity: PrivateScopeAppendActivity[];
+};
+
+type PrivateScopeWatchDescriptor = Pick<PrivateChannelScope, "scopeId" | "keyPrefix" | "collections">;
+
+/** Accept only ranges made by Chitchat's one private-channel transaction. */
+function private_channel_scope_is_valid(scope: BonoboUiScope): scope is PrivateChannelScope {
+	const appendActivity = (scope as { appendActivity?: unknown }).appendActivity;
+	return (
+		chat_private_channel_key_is_valid(scope.scopeId) &&
+		scope.keyPrefix === scope.scopeId &&
+		scope.collections.length === chat_PRIVATE_CHANNEL_COLLECTIONS.length &&
+		chat_PRIVATE_CHANNEL_COLLECTIONS.every((collection) => scope.collections.includes(collection)) &&
+		Number.isSafeInteger(scope.membershipRevision) &&
+		scope.membershipRevision >= 0 &&
+		Array.isArray(appendActivity) &&
+		appendActivity.every(
+			(entry) =>
+				typeof entry === "object" &&
+				entry !== null &&
+				typeof (entry as { collection?: unknown }).collection === "string" &&
+				Number.isSafeInteger((entry as { at?: unknown }).at) &&
+				(entry as { at: number }).at >= 0 &&
+				Number.isSafeInteger((entry as { sequence?: unknown }).sequence) &&
+				(entry as { sequence: number }).sequence >= 0 &&
+				typeof (entry as { createdByUserId?: unknown }).createdByUserId === "string" &&
+				(entry as { createdByUserId: string }).createdByUserId !== "",
+		)
+	);
+}
+
+/** Treat the principal query as outside data before it proves the current member's grant. */
+function private_scope_principals_are_valid(value: unknown): value is BonoboUiScopePrincipal[] {
+	return (
+		Array.isArray(value) &&
+		value.every(
+			(principal: unknown) =>
+				typeof principal === "object" &&
+				principal !== null &&
+				"userId" in principal &&
+				typeof principal.userId === "string" &&
+				principal.userId !== "" &&
+				"level" in principal &&
+				(principal.level === "member" || principal.level === "manage"),
+		)
+	);
+}
+
+/** Keep exact null separate from a failed or malformed principal read. */
+function private_scope_principal_result(value: unknown): BonoboUiScopePrincipalListResult | null {
+	if (typeof value !== "object" || value === null) {
+		return null;
+	}
+	if ("_yay" in value) {
+		const principals = value._yay;
+		return principals === null || private_scope_principals_are_valid(principals) ? { _yay: principals } : null;
+	}
+	if ("_nay" in value) {
+		const refusal = value._nay;
+		if (
+			typeof refusal === "object" &&
+			refusal !== null &&
+			"name" in refusal &&
+			refusal.name === "unavailable" &&
+			"message" in refusal &&
+			typeof refusal.message === "string"
+		) {
+			return { _nay: { name: "unavailable", message: refusal.message } };
+		}
+	}
+	return null;
+}
+
+/**
+ * Use only message and reply appends for private unread state. Reactions, channel docs, and
+ * unknown collections do not mean that the chat has new text.
+ */
+type PrivateChannelActivity = {
+	at: number;
+	activity: chat_PrivateActivityCursor;
+};
+
+const EMPTY_PRIVATE_ACTIVITY: chat_PrivateActivityCursor = { messages: 0, replies: 0 };
+
+function private_activity_max(
+	left: chat_PrivateActivityCursor,
+	right: chat_PrivateActivityCursor,
+): chat_PrivateActivityCursor {
+	return {
+		messages: Math.max(left.messages, right.messages),
+		replies: Math.max(left.replies, right.replies),
+	};
+}
+
+function private_activity_covers(current: chat_PrivateActivityCursor, wanted: chat_PrivateActivityCursor) {
+	return current.messages >= wanted.messages && current.replies >= wanted.replies;
+}
+
+function private_scope_activity(scope: PrivateChannelScope): PrivateChannelActivity {
+	let at = 0;
+	let cursor = EMPTY_PRIVATE_ACTIVITY;
+	for (const entry of scope.appendActivity) {
+		if (entry.collection === "messages") {
+			at = Math.max(at, entry.at);
+			cursor = private_activity_max(cursor, { messages: entry.sequence, replies: 0 });
+		} else if (entry.collection === "replies") {
+			at = Math.max(at, entry.at);
+			cursor = private_activity_max(cursor, { messages: 0, replies: entry.sequence });
+		}
+	}
+	return { at, activity: cursor };
+}
+
+type PrivateCursorWrite = {
+	channelKey: string;
+	pendingAt: number;
+	pendingActivity: chat_PrivateActivityCursor;
+	storedAt: number;
+	storedActivity: chat_PrivateActivityCursor;
+	revision: number;
+	running: boolean;
+	waitingForRefresh: boolean;
+	retryDelayMs: number;
+	retryTimer: ReturnType<typeof setTimeout> | null;
+	cancelled: boolean;
+};
+
+type PendingReadMark = {
+	channel: chat_Doc<chat_ChannelValue>;
+	at: number;
+	activity: chat_PrivateActivityCursor | null;
+};
+
+function cancel_private_cursor(write: PrivateCursorWrite) {
+	write.cancelled = true;
+	if (write.retryTimer !== null) {
+		clearTimeout(write.retryTimer);
+	}
+}
+
+function sync_private_cursor(write: PrivateCursorWrite, cursor: chat_PrivateCursorDoc) {
+	if (cursor.revision <= write.revision) {
+		return false;
+	}
+	write.revision = cursor.revision;
+	write.storedAt = Math.max(write.storedAt, cursor.at);
+	write.storedActivity = private_activity_max(write.storedActivity, cursor.activity);
+	write.waitingForRefresh = false;
+	return true;
+}
+
 type ChannelDialogState =
 	| { kind: "create" }
 	| { kind: "rename"; channel: chat_Doc<chat_ChannelValue> }
 	| { kind: "archive"; channel: chat_Doc<chat_ChannelValue> }
-	| { kind: "people"; channel: chat_Doc<chat_ChannelValue> };
+	| { kind: "people"; channel: chat_Doc<chat_ChannelValue> }
+	| { kind: "exit"; action: "leave" | "delete"; channel: chat_Doc<chat_ChannelValue> };
+
+type PendingChannelValue = {
+	channelKey: string;
+	value: chat_ChannelValue;
+	expectedRevision: number;
+	sectionMoveRequestId: symbol | null;
+};
+
+type PendingPrivateCreateReconciliation = {
+	key: string;
+	running: boolean;
+	retryDelayMs: number;
+	retryTimer: ReturnType<typeof setTimeout> | null;
+	cancelled: boolean;
+};
+
+type PendingExitReconciliation = {
+	channel: chat_Doc<chat_ChannelValue>;
+	action: "leave" | "delete";
+	running: boolean;
+	retryDelayMs: number;
+	retryTimer: ReturnType<typeof setTimeout> | null;
+	cancelled: boolean;
+};
+
+type PendingReaddReconciliation = {
+	scope: PrivateChannelScope;
+	running: boolean;
+	retryDelayMs: number;
+	retryTimer: ReturnType<typeof setTimeout> | null;
+	cancelled: boolean;
+};
+
+function cancel_private_create_reconciliation(reconciliation: PendingPrivateCreateReconciliation) {
+	reconciliation.cancelled = true;
+	if (reconciliation.retryTimer !== null) {
+		clearTimeout(reconciliation.retryTimer);
+		reconciliation.retryTimer = null;
+	}
+}
+
+function cancel_exit_reconciliation(reconciliation: PendingExitReconciliation) {
+	reconciliation.cancelled = true;
+	if (reconciliation.retryTimer !== null) {
+		clearTimeout(reconciliation.retryTimer);
+		reconciliation.retryTimer = null;
+	}
+}
+
+function cancel_readd_reconciliation(reconciliation: PendingReaddReconciliation) {
+	reconciliation.cancelled = true;
+	if (reconciliation.retryTimer !== null) {
+		clearTimeout(reconciliation.retryTimer);
+		reconciliation.retryTimer = null;
+	}
+}
 
 export function App(props: { client: BonoboUiFrontendClient }) {
 	const { client } = props;
@@ -871,22 +1377,27 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	 * key range answers only the public part of a collection, so a private channel is reached by its
 	 * own read, one per scope, and the two lists are merged for the sidebar.
 	 */
-	const [scopes, setScopes] = useState<BonoboUiScope[]>([]);
-	const [privateChannelsByScope, setPrivateChannelsByScope] = useState<
-		Record<string, chat_Doc<chat_ChannelValue>[]>
-	>({});
+	const [scopes, setScopes] = useState<PrivateChannelScope[]>([]);
+	const [privateChannelsByScope, setPrivateChannelsByScope] = useState<Record<string, chat_Doc<chat_ChannelValue>[]>>(
+		{},
+	);
 	const [channelsLoaded, setChannelsLoaded] = useState(false);
 	const [channelsDeath, setChannelsDeath] = useState<{ reason?: string } | null>(null);
 	const [channelsTruncated, setChannelsTruncated] = useState(false);
 	/** The member's public cursor map doc, delivered live. Null until it exists or when it dies. */
-	const [cursorDoc, setCursorDoc] = useState<chat_Doc<chat_CursorMapValue> | null>(null);
+	const [cursorDoc, setCursorDoc] = useState<chat_CursorMapDoc | null>(null);
 	/** The newest 100 public messages, newest first — the one feed behind unreads and Activity. */
 	const [recentFeed, setRecentFeed] = useState<chat_Doc<chat_MessageValue>[]>([]);
 	const [recentDead, setRecentDead] = useState(false);
 	/** This member's own private read cursors, delivered by the per-scope channels reads. */
 	const [privateCursorsByScope, setPrivateCursorsByScope] = useState<Record<string, chat_PrivateCursorDoc[]>>({});
+	/** Increments for every live full scope-list delivery, including an unchanged list. */
+	const [scopeDeliveryVersion, setScopeDeliveryVersion] = useState(0);
+	/** Restart ranged reads once when a dead full scope-list watch becomes live again. */
+	const [scopeWatchRecoveryGeneration, setScopeWatchRecoveryGeneration] = useState(0);
 	/** Holds either a channel key or a `view:*` key — views share the one selection. */
 	const [selectedKey, setSelectedKey] = useState<string | null>(null);
+	const [sendRequestsByChannel, setSendRequestsByChannel] = useState<Record<string, number>>({});
 	/**
 	 * The read cursor of the selected channel, frozen at the moment it was opened. `ChannelView`
 	 * puts its "New messages" mark above the first message newer than this. null = nothing was
@@ -901,6 +1412,10 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	const [railExpanded, setRailExpanded] = useState(false);
 	const [dialog, setDialog] = useState<ChannelDialogState | null>(null);
 	const [dialogBusy, setDialogBusy] = useState(false);
+	const [exitReconciling, setExitReconciling] = useState(false);
+	const [channelCreateUncertain, setChannelCreateUncertain] = useState(false);
+	const [channelCreateReconciling, setChannelCreateReconciling] = useState(false);
+	const [channelValueUncertain, setChannelValueUncertain] = useState(false);
 	const [dialogError, setDialogError] = useState<string | null>(null);
 	const [drawerOpen, setDrawerOpen] = useState(false);
 	const [announcement, setAnnouncement] = useState({ sequence: 0, text: "" });
@@ -912,24 +1427,457 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	 * the whole channel list out of reach at every width.
 	 */
 	const [isNarrow, setIsNarrow] = useState(false);
+	const appRef = useRef<HTMLDivElement | null>(null);
 	const navRef = useRef<HTMLElement | null>(null);
 	const drawerToggleRef = useRef<HTMLButtonElement | null>(null);
 	const railExpandRef = useRef<HTMLButtonElement | null>(null);
+	const responsiveFocusOwnerRef = useRef<"drawer" | "sidebar" | "separator" | null>(null);
+	const pendingResponsiveFocusRef = useRef<"drawer" | "selected" | "thread" | null>(null);
 	/** The latest cursor doc, readable by write paths without a stale closure. */
-	const cursorDocRef = useRef<chat_Doc<chat_CursorMapValue> | null>(null);
-	/** The map a conflicted cursor write wanted; the retry effect merges it over the winner. */
-	const cursorRetryRef = useRef<{ channels: Record<string, number>; attemptedRevision: number } | null>(null);
-	const markReadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const pendingMarkReadRef = useRef<{ channel: chat_Doc<chat_ChannelValue>; at: number } | null>(null);
+	const cursorDocRef = useRef<chat_CursorMapDoc | null>(null);
+	/** The current public keys, including when a cursor backoff timer came from an older render. */
+	const publicChannelKeysRef = useRef(new Set<string>());
+	publicChannelKeysRef.current = new Set(publicChannels.map((channel) => channel.key));
+	/** Hold the exact key and payload only while a create result may have committed. */
+	const pendingChannelCreateRef = useRef<{
+		key: string;
+		name: string;
+		topic: string;
+		isPrivate: boolean;
+		userIds: string[];
+	} | null>(null);
+	const pendingPrivateCreateReconciliationRef = useRef<PendingPrivateCreateReconciliation | null>(null);
+	/** Hold one exact rename or archive until its uncertain result is settled. */
+	const pendingChannelValueRef = useRef<PendingChannelValue | null>(null);
+	/** Conflicted or oversized public cursor writes wait here and share one retry at a time. */
+	const cursorRetryRef = useRef<{
+		channels: Record<string, number>;
+		attemptedRevision: number;
+		running: boolean;
+		needsCompaction: boolean;
+		retryCurrentRevision: boolean;
+		waitBeforeRetry: boolean;
+		retryDelayMs: number;
+		retryTimer: ReturnType<typeof setTimeout> | null;
+	} | null>(null);
+	const markReadTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+	/** Survive ChannelView renders so a navigation handler sees a send start synchronously. */
+	const sendRequestsByChannelRef = useRef(new Map<string, number>());
+	const pendingMarkReadsRef = useRef(new Map<string, PendingReadMark>());
+	const pendingExitKeysRef = useRef(new Set<string>());
+	const exitMarkBuffersRef = useRef(new Map<string, PendingReadMark>());
+	const exitOutcomesRef = useRef(
+		new Map<string, "pending" | "left" | "deleted" | "leave_unconfirmed" | "delete_unconfirmed">(),
+	);
+	const pendingExitReconciliationsRef = useRef(new Map<string, PendingExitReconciliation>());
+	/** Keep an exact departure hidden until an exact principal read proves this member was added back. */
+	const exactDepartureScopeIdsRef = useRef(new Set<string>());
+	const scopeCandidatesRef = useRef(new Map<string, PrivateChannelScope>());
+	const checkedDepartureCandidateRevisionsRef = useRef(new Map<string, number>());
+	const pendingReaddReconciliationsRef = useRef(new Map<string, PendingReaddReconciliation>());
+	/** The newest membership revision from the full live scope list, by scope id. */
+	const scopeMembershipRevisionsRef = useRef(new Map<string, number>());
+	const pendingSuccessfulLeavesRef = useRef(
+		new Map<string, { channel: chat_Doc<chat_ChannelValue>; membershipRevision: number }>(),
+	);
+	const liveScopeIdsRef = useRef(new Set<string>());
+	/** False between a full scope-list death and its next valid delivery. */
+	const scopeWatchLiveRef = useRef(false);
+	const scopeDeliveryVersionRef = useRef(0);
+	const mountedRef = useRef(true);
+	const privateCursorWritesRef = useRef(new Map<string, PrivateCursorWrite>());
+	const previousLiveScopeIdsRef = useRef(new Set<string>());
+	const pendingDeparturesRef = useRef(new Map<string, chat_Doc<chat_ChannelValue>>());
+	const pendingChannelSectionMovesRef = useRef(
+		new Map<symbol, { channelKey: string; sourceRevision: number; archived: boolean }>(),
+	);
+	const pendingReaddedExitFocusRef = useRef<string | null>(null);
+	const [pendingFocusRepair, setPendingFocusRepair] = useState(false);
+
+	const apply_public_cursor_local = useCallback(
+		(revision: number, value: chat_CursorMapValue) => {
+			const base = cursorDocRef.current;
+			if (base !== null && base.revision > revision) {
+				return;
+			}
+			const now = Date.now();
+			const stored: chat_CursorMapDoc = {
+				key: chat_cursor_stored_key(userId),
+				value,
+				revision,
+				createdBy: userId,
+				updatedBy: userId,
+				createdAt: base?.createdAt ?? now,
+				updatedAt: now,
+				ownership: "owned",
+				timestamp: base?.timestamp ?? now,
+			};
+			cursorDocRef.current = stored;
+			setCursorDoc(stored);
+		},
+		[userId],
+	);
+
+	const run_public_cursor_retry = useCallback(
+		function run_public_cursor_retry() {
+			const retry = cursorRetryRef.current;
+			const latest = cursorDocRef.current;
+			const latestRevision = latest?.revision ?? 0;
+			if (
+				!mountedRef.current ||
+				retry === null ||
+				retry.running ||
+				retry.retryTimer !== null ||
+				(latestRevision === retry.attemptedRevision && !retry.retryCurrentRevision)
+			) {
+				return;
+			}
+			if (retry.waitBeforeRetry) {
+				const delayMs = retry.retryDelayMs;
+				retry.waitBeforeRetry = false;
+				retry.retryTimer = setTimeout(() => {
+					retry.retryTimer = null;
+					retry.retryDelayMs = Math.min(delayMs * 2, CURSOR_RETRY_MAX_MS);
+					run_public_cursor_retry();
+				}, delayMs);
+				return;
+			}
+
+			const wanted: chat_CursorMapValue = { channels: retry.channels };
+			retry.channels = {};
+			retry.attemptedRevision = latestRevision;
+			retry.retryCurrentRevision = false;
+			const needsCompaction = retry.needsCompaction;
+			retry.needsCompaction = false;
+			const merged = chat_merge_cursor_maps(latest?.value ?? { channels: {} }, wanted);
+			const submitted = needsCompaction
+				? {
+						channels: Object.fromEntries(
+							Object.entries(merged.channels).filter(([key]) => publicChannelKeysRef.current.has(key)),
+						),
+					}
+				: merged;
+			if (needsCompaction && Object.keys(submitted.channels).length === Object.keys(merged.channels).length) {
+				// Keep every wanted mark for a later revision when no stale channel can be removed now.
+				retry.channels = chat_merge_cursor_maps({ channels: retry.channels }, wanted).channels;
+				retry.needsCompaction = true;
+				console.warn("[chitchat] The read-cursor map is still too large after cleanup");
+				return;
+			}
+			retry.running = true;
+			client.data
+				.putOwned({
+					collection: "cursors",
+					key: chat_CURSOR_CALLER_KEY,
+					value: submitted,
+					expectedRevision: latestRevision,
+				})
+				.then((result) => {
+					retry.running = false;
+					if (!mountedRef.current || cursorRetryRef.current !== retry) {
+						return;
+					}
+					if ("_yay" in result) {
+						retry.retryDelayMs = CURSOR_RETRY_INITIAL_MS;
+						apply_public_cursor_local(result._yay.revision, submitted);
+					} else if (result._nay.name === "conflict") {
+						// Put this flight back before another retry, including wants queued while it ran.
+						retry.channels = chat_merge_cursor_maps({ channels: retry.channels }, wanted).channels;
+						retry.needsCompaction ||= needsCompaction;
+						// A conflict needs its winner's revision. Only a separate unavailable call may
+						// still retry this revision after its backoff timer.
+						retry.retryCurrentRevision = retry.waitBeforeRetry;
+						retry.retryDelayMs = CURSOR_RETRY_INITIAL_MS;
+					} else if (result._nay.name === "storage_full") {
+						// A size refusal can retry this revision after stale channel keys are removed.
+						retry.channels = chat_merge_cursor_maps({ channels: retry.channels }, wanted).channels;
+						retry.needsCompaction = true;
+						retry.retryCurrentRevision = true;
+						retry.retryDelayMs = CURSOR_RETRY_INITIAL_MS;
+						if (needsCompaction) {
+							console.warn("[chitchat] The compacted read-cursor retry was refused", {
+								message: result._nay.message,
+							});
+							return;
+						}
+					} else if (result._nay.name === "unavailable") {
+						// The call may not have reached the store. Keep its maxima and retry this revision.
+						retry.channels = chat_merge_cursor_maps({ channels: retry.channels }, wanted).channels;
+						retry.needsCompaction ||= needsCompaction;
+						retry.retryCurrentRevision = true;
+						retry.waitBeforeRetry = true;
+					} else {
+						console.warn("[chitchat] A read-cursor retry was refused", {
+							message: result._nay.message,
+						});
+					}
+
+					if (Object.keys(retry.channels).length === 0) {
+						cursorRetryRef.current = null;
+						return;
+					}
+					run_public_cursor_retry();
+				})
+				.catch(() => {
+					retry.running = false;
+					if (!mountedRef.current || cursorRetryRef.current !== retry) {
+						return;
+					}
+					retry.channels = chat_merge_cursor_maps({ channels: retry.channels }, wanted).channels;
+					retry.needsCompaction ||= needsCompaction;
+					retry.retryCurrentRevision = true;
+					retry.waitBeforeRetry = true;
+					run_public_cursor_retry();
+				});
+		},
+		[apply_public_cursor_local, client],
+	);
+
+	/** Merge one failed public map into the single retry, including same-revision recovery. */
+	const queue_public_cursor_retry = (
+		value: chat_CursorMapValue,
+		attemptedRevision: number,
+		reason: "conflict" | "storage_full" | "unavailable",
+	) => {
+		if (!mountedRef.current) {
+			return;
+		}
+		const pending = cursorRetryRef.current;
+		const retry = pending ?? {
+			channels: {},
+			attemptedRevision,
+			running: false,
+			needsCompaction: false,
+			retryCurrentRevision: false,
+			waitBeforeRetry: false,
+			retryDelayMs: CURSOR_RETRY_INITIAL_MS,
+			retryTimer: null,
+		};
+		retry.channels = chat_merge_cursor_maps({ channels: retry.channels }, value).channels;
+		retry.attemptedRevision = Math.max(retry.attemptedRevision, attemptedRevision);
+		if (reason === "storage_full") {
+			retry.needsCompaction = true;
+			retry.retryCurrentRevision = true;
+		} else if (reason === "unavailable") {
+			retry.retryCurrentRevision = true;
+			if (retry.retryTimer === null) {
+				retry.waitBeforeRetry = true;
+			}
+		}
+		cursorRetryRef.current = retry;
+		run_public_cursor_retry();
+	};
+
+	const run_private_cursor_write = useCallback(
+		function run_private_cursor_write(write: PrivateCursorWrite) {
+			const stored_covers_pending = () =>
+				write.storedAt >= write.pendingAt && private_activity_covers(write.storedActivity, write.pendingActivity);
+			const schedule_retry = (retry: () => void) => {
+				if (
+					write.cancelled ||
+					!mountedRef.current ||
+					!liveScopeIdsRef.current.has(write.channelKey) ||
+					stored_covers_pending() ||
+					write.retryTimer !== null
+				) {
+					return;
+				}
+				const delayMs = write.retryDelayMs;
+				write.retryTimer = setTimeout(() => {
+					write.retryTimer = null;
+					write.retryDelayMs = Math.min(delayMs * 2, CURSOR_RETRY_MAX_MS);
+					retry();
+				}, delayMs);
+			};
+
+			const refresh_after_conflict = () => {
+				if (
+					write.cancelled ||
+					!mountedRef.current ||
+					!liveScopeIdsRef.current.has(write.channelKey) ||
+					!write.waitingForRefresh ||
+					write.running ||
+					write.retryTimer !== null
+				) {
+					return;
+				}
+				write.running = true;
+				const storedKey = `${chat_private_cursor_caller_key(write.channelKey)}:${userId}`;
+				client
+					.fetchJson("/api/v1/plugin-data/read", {
+						body: { collection: "channels", key: storedKey },
+					})
+					.then((raw: unknown) => {
+						if (privateCursorWritesRef.current.get(write.channelKey) !== write || write.cancelled) {
+							return;
+						}
+						write.running = false;
+						// A live ranged watch may have supplied the winner while this read was in flight.
+						if (!write.waitingForRefresh) {
+							run_private_cursor_write(write);
+							return;
+						}
+						const response = chat_plugin_data_read_response_schema.safeParse(raw);
+						const cursor = response.success ? chat_validate_private_cursor_doc(response.data.document) : null;
+						if (
+							cursor !== null &&
+							cursor.key === storedKey &&
+							cursor.channelKey === write.channelKey &&
+							cursor.createdBy === userId &&
+							sync_private_cursor(write, cursor)
+						) {
+							write.retryDelayMs = CURSOR_RETRY_INITIAL_MS;
+							run_private_cursor_write(write);
+							return;
+						}
+						schedule_retry(refresh_after_conflict);
+					})
+					.catch(() => {
+						if (privateCursorWritesRef.current.get(write.channelKey) !== write || write.cancelled) {
+							return;
+						}
+						write.running = false;
+						if (!write.waitingForRefresh) {
+							run_private_cursor_write(write);
+							return;
+						}
+						schedule_retry(refresh_after_conflict);
+					});
+			};
+
+			if (
+				write.running ||
+				write.retryTimer !== null ||
+				write.cancelled ||
+				!liveScopeIdsRef.current.has(write.channelKey)
+			) {
+				return;
+			}
+			if (write.waitingForRefresh) {
+				refresh_after_conflict();
+				return;
+			}
+			if (stored_covers_pending()) {
+				privateCursorWritesRef.current.delete(write.channelKey);
+				return;
+			}
+
+			const at = Math.max(write.pendingAt, write.storedAt);
+			const activity = private_activity_max(write.pendingActivity, write.storedActivity);
+			const expectedRevision = write.revision;
+			write.running = true;
+			client.data
+				.putOwned({
+					collection: "channels",
+					key: chat_private_cursor_caller_key(write.channelKey),
+					value: { at, activity },
+					expectedRevision,
+				})
+				.then((result) => {
+					if (privateCursorWritesRef.current.get(write.channelKey) !== write || write.cancelled) {
+						return;
+					}
+					write.running = false;
+					if ("_yay" in result) {
+						// Use the stored revision returned by the SDK. Do not guess `revision + 1`.
+						write.retryDelayMs = CURSOR_RETRY_INITIAL_MS;
+						write.revision = Math.max(write.revision, result._yay.revision);
+						write.storedAt = Math.max(write.storedAt, at);
+						write.storedActivity = private_activity_max(write.storedActivity, activity);
+						run_private_cursor_write(write);
+						return;
+					}
+					if (result._nay.name === "conflict") {
+						if (write.revision !== expectedRevision) {
+							run_private_cursor_write(write);
+							return;
+						}
+						// This exact read also works after the scope falls outside the eight live watches.
+						write.waitingForRefresh = true;
+						refresh_after_conflict();
+						return;
+					}
+					if (result._nay.name === "unavailable") {
+						schedule_retry(() => run_private_cursor_write(write));
+						return;
+					}
+					console.warn("[chitchat] A private read-cursor write was refused", {
+						message: result._nay.message,
+					});
+					privateCursorWritesRef.current.delete(write.channelKey);
+				})
+				.catch((error: unknown) => {
+					if (privateCursorWritesRef.current.get(write.channelKey) !== write || write.cancelled) {
+						return;
+					}
+					write.running = false;
+					console.warn("[chitchat] A private read-cursor write failed", {
+						message: chat_get_error_message(error),
+					});
+					schedule_retry(() => run_private_cursor_write(write));
+				});
+		},
+		[client, userId],
+	);
+
+	const liveScopeIds = useMemo(() => new Set(scopes.map((scope) => scope.scopeId)), [scopes]);
+	// Activity changes arrive on every scoped append. Keep ranged reads keyed only by their range.
+	const scopeWatchStructureKey = JSON.stringify(
+		scopes
+			.map((scope) => ({
+				scopeId: scope.scopeId,
+				keyPrefix: scope.keyPrefix,
+				collections: [...scope.collections].sort(),
+			}))
+			.sort((a, b) => a.scopeId.localeCompare(b.scopeId)),
+	);
+	const scopeWatchDescriptors = useMemo<PrivateScopeWatchDescriptor[]>(
+		() =>
+			scopes.map((scope) => ({
+				scopeId: scope.scopeId,
+				keyPrefix: scope.keyPrefix,
+				collections: scope.collections,
+			})),
+		[scopeWatchStructureKey],
+	);
+	const firstWatchedScopes = useMemo(
+		() => [...scopeWatchDescriptors].sort((a, b) => a.scopeId.localeCompare(b.scopeId)).slice(0, MAX_WATCHED_SCOPES),
+		[scopeWatchDescriptors],
+	);
+	const watchedScopes = useMemo(() => {
+		const ordered = [...scopeWatchDescriptors].sort((a, b) => a.scopeId.localeCompare(b.scopeId));
+		const selectedScope =
+			selectedKey !== null && chat_channel_is_private(selectedKey)
+				? ordered.find((scope) => scope.scopeId === selectedKey)
+				: undefined;
+		if (selectedScope === undefined || firstWatchedScopes.some((scope) => scope.scopeId === selectedScope.scopeId)) {
+			return firstWatchedScopes;
+		}
+		return [selectedScope, ...ordered.filter((scope) => scope.scopeId !== selectedScope.scopeId).slice(0, 7)].sort(
+			(a, b) => a.scopeId.localeCompare(b.scopeId),
+		);
+	}, [firstWatchedScopes, scopeWatchDescriptors, selectedKey]);
+	const watchedScopeIds = useMemo(() => new Set(watchedScopes.map((scope) => scope.scopeId)), [watchedScopes]);
 
 	// One sidebar: a private channel sits among the public ones rather than in a tray of its own.
 	// Channel keys are client-generated, so the list sorts by name.
-	const channels = [...publicChannels, ...Object.values(privateChannelsByScope).flat()].sort((a, b) =>
-		a.value.name.localeCompare(b.value.name),
-	);
+	const channels = [
+		...publicChannels,
+		...Object.entries(privateChannelsByScope).flatMap(([scopeId, entries]) =>
+			liveScopeIds.has(scopeId) && watchedScopeIds.has(scopeId) ? entries : [],
+		),
+	].sort((a, b) => a.value.name.localeCompare(b.value.name));
 
 	/** channelKey → this member's own private cursor, flattened from the per-scope deliveries. */
-	const privateCursors = new Map(Object.values(privateCursorsByScope).flat().map((doc) => [doc.channelKey, doc]));
+	const privateCursors = new Map(
+		Object.entries(privateCursorsByScope).flatMap(([scopeId, entries]) =>
+			liveScopeIds.has(scopeId) && watchedScopeIds.has(scopeId)
+				? entries.map((doc) => [doc.channelKey, doc] as const)
+				: [],
+		),
+	);
+	/** channelKey → durable message/reply activity from the full scope list. */
+	const privateActivity = new Map(scopes.map((scope) => [scope.scopeId, private_scope_activity(scope)]));
 
 	// One fold serves the sidebar marks, the Unreads view and its aggregate row. Memoized so the
 	// name-resolving effects that depend on it run only when the feed or the cursors change.
@@ -952,8 +1900,9 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 			return false;
 		}
 		if (chat_channel_is_private(channel.key)) {
-			const last = channel.value.lastMessageAt;
-			return last !== undefined && last > (privateCursors.get(channel.key)?.at ?? 0);
+			const activity = privateActivity.get(channel.key)?.activity ?? EMPTY_PRIVATE_ACTIVITY;
+			const cursor = privateCursors.get(channel.key)?.activity ?? EMPTY_PRIVATE_ACTIVITY;
+			return !private_activity_covers(cursor, activity);
 		}
 		return publicUnreads.has(channel.key);
 	};
@@ -979,6 +1928,183 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 		setAnnouncement((current) => ({ sequence: current.sequence + 1, text }));
 	}, []);
 
+	const handle_send_request_start = useCallback((channelKey: string) => {
+		const next = (sendRequestsByChannelRef.current.get(channelKey) ?? 0) + 1;
+		sendRequestsByChannelRef.current.set(channelKey, next);
+		setSendRequestsByChannel(Object.fromEntries(sendRequestsByChannelRef.current));
+	}, []);
+
+	const handle_send_request_settled = useCallback((channelKey: string) => {
+		const current = sendRequestsByChannelRef.current.get(channelKey) ?? 0;
+		if (current === 0) {
+			return;
+		}
+		if (current === 1) {
+			sendRequestsByChannelRef.current.delete(channelKey);
+		} else {
+			sendRequestsByChannelRef.current.set(channelKey, current - 1);
+		}
+		setSendRequestsByChannel(Object.fromEntries(sendRequestsByChannelRef.current));
+	}, []);
+
+	const reconcile_departed_scope = useCallback(
+		(scope: PrivateChannelScope) => {
+			if (
+				!exactDepartureScopeIdsRef.current.has(scope.scopeId) ||
+				(checkedDepartureCandidateRevisionsRef.current.get(scope.scopeId) ?? -1) >= scope.membershipRevision
+			) {
+				return;
+			}
+
+			const current = pendingReaddReconciliationsRef.current.get(scope.scopeId);
+			if (current !== undefined) {
+				current.scope = scope;
+				return;
+			}
+
+			const reconciliation: PendingReaddReconciliation = {
+				scope,
+				running: false,
+				retryDelayMs: EXIT_READ_RETRY_INITIAL_MS,
+				retryTimer: null,
+				cancelled: false,
+			};
+			pendingReaddReconciliationsRef.current.set(scope.scopeId, reconciliation);
+
+			const is_current = () =>
+				mountedRef.current &&
+				!reconciliation.cancelled &&
+				pendingReaddReconciliationsRef.current.get(scope.scopeId) === reconciliation;
+			const stop = () => {
+				cancel_readd_reconciliation(reconciliation);
+				if (pendingReaddReconciliationsRef.current.get(scope.scopeId) === reconciliation) {
+					pendingReaddReconciliationsRef.current.delete(scope.scopeId);
+				}
+			};
+			const restore = () => {
+				const restoredScope = reconciliation.scope;
+				stop();
+				exactDepartureScopeIdsRef.current.delete(restoredScope.scopeId);
+				checkedDepartureCandidateRevisionsRef.current.delete(restoredScope.scopeId);
+				pendingDeparturesRef.current.delete(restoredScope.scopeId);
+				pendingExitKeysRef.current.delete(restoredScope.scopeId);
+				exitMarkBuffersRef.current.delete(restoredScope.scopeId);
+				exitOutcomesRef.current.delete(restoredScope.scopeId);
+				const nextLiveScopeIds = new Set(liveScopeIdsRef.current);
+				nextLiveScopeIds.add(restoredScope.scopeId);
+				liveScopeIdsRef.current = nextLiveScopeIds;
+				scopeMembershipRevisionsRef.current.set(restoredScope.scopeId, restoredScope.membershipRevision);
+				scopeDeliveryVersionRef.current += 1;
+				setScopes((scopes) => {
+					const index = scopes.findIndex((entry) => entry.scopeId === restoredScope.scopeId);
+					if (index === -1) {
+						return [...scopes, restoredScope];
+					}
+					const next = [...scopes];
+					next[index] = restoredScope;
+					return next;
+				});
+				setScopeDeliveryVersion(scopeDeliveryVersionRef.current);
+			};
+			const run = () => {
+				if (!is_current() || reconciliation.running || reconciliation.retryTimer !== null) {
+					return;
+				}
+				reconciliation.running = true;
+				const attemptedRevision = reconciliation.scope.membershipRevision;
+				const schedule_retry = () => {
+					if (!is_current() || reconciliation.retryTimer !== null) {
+						return;
+					}
+					const delayMs = reconciliation.retryDelayMs;
+					reconciliation.retryTimer = setTimeout(() => {
+						reconciliation.retryTimer = null;
+						reconciliation.retryDelayMs = Math.min(delayMs * 2, EXIT_READ_RETRY_MAX_MS);
+						run();
+					}, delayMs);
+				};
+				const settle_absent = () => {
+					reconciliation.running = false;
+					if (reconciliation.scope.membershipRevision !== attemptedRevision) {
+						run();
+						return;
+					}
+					checkedDepartureCandidateRevisionsRef.current.set(scope.scopeId, attemptedRevision);
+					stop();
+				};
+
+				Promise.resolve()
+					.then(() =>
+						client.fetchJson("/api/v1/plugin-data/read", {
+							body: { collection: "channels", key: scope.scopeId },
+						}),
+					)
+					.then((raw: unknown) => {
+						if (!is_current()) {
+							return;
+						}
+						const response = chat_plugin_data_read_response_schema.safeParse(raw);
+						if (!response.success) {
+							reconciliation.running = false;
+							schedule_retry();
+							return;
+						}
+						if (response.data.document === null) {
+							settle_absent();
+							return;
+						}
+						const channel = chat_validate_channel_doc(response.data.document);
+						if (
+							response.data.document.collection !== "channels" ||
+							channel === null ||
+							channel.key !== scope.scopeId ||
+							!chat_channel_is_private(channel.key)
+						) {
+							reconciliation.running = false;
+							schedule_retry();
+							return;
+						}
+						return client.scopes.listPrincipals({ scopeId: channel.key }).then((rawResult) => {
+							if (!is_current()) {
+								return;
+							}
+							reconciliation.running = false;
+							const result = private_scope_principal_result(rawResult);
+							if (result === null || "_nay" in result) {
+								schedule_retry();
+								return;
+							}
+							const principals = result._yay;
+							if (principals === null) {
+								settle_absent();
+								return;
+							}
+							if (reconciliation.scope.membershipRevision !== attemptedRevision) {
+								run();
+								return;
+							}
+							if (principals.some((principal) => principal.userId === userId)) {
+								restore();
+								return;
+							}
+							checkedDepartureCandidateRevisionsRef.current.set(scope.scopeId, attemptedRevision);
+							stop();
+						});
+					})
+					.catch(() => {
+						if (!is_current()) {
+							return;
+						}
+						reconciliation.running = false;
+						schedule_retry();
+					});
+			};
+
+			run();
+		},
+		[client, userId],
+	);
+
 	// Clear-then-set. The sequence number used to be rendered as text so that two identical
 	// announcements differed, because a live region does not speak text it already holds — but
 	// assistive tech read the digit out loud too ("1 Ana: hello"). Emptying the region and setting
@@ -993,14 +2119,81 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 		return () => cancelAnimationFrame(frame);
 	}, [announcement]);
 
+	// Do not pull focus back after the member moves to another control or leaves the iframe.
+	useEffect(() => {
+		const clear_if_outside = (event: FocusEvent) => {
+			const target = event.target;
+			if (target instanceof Node && !appRef.current?.contains(target)) {
+				responsiveFocusOwnerRef.current = null;
+			}
+		};
+		const clear_on_window_blur = () => {
+			responsiveFocusOwnerRef.current = null;
+		};
+		document.addEventListener("focusin", clear_if_outside);
+		window.addEventListener("blur", clear_on_window_blur);
+		return () => {
+			document.removeEventListener("focusin", clear_if_outside);
+			window.removeEventListener("blur", clear_on_window_blur);
+		};
+	}, []);
+
 	// The drawer's overlay behaviour is a media-query state, and `inert` has to follow it.
 	useEffect(() => {
 		const query = window.matchMedia("(max-width: 719px)");
 		setIsNarrow(query.matches);
-		const handle_change = (event: MediaQueryListEvent) => setIsNarrow(event.matches);
+		const handle_change = (event: MediaQueryListEvent) => {
+			const focusOwner = responsiveFocusOwnerRef.current;
+			pendingResponsiveFocusRef.current = event.matches
+				? threadRootKey !== null && (focusOwner === "sidebar" || focusOwner === "separator")
+						? "thread"
+						: focusOwner === "sidebar" && !drawerOpen
+							? "drawer"
+							: null
+				: focusOwner === "drawer"
+					? "selected"
+					: null;
+			setIsNarrow(event.matches);
+		};
 		query.addEventListener("change", handle_change);
 		return () => query.removeEventListener("change", handle_change);
-	}, []);
+	}, [drawerOpen, threadRootKey]);
+
+	// A responsive layout can hide the focused rail, drawer toggle, or thread separator. Move to
+	// the matching visible control after React updates `inert` and the thread button label.
+	useLayoutEffect(() => {
+		const target = pendingResponsiveFocusRef.current;
+		pendingResponsiveFocusRef.current = null;
+		const focus_thread = () => {
+			const thread = appRef.current?.querySelector<HTMLElement>(".thread") ?? null;
+			if (thread === null) {
+				return false;
+			}
+			const threadBack = thread?.querySelector<HTMLButtonElement>(".thread-head button") ?? null;
+			threadBack?.focus();
+			// A pending send disables Back. Keep focus on the named thread region until it settles.
+			if (document.activeElement !== threadBack) {
+				thread.focus();
+			}
+			return document.activeElement === threadBack || document.activeElement === thread;
+		};
+		if (target === "drawer") {
+			// A narrow open thread hides the drawer toggle. Keep focus on its visible Back control.
+			if (threadRootKey === null || !focus_thread()) {
+				drawerToggleRef.current?.focus();
+			}
+		} else if (target === "thread") {
+			if (!focus_thread()) {
+				drawerToggleRef.current?.focus();
+			}
+		} else if (target === "selected") {
+			const selectedControl = navRef.current?.querySelector<HTMLButtonElement>('[aria-current="page"]') ?? null;
+			selectedControl?.focus();
+			if (document.activeElement !== selectedControl) {
+				navRef.current?.focus();
+			}
+		}
+	}, [isNarrow, threadRootKey]);
 
 	// The host resolves its own palette and sends finished colour values, so this page never guesses
 	// at them. Write each role into its `--bonobo-*` property and put the mode on the document
@@ -1032,7 +2225,12 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 				setChannelsDeath({ ...(info?.reason === undefined ? {} : { reason: info.reason }) });
 				return;
 			}
-			setPublicChannels(store.apply_window(update.docs));
+			// A public `p/` doc has no scope. Never let its key make it look private in the UI.
+			const publicDocs = update.docs.filter((raw) => {
+				const key = (raw as { key?: unknown }).key;
+				return !(typeof key === "string" && chat_channel_is_private(key));
+			});
+			setPublicChannels(store.apply_window(publicDocs));
 			setChannelsLoaded(true);
 			// The read stops at 100 channels and this watch has no way to reach past that. Say so,
 			// or a workspace with more channels shows a sidebar that looks complete and is not.
@@ -1044,83 +2242,200 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	// Which private ranges this member is in. It is live, so being added to a private channel makes
 	// it appear here, and being taken out makes it go away, without reloading the page.
 	useEffect(() => {
-		const unsubscribe = client.scopes.watchMine((list) => {
-			setScopes(list ?? []);
-		});
-		return unsubscribe;
-	}, [client]);
+		let cancelled = false;
+		let unsubscribe: (() => void) | null = null;
+		let retryTimer: ReturnType<typeof setTimeout> | null = null;
+		let retryDelayMs = SCOPE_WATCH_RETRY_INITIAL_MS;
 
-	// One channels read per private range, beside the public one above. A dead read means this
-	// member was taken out of that range while the page was open, so its channels go with it.
+		const start_watch = () => {
+			if (cancelled) {
+				return;
+			}
+			unsubscribe = client.scopes.watchMine((list, info) => {
+				if (cancelled) {
+					return;
+				}
+				if (list === null) {
+					scopeWatchLiveRef.current = false;
+					// The SDK has already ended this subscription. Only a connection death can recover
+					// inside the frame; access, session, capacity, and invalid deaths need the host page.
+					if (info?.reason === "unavailable" && retryTimer === null) {
+						const delayMs = retryDelayMs;
+						retryTimer = setTimeout(() => {
+							retryTimer = null;
+							retryDelayMs = Math.min(delayMs * 2, SCOPE_WATCH_RETRY_MAX_MS);
+							start_watch();
+						}, delayMs);
+					}
+					return;
+				}
+
+				retryDelayMs = SCOPE_WATCH_RETRY_INITIAL_MS;
+				const scopeCandidates = list.filter(private_channel_scope_is_valid);
+				scopeCandidatesRef.current = new Map(scopeCandidates.map((scope) => [scope.scopeId, scope]));
+				for (const [scopeId, reconciliation] of pendingReaddReconciliationsRef.current) {
+					if (!scopeCandidatesRef.current.has(scopeId)) {
+						cancel_readd_reconciliation(reconciliation);
+						pendingReaddReconciliationsRef.current.delete(scopeId);
+					}
+				}
+				const validScopes = scopeCandidates.filter((scope) => {
+					if (!exactDepartureScopeIdsRef.current.has(scope.scopeId)) {
+						return true;
+					}
+					// A revision can change for another principal. Restore only after an exact principal read.
+					reconcile_departed_scope(scope);
+					return false;
+				});
+				const nextLiveScopeIds = new Set(validScopes.map((scope) => scope.scopeId));
+				const recovered = !scopeWatchLiveRef.current;
+				scopeWatchLiveRef.current = true;
+				if (recovered) {
+					setScopeWatchRecoveryGeneration((current) => current + 1);
+				}
+				for (const [channelKey, write] of privateCursorWritesRef.current) {
+					if (!nextLiveScopeIds.has(channelKey)) {
+						cancel_private_cursor(write);
+						privateCursorWritesRef.current.delete(channelKey);
+					}
+				}
+				scopeMembershipRevisionsRef.current = new Map(
+					validScopes.map((scope) => [scope.scopeId, scope.membershipRevision]),
+				);
+				scopeDeliveryVersionRef.current += 1;
+				liveScopeIdsRef.current = nextLiveScopeIds;
+				setScopes(validScopes);
+				setScopeDeliveryVersion(scopeDeliveryVersionRef.current);
+			});
+		};
+
+		start_watch();
+		return () => {
+			cancelled = true;
+			scopeWatchLiveRef.current = false;
+			if (retryTimer !== null) {
+				clearTimeout(retryTimer);
+			}
+			unsubscribe?.();
+		};
+	}, [client, reconcile_departed_scope]);
+
+	// One channels read per private range, beside the public one above. Only the full scope list proves
+	// departure. A ranged read may die late after this page already stopped watching it.
 	// Only the first MAX_WATCHED_SCOPES ranges get a read — the slot arithmetic on that constant —
 	// and the sidebar renders one honest line when more exist.
 	useEffect(() => {
-		const unsubscribes = scopes.slice(0, MAX_WATCHED_SCOPES).map((scope) => {
+		const cleanups = watchedScopes.map((scope) => {
 			const store = chat_create_window_store(chat_validate_channel_doc);
-			return client.data.watch(
-				{ collection: "channels", keyPrefix: scope.keyPrefix, limit: 100 },
-				(update) => {
-					// The scope's range holds the channel doc AND the members' read-cursor docs
-					// (`<channelKey>:read:<userId>`). Split them here: a cursor doc is not an
-					// invalid channel, so it must not reach the channel store's dropped-doc warning.
-					const channelDocs =
-						update === null
-							? []
-							: update.docs.filter((raw) => {
-									const key = (raw as { key?: unknown }).key;
-									return !(typeof key === "string" && chat_parse_private_cursor_key(key) !== null);
-								});
-					setPrivateChannelsByScope((current) => {
-						if (update === null) {
-							const { [scope.scopeId]: _gone, ...rest } = current;
-							return rest;
+			let cancelled = false;
+			let unsubscribe: (() => void) | null = null;
+			let retryTimer: ReturnType<typeof setTimeout> | null = null;
+			let retryDelayMs = PRIVATE_CHANNEL_WATCH_RETRY_INITIAL_MS;
+
+			const start_watch = () => {
+				if (cancelled || !scopeWatchLiveRef.current) {
+					return;
+				}
+				unsubscribe = client.data.watch(
+					{ collection: "channels", keyPrefix: scope.keyPrefix, limit: 100 },
+					(update, info) => {
+						if (cancelled) {
+							return;
 						}
-						return { ...current, [scope.scopeId]: store.apply_window(channelDocs) };
-					});
-					setPrivateCursorsByScope((current) => {
 						if (update === null) {
-							const { [scope.scopeId]: _gone, ...rest } = current;
-							return rest;
+							unsubscribe?.();
+							unsubscribe = null;
+							// The full list may coalesce a fast remove and re-add. Retry its denied range
+							// until that list proves the member really left.
+							if (
+								(info?.reason === "unavailable" || info?.reason === "denied") &&
+								scopeWatchLiveRef.current &&
+								retryTimer === null
+							) {
+								const delayMs = retryDelayMs;
+								retryTimer = setTimeout(() => {
+									retryTimer = null;
+									retryDelayMs = Math.min(delayMs * 2, PRIVATE_CHANNEL_WATCH_RETRY_MAX_MS);
+									start_watch();
+								}, delayMs);
+							}
+							return;
 						}
+
+						if (retryTimer !== null) {
+							clearTimeout(retryTimer);
+							retryTimer = null;
+						}
+						retryDelayMs = PRIVATE_CHANNEL_WATCH_RETRY_INITIAL_MS;
+						// The range also holds member cursor docs. Only its exact root key is the channel.
+						const channelDocs = store.apply_window(
+							update.docs.filter((raw) => (raw as { key?: unknown }).key === scope.scopeId),
+						);
+						setPrivateChannelsByScope((current) => ({ ...current, [scope.scopeId]: channelDocs }));
+
 						// Only this member's own cursors matter for unread state. `createdBy` is the
 						// server-stamped owner; the key tail is not trusted.
 						const mine = update.docs
 							.map(chat_validate_private_cursor_doc)
-							.filter((doc): doc is chat_PrivateCursorDoc => doc !== null && doc.createdBy === userId);
-						return { ...current, [scope.scopeId]: mine };
-					});
-				},
-			);
+							.filter(
+								(doc): doc is chat_PrivateCursorDoc =>
+									doc !== null && doc.channelKey === scope.scopeId && doc.createdBy === userId,
+							);
+						for (const doc of mine) {
+							const write = privateCursorWritesRef.current.get(doc.channelKey);
+							if (write !== undefined && sync_private_cursor(write, doc)) {
+								if (write.retryTimer !== null) {
+									clearTimeout(write.retryTimer);
+									write.retryTimer = null;
+								}
+								write.retryDelayMs = CURSOR_RETRY_INITIAL_MS;
+								run_private_cursor_write(write);
+							}
+						}
+						setPrivateCursorsByScope((current) => ({ ...current, [scope.scopeId]: mine }));
+					},
+				);
+			};
+
+			start_watch();
+			return () => {
+				cancelled = true;
+				if (retryTimer !== null) {
+					clearTimeout(retryTimer);
+				}
+				unsubscribe?.();
+			};
 		});
 		return () => {
-			for (const unsubscribe of unsubscribes) {
-				unsubscribe();
+			for (const cleanup of cleanups) {
+				cleanup();
 			}
 		};
-	}, [client, scopes, userId]);
+	}, [client, run_private_cursor_write, scopeWatchRecoveryGeneration, watchedScopes, userId]);
 
 	// The member's public read cursors, one map doc. This watch is also the conflict-retry read:
 	// the SDK has no one-shot read, so the winner of a lost compare-and-set arrives here and the
 	// retry effect below merges over it.
 	useEffect(() => {
-		const unsubscribe = client.data.watch(
-			{ collection: "cursors", keyPrefix: chat_cursor_stored_key(userId), limit: 1 },
-			(update) => {
-				// A dead cursors watch does not take the page down: with no cursor map everything
-				// recent shows unread, which is the honest degraded answer.
-				if (update === null) {
-					setCursorDoc(null);
-					cursorDocRef.current = null;
-					return;
-				}
-				const doc =
-					update.docs
-						.map(chat_validate_cursor_map_doc)
-						.find((entry): entry is chat_Doc<chat_CursorMapValue> => entry !== null) ?? null;
-				setCursorDoc(doc);
-				cursorDocRef.current = doc;
-			},
-		);
+		const storedKey = chat_cursor_stored_key(userId);
+		const unsubscribe = client.data.watch({ collection: "cursors", keyPrefix: storedKey, limit: 1 }, (update) => {
+			// A dead cursors watch does not take the page down: with no cursor map everything
+			// recent shows unread, which is the honest degraded answer.
+			if (update === null) {
+				setCursorDoc(null);
+				cursorDocRef.current = null;
+				return;
+			}
+			const doc =
+				update.docs
+					.map(chat_validate_cursor_map_doc)
+					.find(
+						(entry): entry is chat_CursorMapDoc =>
+							entry !== null && entry.key === storedKey && entry.createdBy === userId && entry.ownership === "owned",
+					) ?? null;
+			setCursorDoc(doc);
+			cursorDocRef.current = doc;
+		});
 		return unsubscribe;
 	}, [client, userId]);
 
@@ -1155,6 +2470,30 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 		}
 	}, [channels, selectedKey]);
 
+	// Repair focus only after the watch moves a channel row between its two different lists.
+	useEffect(() => {
+		let repairFocus = false;
+		for (const [requestId, move] of pendingChannelSectionMovesRef.current) {
+			const channel = channels.find((entry) => entry.key === move.channelKey);
+			if (channel === undefined) {
+				pendingChannelSectionMovesRef.current.delete(requestId);
+				repairFocus = true;
+				continue;
+			}
+			if (channel.revision <= move.sourceRevision) {
+				continue;
+			}
+			// Any newer value settles this request. Keep no marker that can steal focus on a later move.
+			pendingChannelSectionMovesRef.current.delete(requestId);
+			if ((channel.value.archivedAt !== null) === move.archived) {
+				repairFocus = true;
+			}
+		}
+		if (repairFocus) {
+			setPendingFocusRepair(true);
+		}
+	}, [channels]);
+
 	// Focus moves into the drawer when it opens at narrow widths.
 	useEffect(() => {
 		if (drawerOpen) {
@@ -1179,113 +2518,131 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 		const value: chat_CursorMapValue = { channels: { ...currentChannels, [channelKey]: at } };
 		const expectedRevision = base?.revision ?? 0;
 
-		const apply_local = (revision: number, applied: chat_CursorMapValue) => {
-			const now = Date.now();
-			const stored: chat_Doc<chat_CursorMapValue> = {
-				key: chat_cursor_stored_key(userId),
-				value: applied,
-				revision,
-				createdBy: userId,
-				updatedBy: userId,
-				createdAt: base?.createdAt ?? now,
-				updatedAt: now,
-				timestamp: base?.timestamp ?? now,
-			};
-			cursorDocRef.current = stored;
-			setCursorDoc(stored);
-		};
-
 		client.data
 			.putOwned({ collection: "cursors", key: chat_CURSOR_CALLER_KEY, value, expectedRevision })
 			.then((result) => {
 				if ("_yay" in result) {
-					apply_local(result._yay.revision, value);
+					apply_public_cursor_local(result._yay.revision, value);
 					return;
 				}
 				if (result._nay.name === "conflict") {
-					// The winner may already be here (the watch delivered while the write was in
-					// flight); then retry now. Otherwise park the wanted map for the retry effect.
-					const latest = cursorDocRef.current;
-					if (latest !== null && latest.revision !== expectedRevision) {
-						const merged = chat_merge_cursor_maps(latest.value, value);
-						client.data
-							.putOwned({
-								collection: "cursors",
-								key: chat_CURSOR_CALLER_KEY,
-								value: merged,
-								expectedRevision: latest.revision,
-							})
-							.then((retryResult) => {
-								// One retry only: a second conflict waits for the next mark-read.
-								if ("_yay" in retryResult) {
-									apply_local(retryResult._yay.revision, merged);
-								}
-							})
-							.catch(() => {});
-						return;
-					}
-					cursorRetryRef.current = { channels: value.channels, attemptedRevision: expectedRevision };
+					queue_public_cursor_retry(value, expectedRevision, "conflict");
 					return;
 				}
-				// Any other refusal: the likeliest is the value-size ceiling (~290 entries). Drop
-				// the entries for channels no longer in the sidebar and retry once.
-				const sidebarKeys = new Set(channels.map((channel) => channel.key));
-				const kept = Object.fromEntries(
-					Object.entries(value.channels).filter(([key]) => key === channelKey || sidebarKeys.has(key)),
-				);
-				if (Object.keys(kept).length === Object.keys(value.channels).length) {
-					console.warn("[chitchat] A read-cursor write was refused", { message: result._nay.message });
+				if (result._nay.name === "storage_full") {
+					// The shared queue removes stale channels and keeps concurrent wanted maxima together.
+					queue_public_cursor_retry(value, expectedRevision, "storage_full");
 					return;
 				}
-				client.data
-					.putOwned({ collection: "cursors", key: chat_CURSOR_CALLER_KEY, value: { channels: kept }, expectedRevision })
-					.then((retryResult) => {
-						if ("_yay" in retryResult) {
-							apply_local(retryResult._yay.revision, { channels: kept });
-						} else {
-							console.warn("[chitchat] A read-cursor write was refused", { message: retryResult._nay.message });
-						}
-					})
-					.catch(() => {});
+				if (result._nay.name === "unavailable") {
+					queue_public_cursor_retry(value, expectedRevision, "unavailable");
+					return;
+				}
+				console.warn("[chitchat] A read-cursor write was refused", { message: result._nay.message });
 			})
 			.catch((error: unknown) => {
 				console.warn("[chitchat] A read-cursor write failed", { message: chat_get_error_message(error) });
+				queue_public_cursor_retry(value, expectedRevision, "unavailable");
 			});
 	};
 
 	/**
 	 * Moves this member's read cursor for one private channel. The doc lives inside the scope's
-	 * range, so a `p/` key never enters the public map. Only this member writes this doc, so a
-	 * conflict is a race with this page's own concurrent write and the next mark-read heals it.
+	 * range, so a `p/` key never enters the public map. Serialize this page's writes and carry the
+	 * stored revision forward, so two marks before the watch echo cannot race each other.
 	 */
-	const write_private_cursor = (channel: chat_Doc<chat_ChannelValue>, at: number) => {
-		const existing = privateCursors.get(channel.key);
-		if ((existing?.at ?? 0) >= at) {
+	const write_private_cursor = (
+		channel: chat_Doc<chat_ChannelValue>,
+		at: number,
+		activity: chat_PrivateActivityCursor,
+	) => {
+		if (!liveScopeIdsRef.current.has(channel.key)) {
 			return;
 		}
-		client.data
-			.putOwned({
-				collection: "channels",
-				key: chat_private_cursor_caller_key(channel.key),
-				value: { at },
-				expectedRevision: existing?.revision ?? 0,
-			})
-			.then((result) => {
-				if ("_nay" in result && result._nay.name !== "conflict") {
-					console.warn("[chitchat] A private read-cursor write was refused", { message: result._nay.message });
-				}
-			})
-			.catch((error: unknown) => {
-				console.warn("[chitchat] A private read-cursor write failed", { message: chat_get_error_message(error) });
-			});
+		const pending = privateCursorWritesRef.current.get(channel.key);
+		if (pending !== undefined) {
+			pending.pendingAt = Math.max(pending.pendingAt, at);
+			pending.pendingActivity = private_activity_max(pending.pendingActivity, activity);
+			run_private_cursor_write(pending);
+			return;
+		}
+		const existing = privateCursors.get(channel.key);
+		if ((existing?.at ?? 0) >= at && private_activity_covers(existing?.activity ?? EMPTY_PRIVATE_ACTIVITY, activity)) {
+			return;
+		}
+		const write: PrivateCursorWrite = {
+			channelKey: channel.key,
+			pendingAt: at,
+			pendingActivity: activity,
+			storedAt: existing?.at ?? 0,
+			storedActivity: existing?.activity ?? EMPTY_PRIVATE_ACTIVITY,
+			revision: existing?.revision ?? 0,
+			running: false,
+			waitingForRefresh: false,
+			retryDelayMs: CURSOR_RETRY_INITIAL_MS,
+			retryTimer: null,
+			cancelled: false,
+		};
+		privateCursorWritesRef.current.set(channel.key, write);
+		run_private_cursor_write(write);
 	};
 
-	const mark_channel_read = (channel: chat_Doc<chat_ChannelValue>, at: number) => {
+	const mark_channel_read = (
+		channel: chat_Doc<chat_ChannelValue>,
+		at: number,
+		activity: chat_PrivateActivityCursor | null,
+	) => {
 		if (chat_channel_is_private(channel.key)) {
-			write_private_cursor(channel, at);
+			write_private_cursor(channel, at, activity ?? EMPTY_PRIVATE_ACTIVITY);
 		} else {
 			write_public_cursor(channel.key, at);
 		}
+	};
+
+	const cancel_pending_mark_read = (channelKey: string, cancelStartedWrite = true) => {
+		const timer = markReadTimersRef.current.get(channelKey);
+		if (timer !== undefined) {
+			clearTimeout(timer);
+			markReadTimersRef.current.delete(channelKey);
+		}
+		pendingMarkReadsRef.current.delete(channelKey);
+		if (cancelStartedWrite) {
+			const privateWrite = privateCursorWritesRef.current.get(channelKey);
+			if (privateWrite !== undefined) {
+				privateWrite.cancelled = true;
+				if (privateWrite.retryTimer !== null) {
+					clearTimeout(privateWrite.retryTimer);
+				}
+				privateCursorWritesRef.current.delete(channelKey);
+			}
+		}
+	};
+
+	const schedule_mark_read = (
+		channel: chat_Doc<chat_ChannelValue>,
+		timestamp: number,
+		activity: chat_PrivateActivityCursor | null,
+	) => {
+		const pending = pendingMarkReadsRef.current.get(channel.key);
+		pendingMarkReadsRef.current.set(channel.key, {
+			channel,
+			at: Math.max(pending?.at ?? 0, timestamp),
+			activity: activity === null ? null : private_activity_max(pending?.activity ?? EMPTY_PRIVATE_ACTIVITY, activity),
+		});
+		if (markReadTimersRef.current.has(channel.key)) {
+			return;
+		}
+		markReadTimersRef.current.set(
+			channel.key,
+			setTimeout(() => {
+				markReadTimersRef.current.delete(channel.key);
+				const entry = pendingMarkReadsRef.current.get(channel.key);
+				pendingMarkReadsRef.current.delete(channel.key);
+				if (entry !== undefined && !pendingExitKeysRef.current.has(channel.key)) {
+					mark_channel_read(entry.channel, entry.at, entry.activity);
+				}
+			}, MARK_READ_DEBOUNCE_MS),
+		);
 	};
 
 	/**
@@ -1293,24 +2650,186 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	 * arrivals costs one cursor write, not one per message.
 	 */
 	const handle_newest_visible = (channel: chat_Doc<chat_ChannelValue>, timestamp: number) => {
-		const pending = pendingMarkReadRef.current;
-		pendingMarkReadRef.current =
-			pending !== null && pending.channel.key === channel.key
-				? { channel, at: Math.max(pending.at, timestamp) }
-				: { channel, at: timestamp };
-		if (markReadTimerRef.current === null) {
-			markReadTimerRef.current = setTimeout(() => {
-				markReadTimerRef.current = null;
-				const entry = pendingMarkReadRef.current;
-				pendingMarkReadRef.current = null;
-				if (entry !== null) {
-					mark_channel_read(entry.channel, entry.at);
-				}
-			}, MARK_READ_DEBOUNCE_MS);
+		const privateLatest = chat_channel_is_private(channel.key) ? privateActivity.get(channel.key) : undefined;
+		const mark: PendingReadMark = {
+			channel,
+			at: Math.max(timestamp, privateLatest?.at ?? 0),
+			activity: privateLatest?.activity ?? (chat_channel_is_private(channel.key) ? EMPTY_PRIVATE_ACTIVITY : null),
+		};
+		if (pendingExitKeysRef.current.has(channel.key)) {
+			const buffered = exitMarkBuffersRef.current.get(channel.key);
+			exitMarkBuffersRef.current.set(channel.key, {
+				channel,
+				at: Math.max(buffered?.at ?? 0, mark.at),
+				activity:
+					mark.activity === null
+						? null
+						: private_activity_max(buffered?.activity ?? EMPTY_PRIVATE_ACTIVITY, mark.activity),
+			});
+			return;
 		}
+		schedule_mark_read(channel, mark.at, mark.activity);
+	};
+
+	const selectedPrivateActivity = selectedKey === null ? undefined : privateActivity.get(selectedKey);
+	const selectedPrivateActivityAt = selectedPrivateActivity?.at ?? 0;
+	const selectedPrivateMessageSequence = selectedPrivateActivity?.activity.messages ?? 0;
+	const selectedPrivateReplySequence = selectedPrivateActivity?.activity.replies ?? 0;
+	useEffect(() => {
+		if (selectedKey === null || selectedPrivateActivity === undefined || !chat_channel_is_private(selectedKey)) {
+			return;
+		}
+		const channel = channels.find((entry) => entry.key === selectedKey);
+		const cursor = privateCursors.get(selectedKey);
+		if (
+			channel !== undefined &&
+			((cursor?.at ?? 0) < selectedPrivateActivityAt ||
+				!private_activity_covers(cursor?.activity ?? EMPTY_PRIVATE_ACTIVITY, selectedPrivateActivity.activity))
+		) {
+			// A reply may not change the top-level message window. The scope activity still marks it read.
+			schedule_mark_read(channel, selectedPrivateActivityAt, selectedPrivateActivity.activity);
+		}
+	}, [selectedKey, selectedPrivateActivityAt, selectedPrivateMessageSequence, selectedPrivateReplySequence]);
+
+	// Losing a scope is the authoritative departure signal. Rendered rows can also disappear only
+	// because the eight-watch budget changed, and that must not announce a departure or move focus.
+	useEffect(() => {
+		const previous = previousLiveScopeIdsRef.current;
+		// A manager may add the member back while an exit result is pending. Clear only the old
+		// departure snapshot; the exit request keeps its lock until its result settles.
+		for (const scopeId of liveScopeIds) {
+			pendingDeparturesRef.current.delete(scopeId);
+		}
+		for (const scopeId of previous) {
+			if (liveScopeIds.has(scopeId)) {
+				continue;
+			}
+			const channel = privateChannelsByScope[scopeId]?.find((entry) => entry.key === scopeId);
+			if (channel !== undefined) {
+				pendingDeparturesRef.current.set(scopeId, channel);
+			}
+			cancel_pending_mark_read(scopeId);
+		}
+		previousLiveScopeIdsRef.current = new Set(liveScopeIds);
+	}, [liveScopeIds, privateChannelsByScope]);
+
+	useEffect(() => {
+		if (dialog !== null) {
+			return;
+		}
+		let repairFocus = false;
+		for (const [scopeId, channel] of pendingDeparturesRef.current) {
+			const outcome = exitOutcomesRef.current.get(scopeId);
+			if (outcome === "pending") {
+				continue;
+			}
+			const actedOn = outcome !== undefined;
+			announce(
+				outcome === "deleted"
+					? `Deleted #${channel.value.name}`
+					: outcome === "left"
+						? `Left #${channel.value.name}`
+						: outcome === "delete_unconfirmed"
+							? `You no longer have access to #${channel.value.name}. The Delete request could not be confirmed.`
+							: outcome === "leave_unconfirmed"
+								? `You no longer have access to #${channel.value.name}. The Leave request could not be confirmed.`
+								: `You were removed from #${channel.value.name}.`,
+			);
+			if (selectedKey === scopeId) {
+				setSelectedKey(null);
+				setThreadRootKey(null);
+				setOpenedAtLastReadAt(null);
+			}
+			if (selectedKey === scopeId || actedOn) {
+				repairFocus = true;
+			}
+			pendingExitKeysRef.current.delete(scopeId);
+			exitMarkBuffersRef.current.delete(scopeId);
+			exitOutcomesRef.current.delete(scopeId);
+			pendingDeparturesRef.current.delete(scopeId);
+		}
+		if (repairFocus) {
+			setPendingFocusRepair(true);
+		}
+	}, [announce, dialog, liveScopeIds, selectedKey]);
+
+	// Clear a departing selected channel's thread first. A background departure can finish after a
+	// resize, so use the open thread's visible back control instead of leaving a repair pending.
+	useLayoutEffect(() => {
+		if (!pendingFocusRepair || dialog !== null) {
+			return;
+		}
+		const activeElement = document.activeElement;
+		if (activeElement instanceof HTMLElement && activeElement !== document.body && activeElement.isConnected) {
+			setPendingFocusRepair(false);
+			return;
+		}
+		if (isNarrow && !drawerOpen) {
+			if (threadRootKey !== null) {
+				const threadBack = appRef.current?.querySelector<HTMLButtonElement>(".thread-head button") ?? null;
+				if (threadBack !== null) {
+					threadBack.focus();
+					if (document.activeElement === threadBack) {
+						setPendingFocusRepair(false);
+						return;
+					}
+				}
+			}
+			setPendingFocusRepair(false);
+			drawerToggleRef.current?.focus();
+		} else {
+			setPendingFocusRepair(false);
+			navRef.current?.focus();
+		}
+	}, [dialog, drawerOpen, isNarrow, pendingFocusRepair, threadRootKey]);
+
+	// Run after the dialog's unmount cleanup restores its opener. On a resize that opener may now
+	// be hidden, so this later repair must be the final focus move.
+	useEffect(() => {
+		const channelKey = pendingReaddedExitFocusRef.current;
+		if (channelKey === null || dialog !== null) {
+			return;
+		}
+		pendingReaddedExitFocusRef.current = null;
+		if (isNarrow && !drawerOpen) {
+			if (threadRootKey !== null) {
+				const threadBack = appRef.current?.querySelector<HTMLButtonElement>(".thread-head button") ?? null;
+				if (threadBack !== null) {
+					threadBack.focus();
+					if (document.activeElement === threadBack) {
+						return;
+					}
+				}
+			}
+			drawerToggleRef.current?.focus();
+			return;
+		}
+		for (const row of appRef.current?.querySelectorAll<HTMLElement>(".channel-item") ?? []) {
+			if (row.dataset.channelKey === channelKey) {
+				const trigger = row.querySelector<HTMLButtonElement>(".ChannelRowMenu-trigger");
+				if (trigger !== null) {
+					trigger.focus();
+					if (document.activeElement === trigger) {
+						return;
+					}
+				}
+			}
+		}
+		navRef.current?.focus();
+	}, [dialog, drawerOpen, isNarrow, threadRootKey]);
+
+	const guard_selected_send_navigation = () => {
+		if (selectedKey === null || (sendRequestsByChannelRef.current.get(selectedKey) ?? 0) === 0) {
+			return false;
+		}
+		announce(MESSAGE_CHANGE_IN_FLIGHT_NAVIGATION_MESSAGE);
+		return true;
 	};
 
 	const handle_select_channel = (channel: chat_Doc<chat_ChannelValue>) => {
+		if ((channel.key !== selectedKey || threadRootKey !== null) && guard_selected_send_navigation()) {
+			return false;
+		}
 		setSelectedKey(channel.key);
 		// `ChannelView` is keyed by channel and remounts, but this state does not. A key left over
 		// from the old channel resolves to no message in the new one, so no panel renders while the
@@ -1323,7 +2842,10 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 			// "New messages" mark on this value, so reading it live would erase the mark a moment
 			// after the member arrived.
 			setOpenedAtLastReadAt(read_cursor_at(channel));
-			mark_channel_read(channel, Date.now());
+			// Use only server-observed activity. A fast device clock must not hide later messages.
+			const privateLatest = privateActivity.get(channel.key);
+			const publicLatest = publicUnreads.get(channel.key)?.latest.timestamp ?? 0;
+			mark_channel_read(channel, privateLatest?.at ?? publicLatest, privateLatest?.activity ?? null);
 		} else {
 			setOpenedAtLastReadAt(null);
 		}
@@ -1335,9 +2857,13 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 			setDrawerOpen(false);
 			drawerToggleRef.current?.focus();
 		}
+		return true;
 	};
 
 	const handle_select_view = (view: (typeof VIEWS)[number]) => {
+		if (view.key !== selectedKey && guard_selected_send_navigation()) {
+			return;
+		}
 		setSelectedKey(view.key);
 		setThreadRootKey(null);
 		announce(view.name);
@@ -1353,118 +2879,621 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	 * outside the channel's loaded window, the channel opens without the panel.
 	 */
 	const handle_open_thread_from_view = (channel: chat_Doc<chat_ChannelValue>, rootKey: string) => {
-		handle_select_channel(channel);
-		setThreadRootKey(rootKey);
+		if (handle_select_channel(channel)) {
+			setThreadRootKey(rootKey);
+		}
 	};
 
-	// The other half of the cursor compare-and-set: when a write lost the race, the watch
-	// delivers the winner here. Merge per-key maxima over it and write once more, so neither
-	// side's read state moves backwards. One retry — a second conflict waits for the next
-	// mark-read to try again.
-	useEffect(() => {
-		const pending = cursorRetryRef.current;
-		if (pending === null || cursorDoc === null || cursorDoc.revision === pending.attemptedRevision) {
-			return;
+	const handle_open_create_dialog = () => {
+		if (!guard_selected_send_navigation()) {
+			setDialog({ kind: "create" });
 		}
-		cursorRetryRef.current = null;
-		const merged = chat_merge_cursor_maps(cursorDoc.value, { channels: pending.channels });
-		client.data
-			.putOwned({
-				collection: "cursors",
-				key: chat_CURSOR_CALLER_KEY,
-				value: merged,
-				expectedRevision: cursorDoc.revision,
-			})
-			.then((result) => {
-				if ("_nay" in result && result._nay.name !== "conflict") {
-					console.warn("[chitchat] The read-cursor retry was refused", { message: result._nay.message });
-				}
-			})
-			.catch(() => {});
-	}, [cursorDoc, client]);
+	};
 
-	// A pending debounced mark-read must not fire against an unmounted page.
+	// A conflict waits for the newer winner. A size refusal retries without stale channels, and an
+	// unavailable call retries the same revision with backoff. All paths share pending maxima.
 	useEffect(() => {
+		run_public_cursor_retry();
+	}, [cursorDoc, publicChannels, run_public_cursor_retry]);
+
+	// Pending debounced mark-reads must not fire against an unmounted page.
+	useEffect(() => {
+		// StrictMode replays setup after cleanup while the page is still mounted.
+		mountedRef.current = true;
 		return () => {
-			if (markReadTimerRef.current !== null) {
-				clearTimeout(markReadTimerRef.current);
+			mountedRef.current = false;
+			const publicRetry = cursorRetryRef.current;
+			if (publicRetry !== null && publicRetry.retryTimer !== null) {
+				clearTimeout(publicRetry.retryTimer);
+			}
+			cursorRetryRef.current = null;
+			for (const timer of markReadTimersRef.current.values()) {
+				clearTimeout(timer);
+			}
+			markReadTimersRef.current.clear();
+			pendingMarkReadsRef.current.clear();
+			for (const write of privateCursorWritesRef.current.values()) {
+				cancel_private_cursor(write);
+			}
+			privateCursorWritesRef.current.clear();
+			pendingExitKeysRef.current.clear();
+			exitMarkBuffersRef.current.clear();
+			exitOutcomesRef.current.clear();
+			for (const reconciliation of pendingExitReconciliationsRef.current.values()) {
+				cancel_exit_reconciliation(reconciliation);
+			}
+			pendingExitReconciliationsRef.current.clear();
+			for (const reconciliation of pendingReaddReconciliationsRef.current.values()) {
+				cancel_readd_reconciliation(reconciliation);
+			}
+			pendingReaddReconciliationsRef.current.clear();
+			exactDepartureScopeIdsRef.current.clear();
+			checkedDepartureCandidateRevisionsRef.current.clear();
+			scopeCandidatesRef.current.clear();
+			scopeMembershipRevisionsRef.current.clear();
+			pendingSuccessfulLeavesRef.current.clear();
+			sendRequestsByChannelRef.current.clear();
+			const privateCreateReconciliation = pendingPrivateCreateReconciliationRef.current;
+			if (privateCreateReconciliation !== null) {
+				cancel_private_create_reconciliation(privateCreateReconciliation);
+				pendingPrivateCreateReconciliationRef.current = null;
 			}
 		};
 	}, []);
 
+	const resume_refused_exit = (channelKey: string) => {
+		const reconciliation = pendingExitReconciliationsRef.current.get(channelKey);
+		if (reconciliation !== undefined) {
+			cancel_exit_reconciliation(reconciliation);
+			pendingExitReconciliationsRef.current.delete(channelKey);
+		}
+		pendingSuccessfulLeavesRef.current.delete(channelKey);
+		pendingExitKeysRef.current.delete(channelKey);
+		exitOutcomesRef.current.delete(channelKey);
+		const buffered = exitMarkBuffersRef.current.get(channelKey);
+		exitMarkBuffersRef.current.delete(channelKey);
+		if (mountedRef.current && buffered !== undefined && liveScopeIdsRef.current.has(channelKey)) {
+			schedule_mark_read(buffered.channel, buffered.at, buffered.activity);
+		}
+	};
+
 	const close_dialog = () => {
+		if (dialog?.kind === "exit" && pendingExitReconciliationsRef.current.has(dialog.channel.key)) {
+			resume_refused_exit(dialog.channel.key);
+		}
+		pendingChannelCreateRef.current = null;
+		const privateCreateReconciliation = pendingPrivateCreateReconciliationRef.current;
+		if (privateCreateReconciliation !== null) {
+			cancel_private_create_reconciliation(privateCreateReconciliation);
+		}
+		pendingPrivateCreateReconciliationRef.current = null;
+		setChannelCreateUncertain(false);
+		setChannelCreateReconciling(false);
+		pendingChannelValueRef.current = null;
+		setChannelValueUncertain(false);
+		setExitReconciling(false);
 		setDialog(null);
 		setDialogBusy(false);
 		setDialogError(null);
 	};
 
+	const resume_readded_exit = (channelKey: string) => {
+		pendingDeparturesRef.current.delete(channelKey);
+		resume_refused_exit(channelKey);
+		pendingReaddedExitFocusRef.current = channelKey;
+		close_dialog();
+	};
+
+	const settle_departed_exit = (
+		channel: chat_Doc<chat_ChannelValue>,
+		outcome: "left" | "deleted" | "delete_unconfirmed",
+	) => {
+		const reconciliation = pendingExitReconciliationsRef.current.get(channel.key);
+		if (reconciliation !== undefined) {
+			cancel_exit_reconciliation(reconciliation);
+			pendingExitReconciliationsRef.current.delete(channel.key);
+		}
+		pendingSuccessfulLeavesRef.current.delete(channel.key);
+		exitOutcomesRef.current.set(channel.key, outcome);
+		pendingDeparturesRef.current.set(channel.key, channel);
+		const nextLiveScopeIds = new Set(liveScopeIdsRef.current);
+		nextLiveScopeIds.delete(channel.key);
+		liveScopeIdsRef.current = nextLiveScopeIds;
+		scopeMembershipRevisionsRef.current.delete(channel.key);
+		// Remove the row now. The scope watch still reconciles later server changes.
+		setScopes((current) => current.filter((scope) => scope.scopeId !== channel.key));
+		close_dialog();
+	};
+
+	const run_exit_reconciliation = (reconciliation: PendingExitReconciliation) => {
+		const is_current = () =>
+			mountedRef.current &&
+			!reconciliation.cancelled &&
+			pendingExitReconciliationsRef.current.get(reconciliation.channel.key) === reconciliation;
+		const settle_departure = () => {
+			exactDepartureScopeIdsRef.current.add(reconciliation.channel.key);
+			checkedDepartureCandidateRevisionsRef.current.delete(reconciliation.channel.key);
+			settle_departed_exit(reconciliation.channel, reconciliation.action === "leave" ? "left" : "delete_unconfirmed");
+			const candidate = scopeCandidatesRef.current.get(reconciliation.channel.key);
+			if (candidate !== undefined) {
+				reconcile_departed_scope(candidate);
+			}
+		};
+		const schedule_retry = () => {
+			if (!is_current() || reconciliation.retryTimer !== null) {
+				return;
+			}
+			const delayMs = reconciliation.retryDelayMs;
+			reconciliation.retryTimer = setTimeout(() => {
+				reconciliation.retryTimer = null;
+				reconciliation.retryDelayMs = Math.min(delayMs * 2, EXIT_READ_RETRY_MAX_MS);
+				run_exit_reconciliation(reconciliation);
+			}, delayMs);
+		};
+
+		if (!is_current() || reconciliation.running || reconciliation.retryTimer !== null) {
+			return;
+		}
+		reconciliation.running = true;
+		Promise.resolve()
+			.then(() =>
+				client.fetchJson("/api/v1/plugin-data/read", {
+					body: { collection: "channels", key: reconciliation.channel.key },
+				}),
+			)
+			.then((raw: unknown) => {
+				if (!is_current()) {
+					return;
+				}
+				const response = chat_plugin_data_read_response_schema.safeParse(raw);
+				if (!response.success) {
+					reconciliation.running = false;
+					schedule_retry();
+					return;
+				}
+				if (response.data.document === null) {
+					reconciliation.running = false;
+					settle_departure();
+					return;
+				}
+				const channel = chat_validate_channel_doc(response.data.document);
+				if (
+					response.data.document.collection !== "channels" ||
+					channel === null ||
+					channel.key !== reconciliation.channel.key ||
+					!chat_channel_is_private(channel.key)
+				) {
+					reconciliation.running = false;
+					schedule_retry();
+					return;
+				}
+				// An organization owner can read this document without a scope grant. Check the exact
+				// principal list before deciding whether this member still belongs to the channel.
+				return client.scopes.listPrincipals({ scopeId: channel.key }).then((rawResult) => {
+					if (!is_current()) {
+						return;
+					}
+					reconciliation.running = false;
+					const result = private_scope_principal_result(rawResult);
+					if (result === null || "_nay" in result) {
+						schedule_retry();
+						return;
+					}
+					const principals = result._yay;
+					if (principals === null) {
+						settle_departure();
+						return;
+					}
+					if (!principals.some((principal) => principal.userId === userId)) {
+						settle_departure();
+						return;
+					}
+					pendingDeparturesRef.current.delete(channel.key);
+					resume_refused_exit(channel.key);
+					setExitReconciling(false);
+					setDialogBusy(false);
+				});
+			})
+			.catch(() => {
+				if (!is_current()) {
+					return;
+				}
+				reconciliation.running = false;
+				schedule_retry();
+			});
+	};
+
+	const handle_exit_channel = (
+		channel: chat_Doc<chat_ChannelValue>,
+		action: "leave" | "delete",
+		expectedPrincipalCount: number | undefined,
+	) => {
+		if (pendingExitKeysRef.current.has(channel.key)) {
+			return;
+		}
+		if ((sendRequestsByChannelRef.current.get(channel.key) ?? 0) > 0) {
+			setDialogBusy(false);
+			setDialogError(MESSAGE_CHANGE_IN_FLIGHT_NAVIGATION_MESSAGE);
+			announce(MESSAGE_CHANGE_IN_FLIGHT_NAVIGATION_MESSAGE);
+			return;
+		}
+		const pending = pendingMarkReadsRef.current.get(channel.key);
+		if (pending !== undefined) {
+			const buffered = exitMarkBuffersRef.current.get(channel.key);
+			exitMarkBuffersRef.current.set(channel.key, {
+				channel: pending.channel,
+				at: Math.max(buffered?.at ?? 0, pending.at),
+				activity:
+					pending.activity === null
+						? null
+						: private_activity_max(buffered?.activity ?? EMPTY_PRIVATE_ACTIVITY, pending.activity),
+			});
+		}
+		pendingExitKeysRef.current.add(channel.key);
+		exitOutcomesRef.current.set(channel.key, "pending");
+		// Keep a write that already reached the server. If exit is refused, its queued maximum still
+		// completes; if exit succeeds, the scope mutation or the next live-scope update stops it.
+		cancel_pending_mark_read(channel.key, false);
+		setDialogBusy(true);
+		setDialogError(null);
+		const change =
+			action === "delete"
+				? client.scopes.delete({
+						scopeId: channel.key,
+						...(expectedPrincipalCount === undefined ? {} : { expectedPrincipalCount }),
+					})
+				: client.scopes.removePrincipal({
+						scopeId: channel.key,
+						userId,
+						...(expectedPrincipalCount === undefined ? {} : { expectedPrincipalCount }),
+					});
+		const handle_uncertain_exit = (message: string) => {
+			const reconciliation: PendingExitReconciliation = {
+				channel,
+				action,
+				running: false,
+				retryDelayMs: EXIT_READ_RETRY_INITIAL_MS,
+				retryTimer: null,
+				cancelled: false,
+			};
+			pendingExitReconciliationsRef.current.set(channel.key, reconciliation);
+			setDialogBusy(false);
+			setExitReconciling(true);
+			setDialogError(message);
+			run_exit_reconciliation(reconciliation);
+		};
+		change
+			.then((result) => {
+				if (!mountedRef.current) {
+					return;
+				}
+				if ("_nay" in result) {
+					if (result._nay.name === "unavailable") {
+						// Read the exact channel. A cached full scope list cannot prove the write result.
+						handle_uncertain_exit(result._nay.message);
+						return;
+					}
+					resume_refused_exit(channel.key);
+					setDialogBusy(false);
+					setDialogError(
+						result._nay.name === "conflict"
+							? "Who is in this channel changed. Close it and try again."
+							: result._nay.message,
+					);
+					return;
+				}
+				if (action === "leave" && !result._yay.deleted) {
+					const currentRevision = scopeMembershipRevisionsRef.current.get(channel.key);
+					if (currentRevision === undefined) {
+						settle_departed_exit(channel, "left");
+						return;
+					}
+					if (currentRevision > result._yay.membershipRevision) {
+						// A later membership change added this member back, so keep the live channel.
+						resume_readded_exit(channel.key);
+						return;
+					}
+					// The Leave reply can arrive before its full scope-list update. Keep the request
+					// pending until that exact scope is absent or a newer membership change appears.
+					pendingSuccessfulLeavesRef.current.set(channel.key, {
+						channel,
+						membershipRevision: result._yay.membershipRevision,
+					});
+					return;
+				}
+				settle_departed_exit(channel, result._yay.deleted ? "deleted" : "left");
+			})
+			.catch((error: unknown) => {
+				if (!mountedRef.current) {
+					return;
+				}
+				// A thrown transport result is uncertain for the same reason as `unavailable`.
+				handle_uncertain_exit(chat_get_error_message(error));
+			});
+	};
+
+	// A successful Leave may be newer than the last scope-list delivery. Only this target scope's
+	// absence, or a strictly newer target membership revision, can settle that pending result.
+	useEffect(() => {
+		for (const [scopeId, pending] of pendingSuccessfulLeavesRef.current) {
+			const currentRevision = scopeMembershipRevisionsRef.current.get(scopeId);
+			if (currentRevision === undefined) {
+				settle_departed_exit(pending.channel, "left");
+				continue;
+			}
+			if (currentRevision > pending.membershipRevision) {
+				resume_readded_exit(scopeId);
+			}
+		}
+	}, [scopeDeliveryVersion]);
+
+	const run_private_create_reconciliation = (reconciliation: PendingPrivateCreateReconciliation) => {
+		const is_current = () =>
+			mountedRef.current &&
+			!reconciliation.cancelled &&
+			pendingPrivateCreateReconciliationRef.current === reconciliation;
+		const schedule_retry = () => {
+			if (!is_current() || reconciliation.retryTimer !== null) {
+				return;
+			}
+			const delayMs = reconciliation.retryDelayMs;
+			reconciliation.retryTimer = setTimeout(() => {
+				reconciliation.retryTimer = null;
+				reconciliation.retryDelayMs = Math.min(delayMs * 2, PRIVATE_CREATE_RETRY_MAX_MS);
+				run_private_create_reconciliation(reconciliation);
+			}, delayMs);
+		};
+		const stop_with_locked_retry = (message: string) => {
+			cancel_private_create_reconciliation(reconciliation);
+			pendingPrivateCreateReconciliationRef.current = null;
+			setChannelCreateUncertain(true);
+			setChannelCreateReconciling(false);
+			setDialogBusy(false);
+			setDialogError(message);
+		};
+
+		if (!is_current() || reconciliation.running || reconciliation.retryTimer !== null) {
+			return;
+		}
+		reconciliation.running = true;
+		Promise.resolve()
+			.then(() =>
+				client.fetchJson("/api/v1/plugin-data/read", {
+					body: { collection: "channels", key: reconciliation.key },
+				}),
+			)
+			.then((raw: unknown) => {
+				if (!is_current()) {
+					return;
+				}
+				const response = chat_plugin_data_read_response_schema.safeParse(raw);
+				if (!response.success) {
+					reconciliation.running = false;
+					schedule_retry();
+					return;
+				}
+				if (response.data.document === null) {
+					reconciliation.running = false;
+					// Null hides absent, released, and unreadable scopes. Keep the exact key until Cancel.
+					stop_with_locked_retry(PRIVATE_CREATE_READ_ABSENT_MESSAGE);
+					return;
+				}
+				const channel = chat_validate_channel_doc(response.data.document);
+				if (
+					response.data.document.collection !== "channels" ||
+					channel === null ||
+					channel.key !== reconciliation.key ||
+					!chat_channel_is_private(channel.key)
+				) {
+					reconciliation.running = false;
+					schedule_retry();
+					return;
+				}
+				// An organization owner can read this document without a direct scope grant. Require
+				// the exact principal list before treating the create as available to this member.
+				return client.scopes.listPrincipals({ scopeId: channel.key }).then((rawResult) => {
+					if (!is_current()) {
+						return;
+					}
+					reconciliation.running = false;
+					const result = private_scope_principal_result(rawResult);
+					if (result === null || "_nay" in result) {
+						schedule_retry();
+						return;
+					}
+					const principals = result._yay;
+					if (principals === null || !principals.some((principal) => principal.userId === userId)) {
+						stop_with_locked_retry(PRIVATE_CREATE_PRINCIPAL_MISSING_MESSAGE);
+						return;
+					}
+					cancel_private_create_reconciliation(reconciliation);
+					pendingPrivateCreateReconciliationRef.current = null;
+					setSelectedKey(reconciliation.key);
+					setOpenedAtLastReadAt(null);
+					close_dialog();
+				});
+			})
+			.catch(() => {
+				if (!is_current()) {
+					return;
+				}
+				reconciliation.running = false;
+				schedule_retry();
+			});
+	};
+
+	// A lost reply leaves the exact compare-and-set request locked until the watch shows its result.
+	useEffect(() => {
+		const pending = pendingChannelValueRef.current;
+		if (
+			!channelValueUncertain ||
+			pending === null ||
+			dialog === null ||
+			(dialog.kind !== "rename" && dialog.kind !== "archive") ||
+			dialog.channel.key !== pending.channelKey
+		) {
+			return;
+		}
+		const channel = channels.find((entry) => entry.key === pending.channelKey);
+		if (channel === undefined) {
+			close_dialog();
+			return;
+		}
+		if (channel.revision <= pending.expectedRevision) {
+			return;
+		}
+		const matches =
+			pending.sectionMoveRequestId === null
+				? channel.value.name === pending.value.name && (channel.value.topic ?? "") === (pending.value.topic ?? "")
+				: channel.value.archivedAt !== null;
+		if (matches) {
+			close_dialog();
+			return;
+		}
+		pendingChannelValueRef.current = null;
+		setChannelValueUncertain(false);
+		setDialogBusy(false);
+		setDialog((current) =>
+			current !== null &&
+			(current.kind === "rename" || current.kind === "archive") &&
+			current.channel.key === channel.key
+				? { ...current, channel }
+				: current,
+		);
+		setDialogError("Someone else changed this channel while the request was pending. Review it and try again.");
+	}, [channelValueUncertain, channels, dialog]);
+
 	const handle_create_channel = (name: string, topic: string, people: { isPrivate: boolean; userIds: string[] }) => {
 		setDialogBusy(true);
 		setDialogError(null);
-		// Create through put with a client-generated key: put on an absent key creates a
-		// SHARED doc, so any member can rename or archive the channel later.
-		const key = chat_create_channel_key(people.isPrivate ? "private" : "public");
+		// Public channels need one put. Private channels create the scope, invitees, and this
+		// first shared document together, so a refusal cannot leave partial setup behind.
+		const pending = pendingChannelCreateRef.current;
+		const retryingUncertain = channelCreateUncertain && pending !== null;
+		const attempt = retryingUncertain
+			? pending
+			: {
+					key: chat_create_channel_key(people.isPrivate ? "private" : "public"),
+					name,
+					topic,
+					isPrivate: people.isPrivate,
+					userIds: [...people.userIds],
+				};
+		pendingChannelCreateRef.current = attempt;
+		setChannelCreateUncertain(false);
+		setChannelCreateReconciling(false);
 
 		(async (/* iife */) => {
-			// The scope has to exist before the channel document does. A scope refuses a key range that
-			// already holds documents, so writing the channel first would leave a channel nobody can
-			// ever make private — and the channel's own name is the first thing the scope hides.
-			if (people.isPrivate) {
-				const scope = await client.scopes.create({
-					scopeId: key,
-					collections: chat_PRIVATE_CHANNEL_COLLECTIONS,
-					keyPrefix: key,
-				});
-				if ("_nay" in scope) {
+			const value = {
+				name: attempt.name,
+				archivedAt: null,
+				...(attempt.topic === "" ? {} : { topic: attempt.topic }),
+			} satisfies chat_ChannelValue;
+			// Keep a public retry create-only. It must never replace a row that was already stored.
+			const result = attempt.isPrivate
+				? await client.scopes.createWithDocument({
+						scopeId: attempt.key,
+						collections: chat_PRIVATE_CHANNEL_COLLECTIONS,
+						keyPrefix: attempt.key,
+						principals: attempt.userIds.map((userId) => ({ userId, level: "member" as const })),
+						document: { collection: "channels", key: attempt.key, value },
+					})
+				: await client.data.put({ collection: "channels", key: attempt.key, value, expectedRevision: 0 });
+			if ("_nay" in result) {
+				if (result._nay.name === "unavailable") {
+					setChannelCreateUncertain(true);
+					setChannelCreateReconciling(false);
 					setDialogBusy(false);
-					setDialogError(scope._nay.message);
+					setDialogError(result._nay.message);
 					return;
 				}
-				// One at a time and in order, so the first refusal is the one the member reads. A person
-				// who cannot be added (they left the workspace, or they are already in 50 scopes) stops
-				// the create rather than quietly missing from the channel.
-				for (const userId of people.userIds) {
-					const added = await client.scopes.setPrincipal({ scopeId: key, userId, level: "member" });
-					if ("_nay" in added) {
-						setDialogBusy(false);
-						setDialogError(added._nay.message);
-						return;
-					}
+				// A public create-only conflict proves the same key was stored. A private scope may have
+				// changed or been released after that store, so read the exact current channel instead.
+				if (retryingUncertain && result._nay.name === "conflict" && attempt.isPrivate) {
+					const reconciliation: PendingPrivateCreateReconciliation = {
+						key: attempt.key,
+						running: false,
+						retryDelayMs: PRIVATE_CREATE_RETRY_INITIAL_MS,
+						retryTimer: null,
+						cancelled: false,
+					};
+					pendingPrivateCreateReconciliationRef.current = reconciliation;
+					setChannelCreateUncertain(true);
+					setChannelCreateReconciling(true);
+					setDialogBusy(false);
+					setDialogError("Checking whether this private channel was created.");
+					run_private_create_reconciliation(reconciliation);
+					return;
 				}
-			}
-
-			const result = await client.data.put({
-				collection: "channels",
-				key,
-				value: { name, archivedAt: null, ...(topic === "" ? {} : { topic }) } satisfies chat_ChannelValue,
-			});
-			if ("_nay" in result) {
-				setDialogBusy(false);
-				setDialogError(result._nay.message);
-				return;
+				if (!(retryingUncertain && result._nay.name === "conflict")) {
+					pendingChannelCreateRef.current = null;
+					setChannelCreateUncertain(false);
+					setDialogBusy(false);
+					setDialogError(result._nay.message);
+					return;
+				}
 			}
 			// The sidebar shows the channel when the watch delivers it; select it now.
 			// (0.8.0 put results carry only revision and byteSize, so use the local key.)
-			setSelectedKey(key);
+			setSelectedKey(attempt.key);
 			// A channel this member just created has nothing unread, and the frozen cursor belongs
 			// to the channel they were reading before this one.
 			setOpenedAtLastReadAt(null);
 			close_dialog();
 		})().catch((error: unknown) => {
+			setChannelCreateUncertain(true);
+			setChannelCreateReconciling(false);
 			setDialogBusy(false);
 			setDialogError(chat_get_error_message(error));
 		});
 	};
 
 	const put_channel_value = (channel: chat_Doc<chat_ChannelValue>, value: chat_ChannelValue) => {
+		const pending = pendingChannelValueRef.current;
+		const retryingUncertain = channelValueUncertain && pending !== null;
+		const movesChannelSection = (channel.value.archivedAt !== null) !== (value.archivedAt !== null);
+		const attempt: PendingChannelValue = retryingUncertain
+			? pending
+			: {
+					channelKey: channel.key,
+					value,
+					expectedRevision: channel.revision,
+					sectionMoveRequestId: movesChannelSection ? Symbol() : null,
+				};
+		pendingChannelValueRef.current = attempt;
+		setChannelValueUncertain(false);
+		if (!retryingUncertain && attempt.sectionMoveRequestId !== null) {
+			pendingChannelSectionMovesRef.current.set(attempt.sectionMoveRequestId, {
+				channelKey: attempt.channelKey,
+				sourceRevision: attempt.expectedRevision,
+				archived: attempt.value.archivedAt !== null,
+			});
+		}
 		setDialogBusy(true);
 		setDialogError(null);
 		client.data
 			// expectedRevision makes the write compare-and-set: a concurrent rename or archive
 			// from another member answers a conflict instead of being silently overwritten.
-			.put({ collection: "channels", key: channel.key, value, expectedRevision: channel.revision })
+			.put({
+				collection: "channels",
+				key: attempt.channelKey,
+				value: attempt.value,
+				expectedRevision: attempt.expectedRevision,
+			})
 			.then((result) => {
 				if ("_nay" in result) {
+					if (result._nay.name === "unavailable" || (retryingUncertain && result._nay.name === "conflict")) {
+						// An exact retry conflict means the stored revision moved. Let the watch say which value won.
+						setChannelValueUncertain(true);
+						setDialogBusy(false);
+						setDialogError(result._nay.message);
+						return;
+					}
+					pendingChannelValueRef.current = null;
+					setChannelValueUncertain(false);
+					if (attempt.sectionMoveRequestId !== null && result._nay.name !== "conflict") {
+						pendingChannelSectionMovesRef.current.delete(attempt.sectionMoveRequestId);
+					}
 					setDialogBusy(false);
 					setDialogError(
 						result._nay.name === "conflict"
@@ -1476,12 +3505,20 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 				close_dialog();
 			})
 			.catch((error: unknown) => {
+				// Keep the exact request until a newer watch value proves whether it committed.
+				setChannelValueUncertain(true);
 				setDialogBusy(false);
 				setDialogError(chat_get_error_message(error));
 			});
 	};
 
 	const handle_unarchive = (channel: chat_Doc<chat_ChannelValue>) => {
+		const sectionMoveRequestId = Symbol();
+		pendingChannelSectionMovesRef.current.set(sectionMoveRequestId, {
+			channelKey: channel.key,
+			sourceRevision: channel.revision,
+			archived: false,
+		});
 		client.data
 			.put({
 				collection: "channels",
@@ -1491,10 +3528,15 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 			})
 			.then((result) => {
 				if ("_nay" in result) {
+					// Conflict and unavailable can race a committed winner. Let the watch settle them.
+					if (result._nay.name !== "conflict" && result._nay.name !== "unavailable") {
+						pendingChannelSectionMovesRef.current.delete(sectionMoveRequestId);
+					}
 					announce(result._nay.message);
 				}
 			})
 			.catch((error: unknown) => {
+				// Keep an uncertain request until a newer watch value proves whether it committed.
 				announce(chat_get_error_message(error));
 			});
 	};
@@ -1516,11 +3558,16 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	const activeChannels = channels.filter((channel) => channel.value.archivedAt === null).sort(by_name);
 	const archivedChannels = channels.filter((channel) => channel.value.archivedAt !== null).sort(by_name);
 	const selected = channels.find((channel) => channel.key === selectedKey) ?? null;
+	const selectedReadGeneration =
+		selected !== null && chat_channel_is_private(selected.key)
+			? (scopes.find((scope) => scope.scopeId === selected.key)?.membershipRevision ?? 0)
+			: 0;
+	const selectedSendInFlight = selected !== null && (sendRequestsByChannel[selected.key] ?? 0) > 0;
 
 	// The Unreads sidebar row aggregates what the channel rows show one by one.
 	const unreadChannelCount = activeChannels.filter(channel_has_unread).length;
 	const totalMentions = activeChannels.reduce((sum, channel) => sum + channel_mention_count(channel), 0);
-	const unwatchedScopeCount = Math.max(0, scopes.length - MAX_WATCHED_SCOPES);
+	const unwatchedScopeCount = Math.max(0, scopes.length - watchedScopes.length);
 
 	const render_channel_section = (title: string, sectionChannels: chat_Doc<chat_ChannelValue>[], id: string) => {
 		// A section with no channels renders nothing: an ordinary workspace has no archived channels,
@@ -1539,79 +3586,102 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 					{sectionChannels.map((channel) => {
 						const hasUnread = channel_has_unread(channel);
 						const mentionCount = channel_mention_count(channel);
+						const privateScope = scopes.find((scope) => scope.scopeId === channel.key);
 						return (
-						<li key={channel.key} className="channel-item">
-							<button
-								type="button"
-								className={hasUnread || mentionCount > 0 ? "channel-link is-unread" : "channel-link"}
-								aria-current={channel.key === selectedKey ? "page" : undefined}
-								onClick={() => handle_select_channel(channel)}
-							>
-								{/* The collapsed rail shows this initial; the full name below stays in the
+							<li key={channel.key} className="channel-item" data-channel-key={channel.key}>
+								<button
+									type="button"
+									className={hasUnread || mentionCount > 0 ? "channel-link is-unread" : "channel-link"}
+									aria-current={channel.key === selectedKey ? "page" : undefined}
+									disabled={selectedSendInFlight && (channel.key !== selectedKey || threadRootKey !== null)}
+									onClick={() => handle_select_channel(channel)}
+								>
+									{/* The collapsed rail shows this initial; the full name below stays in the
 								    accessibility tree at every width, so the button is never announced as one
 								    letter. aria-hidden keeps the initial out of that name. */}
-								<span className="channel-initial" aria-hidden="true">
-									{channel.value.name.slice(0, 1).toUpperCase()}
-								</span>
-								<span className="channel-name">
-									{/* One text node on purpose. Wrapping the "#" in its own element to dim it
+									<span className="channel-initial" aria-hidden="true">
+										{channel.value.name.slice(0, 1).toUpperCase()}
+									</span>
+									<span className="channel-name">
+										{/* One text node on purpose. Wrapping the "#" in its own element to dim it
 									    made the accessible name "# general" instead of "#general", which is the
 									    name members hear and every QA locator matches on. */}
-									#{channel.value.name}
-									{/* Said on the channels that are in the list, and nowhere else. A member who is
+										#{channel.value.name}
+										{/* Said on the channels that are in the list, and nowhere else. A member who is
 									    not in a private channel receives none of its documents, so it is absent from
 									    this list entirely — there is deliberately no greyed-out row for it, because
 									    a row is how a member learns the channel exists. */}
-									{chat_channel_is_private(channel.key) ? " (private)" : ""}
-									{channel.value.archivedAt !== null ? " (archived)" : ""}
-								</span>
-								{/* A mention count outranks the plain dot: the amber is design-brief decision
-								    1's one meaning — unread and mention emphasis, never selection. */}
-								{mentionCount > 0 ? (
-									<span className="mention-badge">
-										{mentionCount}
-										<span className="visually-hidden"> unread mentions</span>
+										{chat_channel_is_private(channel.key) ? " (private)" : ""}
+										{channel.value.archivedAt !== null ? " (archived)" : ""}
 									</span>
-								) : hasUnread ? (
-									<>
-										<span className="unread-dot" aria-hidden="true" />
-										<span className="visually-hidden">unread</span>
-									</>
-								) : null}
-							</button>
-							<span className="channel-item-actions">
-								<ChannelRowMenu
-									channelName={channel.value.name}
-									items={[
-										...(chat_channel_is_private(channel.key)
-											? [
-													{
-														id: "people",
-														label: `People in #${channel.value.name}`,
-														onSelect: () => setDialog({ kind: "people", channel }),
+									{/* A mention count outranks the plain dot: the amber is design-brief decision
+								    1's one meaning — unread and mention emphasis, never selection. */}
+									{mentionCount > 0 ? (
+										<span className="mention-badge">
+											{mentionCount}
+											<span className="visually-hidden"> unread mentions</span>
+										</span>
+									) : hasUnread ? (
+										<>
+											<span className="unread-dot" aria-hidden="true" />
+											<span className="visually-hidden">unread</span>
+										</>
+									) : null}
+								</button>
+								<span className="channel-item-actions">
+									<ChannelRowMenu
+										channelName={channel.value.name}
+										items={[
+											...(chat_channel_is_private(channel.key)
+												? [
+														{
+															id: "people",
+															label: `People in #${channel.value.name}`,
+															onSelect: () => setDialog({ kind: "people", channel }),
+														},
+													]
+												: []),
+											{
+												id: "rename",
+												label: `Rename #${channel.value.name}`,
+												onSelect: () => setDialog({ kind: "rename", channel }),
+											},
+											channel.value.archivedAt === null
+												? {
+														id: "archive",
+														label: `Archive #${channel.value.name}`,
+														onSelect: () => setDialog({ kind: "archive", channel }),
+													}
+												: {
+														id: "unarchive",
+														label: `Unarchive #${channel.value.name}`,
+														onSelect: () => handle_unarchive(channel),
 													},
-												]
-											: []),
-										{
-											id: "rename",
-											label: `Rename #${channel.value.name}`,
-											onSelect: () => setDialog({ kind: "rename", channel }),
-										},
-										channel.value.archivedAt === null
-											? {
-													id: "archive",
-													label: `Archive #${channel.value.name}`,
-													onSelect: () => setDialog({ kind: "archive", channel }),
-												}
-											: {
-													id: "unarchive",
-													label: `Unarchive #${channel.value.name}`,
-													onSelect: () => handle_unarchive(channel),
-												},
-									]}
-								/>
-							</span>
-						</li>
+											...(privateScope
+												? [
+														{ id: "private-exit-separator", separator: true as const },
+														{
+															id: "leave",
+															label: `Leave #${channel.value.name}`,
+															danger: true,
+															onSelect: () => setDialog({ kind: "exit", action: "leave", channel }),
+														},
+														...(privateScope.level === "manage"
+															? [
+																	{
+																		id: "delete",
+																		label: `Delete #${channel.value.name} for everyone`,
+																		danger: true,
+																		onSelect: () => setDialog({ kind: "exit", action: "delete", channel }),
+																	},
+																]
+															: []),
+													]
+												: []),
+										]}
+									/>
+								</span>
+							</li>
 						);
 					})}
 				</ul>
@@ -1620,7 +3690,21 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	};
 
 	return (
-		<div className={threadRootKey === null ? "chitchat" : "chitchat has-thread"}>
+		<div
+			ref={appRef}
+			className="chitchat"
+			onFocusCapture={(event) => {
+				const target = event.target as HTMLElement;
+				responsiveFocusOwnerRef.current =
+					target === drawerToggleRef.current
+						? "drawer"
+						: navRef.current?.contains(target)
+							? "sidebar"
+							: target.classList.contains("thread-resize")
+								? "separator"
+								: null;
+			}}
+		>
 			{/* The page heading sits outside the <nav>, because the closed drawer marks its contents
 			    inert and would otherwise take the document's only level-1 heading with it. The
 			    <header> around it is what keeps it inside a landmark: a heading loose in the body
@@ -1640,7 +3724,9 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 			</header>
 			<nav
 				ref={navRef}
-				className={`sidebar${drawerOpen ? " is-open" : ""}${railExpanded ? " is-expanded" : ""}`}
+				className={["sidebar", drawerOpen ? "is-open" : "", railExpanded ? "is-expanded" : ""]
+					.filter(Boolean)
+					.join(" ")}
 				aria-label="Channels"
 				tabIndex={-1}
 			>
@@ -1659,7 +3745,12 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 						>
 							{railExpanded ? "«" : "»"}
 						</button>
-						<button type="button" className="button sidebar-create" onClick={() => setDialog({ kind: "create" })}>
+						<button
+							type="button"
+							className="button sidebar-create"
+							disabled={selectedSendInFlight}
+							onClick={handle_open_create_dialog}
+						>
 							Create channel
 						</button>
 					</div>
@@ -1684,6 +3775,7 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 											: "channel-link view-link"
 									}
 									aria-current={selectedKey === view.key ? "page" : undefined}
+									disabled={selectedSendInFlight}
 									onClick={() => handle_select_view(view)}
 								>
 									<span className="channel-initial" aria-hidden="true">
@@ -1725,6 +3817,7 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 						channels={activeChannels}
 						publicUnreads={publicUnreads}
 						privateCursors={privateCursors}
+						privateActivity={privateActivity}
 						recentDead={recentDead}
 						memberNames={memberNames}
 						onSelectChannel={handle_select_channel}
@@ -1751,11 +3844,15 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 						client={client}
 						userId={userId}
 						channel={selected}
+						readGeneration={selectedReadGeneration}
 						memberNames={memberNames}
 						announce={announce}
 						threadRootKey={threadRootKey}
 						setThreadRootKey={setThreadRootKey}
 						isNarrow={isNarrow}
+						onRequestStart={() => handle_send_request_start(selected.key)}
+						onRequestSettled={() => handle_send_request_settled(selected.key)}
+						sendInFlight={selectedSendInFlight}
 						onNewestVisible={(timestamp) => handle_newest_visible(selected, timestamp)}
 						openedAtLastReadAt={openedAtLastReadAt}
 					/>
@@ -1779,6 +3876,8 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 					initialTopic=""
 					privacy={{ client, selfUserId: userId }}
 					busy={dialogBusy}
+					waiting={channelCreateReconciling}
+					fieldsLocked={channelCreateUncertain}
 					error={dialogError}
 					onSubmit={handle_create_channel}
 					onClose={close_dialog}
@@ -1801,6 +3900,8 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 					initialTopic={dialog.channel.value.topic ?? ""}
 					privacy={null}
 					busy={dialogBusy}
+					waiting={false}
+					fieldsLocked={channelValueUncertain}
 					error={dialogError}
 					onSubmit={(name, topic) =>
 						put_channel_value(dialog.channel, {
@@ -1818,13 +3919,28 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 				<ArchiveChannelDialog
 					channelName={dialog.channel.value.name}
 					busy={dialogBusy}
+					retry={channelValueUncertain}
 					error={dialogError}
 					onConfirm={() => put_channel_value(dialog.channel, { ...dialog.channel.value, archivedAt: Date.now() })}
 					onClose={close_dialog}
 				/>
 			) : null}
+			{dialog !== null && dialog.kind === "exit" ? (
+				<ExitChannelDialog
+					client={client}
+					channel={dialog.channel}
+					action={dialog.action}
+					busy={dialogBusy}
+					waiting={exitReconciling}
+					error={dialogError}
+					onConfirm={(expectedPrincipalCount) =>
+						handle_exit_channel(dialog.channel, dialog.action, expectedPrincipalCount)
+					}
+					onClose={close_dialog}
+				/>
+			) : null}
 			{/* The single polite announcer. It is permanently mounted and fed ONLY with
-			    remote-authored arrivals and channel switches — never the user's own sends. */}
+			    state changes and channel switches — never the user's own sent messages. */}
 			<div className="chitchat-announcer visually-hidden" role="status" aria-live="polite">
 				<span data-announcement-sequence={String(announcement.sequence)} />
 				{spokenText}
