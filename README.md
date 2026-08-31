@@ -49,7 +49,17 @@ run mutates the installation's transcripts at a time:
   the channel's transcript folder or file through `plugin-archive`.
 - `reconcile` (`/reconcile`) — rebuild a channel transcript from the store. The store and the file
   system commit separately, so a run can crash between them; the store is the source of truth and
-  reconcile heals the file. Over the page caps it degrades to a truncated tail rebuild.
+  reconcile heals the file. Over the page caps it degrades to a truncated tail rebuild — a
+  deviation from the plan's unbounded resumable rebuild, sized to dev-scale data.
+
+Two paths keep a crashed run from leaving the transcript behind the store forever. Opening a
+channel invokes `reconcile` in the background (`ChannelView`, no spinner and no error surface,
+because the transcript is a side artifact and the next open tries again). And a replayed send
+finishes the file half itself, without a full rebuild: it looks for the block's
+`<!-- chitchat:msg:<key> -->` marker in the same bounded set of transcript files the edit paths
+scan, and appends or nests the block only when the marker is absent. So replaying a send twice
+never writes the block twice. A replayed channel create re-runs `ensure_channel` for the same
+reason.
 
 The page calls these through `client.backend.invoke`, wrapped in `src/chat-invoke.ts`: it waits out
 `busy` answers (serialization lock and invoke rate bucket, both with `retryAfterMs`), maps the

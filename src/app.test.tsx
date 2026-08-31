@@ -550,14 +550,44 @@ function deferred<T>() {
 	return { promise, resolve, reject };
 }
 
+/**
+ * Runs an action that opens a channel with the reconcile the channel view fires on open answered
+ * by a stub. A test's queued answers and call counts then stay with the action it is testing. The
+ * real invoke spy is back in place when this returns, and two tests open a channel without going
+ * through the helpers below, to cover the reconcile call itself.
+ */
+async function without_open_reconcile<T>(
+	h: ReturnType<typeof make_harness>,
+	open: () => Promise<T>,
+	opensChannel = true,
+) {
+	const invoke = h.raw.backend.invoke;
+	const stub = vi.fn<(opts: InvokeOpts) => Promise<InvokeResult>>(async () => invoke_ok({ done: true }));
+	h.raw.backend.invoke = stub;
+
+	const opened = await open();
+	if (opensChannel) {
+		await waitFor(() => expect(stub).toHaveBeenCalledWith({ endpoint: "reconcile", input: expect.anything() }));
+	}
+
+	h.raw.backend.invoke = invoke;
+	return opened;
+}
+
 /** Renders the App, delivers one channel, and waits for the channel view's windows. */
 async function boot(h: ReturnType<typeof make_harness>, channels: unknown[] = [channel_doc(CH1_KEY, "general")]) {
-	const utils = render(<App client={h.client} />);
-	h.find_watch("channels")!.onUpdate(watch_update(channels));
-	if (channels.length > 0) {
-		await waitFor(() => expect(h.find_window("messages", `${CH1_KEY}:`)).toBeTruthy());
-	}
-	return utils;
+	return await without_open_reconcile(
+		h,
+		async () => {
+			const utils = render(<App client={h.client} />);
+			h.find_watch("channels")!.onUpdate(watch_update(channels));
+			if (channels.length > 0) {
+				await waitFor(() => expect(h.find_window("messages", `${CH1_KEY}:`)).toBeTruthy());
+			}
+			return utils;
+		},
+		channels.length > 0,
+	);
 }
 
 function list_calls(h: ReturnType<typeof make_harness>, collection?: string) {
@@ -991,6 +1021,41 @@ test("the rendered thread controls the responsive layout and a channel switch re
 	fireEvent.click(screen.getByRole("button", { name: "#random" }));
 	await waitFor(() => expect(root.querySelector(".thread")).toBeNull());
 	expect(root.classList.contains("has-thread")).toBe(false);
+});
+
+test("opening a channel reconciles it, and a switch reconciles the channel switched to", async () => {
+	const h = make_harness();
+	// `boot` waits for the first reconcile and clears the mock, so start from the raw render here.
+	render(<App client={h.client} />);
+	h.find_watch("channels")!.onUpdate(watch_update([channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]));
+
+	// Nothing but the backend's own transcript heal runs on open: no send, no write.
+	await waitFor(() => expect(invoke_calls(h)).toEqual([{ endpoint: "reconcile", input: { channelKey: CH1_KEY } }]));
+
+	fireEvent.click(screen.getByRole("button", { name: "#random" }));
+	await waitFor(() =>
+		expect(invoke_calls(h, "reconcile")).toEqual([
+			{ endpoint: "reconcile", input: { channelKey: CH1_KEY } },
+			{ endpoint: "reconcile", input: { channelKey: CH2_KEY } },
+		]),
+	);
+});
+
+test("a refused reconcile leaves the channel usable and shows no alert", async () => {
+	const h = make_harness();
+	h.raw.backend.invoke.mockImplementation(async (opts: InvokeOpts) => {
+		if (opts.endpoint === "reconcile") {
+			return invoke_refused(503, "Files service unavailable");
+		}
+		return invoke_ok({});
+	});
+	render(<App client={h.client} />);
+	h.find_watch("channels")!.onUpdate(watch_update([channel_doc(CH1_KEY, "general")]));
+
+	// The heal is background maintenance. A member who cannot heal the transcript can still chat.
+	await waitFor(() => expect(invoke_calls(h, "reconcile")).toHaveLength(1));
+	expect(composer_box("Message #general").disabled).toBe(false);
+	expect(screen.queryByRole("alert")).toBeNull();
 });
 
 test("the icon rail's expand control is a labelled toggle that reports its state", async () => {
@@ -4488,12 +4553,18 @@ async function boot_sidebar(
 	strict = false,
 ) {
 	const publicChannels = channels.filter((doc) => !privateKeys.some((key) => (doc as { key: string }).key === key));
-	const app = <App client={h.client} />;
-	const utils = render(strict ? <StrictMode>{app}</StrictMode> : app);
-	h.find_watch("channels")!.onUpdate(watch_update(publicChannels));
-	await deliver_scopes(h, channels, privateKeys);
-	await waitFor(() => expect(screen.getByRole("navigation", { name: "Channels" })).toBeTruthy());
-	return utils;
+	return await without_open_reconcile(
+		h,
+		async () => {
+			const app = <App client={h.client} />;
+			const utils = render(strict ? <StrictMode>{app}</StrictMode> : app);
+			h.find_watch("channels")!.onUpdate(watch_update(publicChannels));
+			await deliver_scopes(h, channels, privateKeys);
+			await waitFor(() => expect(screen.getByRole("navigation", { name: "Channels" })).toBeTruthy());
+			return utils;
+		},
+		channels.length > 0,
+	);
 }
 
 /** Hands the page the scope list, then answers each scope's own channels read. */
@@ -8891,19 +8962,27 @@ function private_scope(appendActivity: ScopeFixture["appendActivity"] = [], scop
 }
 
 async function open_private_composer(h: ReturnType<typeof make_harness>) {
-	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const nav = screen.getByRole("navigation", { name: "Channels" });
-	fireEvent.click(within(nav).getByRole("button", { name: /^#secret-plans/ }));
-	const messageWindow = await waitFor(() => {
-		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
-		expect(found).toBeTruthy();
-		return found!;
-	});
-	messageWindow.onUpdate(window_update([]));
-	return {
-		unmount: utils.unmount,
-		textarea: screen.getByRole("combobox", { name: "Message #secret-plans" }) as HTMLTextAreaElement,
-	};
+	// `boot_sidebar` already waited out the open reconcile. The stub stays for the click below,
+	// which reconciles again only when the channel was not selected yet.
+	return await without_open_reconcile(
+		h,
+		async () => {
+			const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+			const nav = screen.getByRole("navigation", { name: "Channels" });
+			fireEvent.click(within(nav).getByRole("button", { name: /^#secret-plans/ }));
+			const messageWindow = await waitFor(() => {
+				const found = h.find_window("messages", `${PRIVATE_KEY}:`);
+				expect(found).toBeTruthy();
+				return found!;
+			});
+			messageWindow.onUpdate(window_update([]));
+			return {
+				unmount: utils.unmount,
+				textarea: screen.getByRole("combobox", { name: "Message #secret-plans" }) as HTMLTextAreaElement,
+			};
+		},
+		false,
+	);
 }
 
 test("durable private message activity updates unread without replacing its ranged watch", async () => {

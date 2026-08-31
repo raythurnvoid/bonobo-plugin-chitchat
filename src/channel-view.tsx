@@ -2277,6 +2277,15 @@ export function ChannelView(props: ChannelView_Props) {
 		channelNameRef.current = channel.value.name;
 	}, [channel.value.name]);
 
+	// Opening a channel asks the backend to rebuild its transcript file from the store. A send
+	// writes the store first and the file second, so a run that died in between leaves the file
+	// behind the store, and nothing else would ever notice. The store is the source of truth and
+	// the transcript is a side artifact, so this runs in the background: no spinner, no error
+	// surface, and a refusal is left to the next open.
+	useEffect(() => {
+		chat_invoke_backend(client, "reconcile", { channelKey: channel.key }).catch(() => {});
+	}, [client, channel.key]);
+
 	const apply_reply_docs = (docs: unknown[]) => {
 		const store = repliesStoreRef.current;
 		if (store === null) {

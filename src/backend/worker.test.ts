@@ -300,6 +300,35 @@ describe("message-send", () => {
 		expect(tail.split(`<!-- chitchat:msg:${first.body.messageKey as string} -->`)).toHaveLength(2);
 	});
 
+	test("a replayed send writes back a block the first run never appended", async () => {
+		seed_public_channel();
+		const { tailPath } = seed_projection("chan-public");
+		const headerOnly = fake.files.get(tailPath)!;
+
+		const send = {
+			channelKey: "chan-public",
+			text: "hello",
+			authorName: "Alice",
+			clientRequestId: "req-lost",
+		};
+		const first = await invoke("message-send", send);
+		const messageKey = first.body.messageKey as string;
+
+		// The first run wrote the store, then died before the file write. Put the transcript back
+		// to what such a run would have left behind: the header, and no block.
+		fake.files.set(tailPath, headerOnly);
+
+		const replay = await invoke("message-send", send);
+
+		expect(replay.status).toBe(200);
+		expect(replay.body).toMatchObject({ messageKey, replayed: true });
+		// One document and one block: the repair rendered the stored message, it did not send again.
+		expect(fake.collections.get("messages")!.size).toBe(1);
+		const tail = fake.files.get(tailPath)!;
+		expect(tail.split(`<!-- chitchat:msg:${messageKey} -->`)).toHaveLength(2);
+		expect(tail).toContain("hello");
+	});
+
 	test("a missing channel answers 404 and an archived channel answers 409", async () => {
 		const missing = await invoke("message-send", {
 			channelKey: "nope",
@@ -413,6 +442,36 @@ describe("reply-send", () => {
 		const replyIndex = tail.indexOf(`  <!-- chitchat:msg:${replyKey} -->`);
 		expect(replyIndex).toBeGreaterThan(tail.indexOf(rootKey));
 		expect(replyIndex).toBeLessThan(tail.indexOf(`<!-- chitchat:msg:${laterKey} -->`));
+	});
+
+	test("a replayed reply writes back a block the first run never nested", async () => {
+		seed_public_channel();
+		const rootKey = minted_key("chan-public", 100);
+		fake.seed_doc("messages", rootKey, { text: "root", attachments: [], editedAt: null, deletedAt: null });
+		const rootOnly = `# general\n\n<!-- chitchat:msg:${rootKey} -->\n**A** · t\nroot`;
+		seed_projection("chan-public", "general", rootOnly);
+
+		const send = {
+			rootMessageKey: rootKey,
+			text: "nested answer",
+			authorName: "Bob",
+			clientRequestId: "req-r-lost",
+		};
+		const first = await invoke("reply-send", send);
+		const replyKey = first.body.messageKey as string;
+
+		// Same crash window as the message case: the reply is in the store, not in the file.
+		fake.files.set("/chitchat/general.md", rootOnly);
+
+		const replayed = await invoke("reply-send", send);
+
+		expect(replayed.status).toBe(200);
+		expect(replayed.body).toMatchObject({ messageKey: replyKey, replayed: true });
+		expect(fake.collections.get("replies")!.size).toBe(1);
+		const tail = fake.files.get("/chitchat/general.md")!;
+		expect(tail.split(`<!-- chitchat:msg:${replyKey} -->`)).toHaveLength(2);
+		// The repair nests the block under its root, indented, like a first-run reply.
+		expect(tail).toContain(`  <!-- chitchat:msg:${replyKey} -->`);
 	});
 
 	test("a reply to a missing root answers 404", async () => {
@@ -595,6 +654,23 @@ describe("channel-manage", () => {
 		// State lives inside the channel scope, and the README never names the channel.
 		expect(fake.collections.get("channels")!.get(`${channelKey}:projection`)).toBeDefined();
 		expect(fake.files.get("/chitchat/README.md")).not.toContain("secret");
+	});
+
+	test("a replayed create finishes the projection the first run never wrote", async () => {
+		const created = await invoke("channel-manage", { action: "create", name: "general", clientRequestId: "req-c1" });
+		const channelKey = created.body.channelKey as string;
+
+		// The first run stored the channel, then died before the projection existed.
+		fake.collections.get("projection")!.delete(channelKey);
+		fake.files.delete("/chitchat/general.md");
+
+		const replay = await invoke("channel-manage", { action: "create", name: "general", clientRequestId: "req-c1" });
+
+		expect(replay.status).toBe(200);
+		expect(replay.body).toMatchObject({ channelKey, replayed: true });
+		// The channel the page can already post into has its folder and tail file back.
+		expect(fake.collections.get("projection")!.get(channelKey)).toBeDefined();
+		expect(fake.files.get("/chitchat/general.md")).toContain("# general");
 	});
 
 	test("an occupied /chitchat root falls back to the same digest path on every run", async () => {

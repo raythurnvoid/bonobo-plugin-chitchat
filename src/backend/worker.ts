@@ -12,6 +12,7 @@ import {
 	chat_message_channel_key,
 	chat_message_value_schema,
 	chat_REACTION_TOKENS,
+	chat_reply_root_key,
 	type chat_MessageValue,
 } from "../chat-data";
 import { chatbe_create_host, chatbe_host_message, type chatbe_Host, type chatbe_HostAnswer } from "./host";
@@ -713,6 +714,10 @@ async function handle_message_send(ctx: Ctx, input: z.infer<typeof send_input_sc
 		return replayed;
 	}
 	if (replayed !== null) {
+		const repaired = await repair_replayed_block(ctx, replayed.messageKey);
+		if (repaired instanceof Response) {
+			return repaired;
+		}
 		return json_response(200, { messageKey: replayed.messageKey, replayed: true });
 	}
 
@@ -791,6 +796,10 @@ async function handle_reply_send(ctx: Ctx, input: z.infer<typeof reply_input_sch
 		return replayed;
 	}
 	if (replayed !== null) {
+		const repaired = await repair_replayed_block(ctx, replayed.messageKey);
+		if (repaired instanceof Response) {
+			return repaired;
+		}
 		return json_response(200, { messageKey: replayed.messageKey, replayed: true });
 	}
 
@@ -898,6 +907,95 @@ async function load_own_message(ctx: Ctx, messageKey: string) {
 		return refuse(403, "You can only change your own messages");
 	}
 	return { collection, doc };
+}
+
+/**
+ * Whether a block for `key` is already in one of the channel's transcript files. Scans the same
+ * bounded set of files `update_block_in_transcript` scans: the tail first, then rolled files
+ * newest-first.
+ */
+async function transcript_has_block(
+	ctx: Ctx,
+	state: chatbe_ChannelState,
+	key: string,
+): Promise<boolean | Response> {
+	const paths = [chatbe_tail_path(state)];
+	for (let index = state.tailIndex; index >= 1 && paths.length < TRANSCRIPT_SCAN_MAX_FILES; index -= 1) {
+		paths.push(chatbe_rollover_path(state.folderPath, state.slug, index));
+	}
+
+	for (const path of paths) {
+		const file = await files_read_or_null(ctx, path);
+		if (file instanceof Response) {
+			return file;
+		}
+		if (file !== null && chatbe_file_contains_block(file.content, key)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Write the transcript block of a replayed send when the first attempt never wrote it.
+ *
+ * The store and the transcript are two systems with one write each. A send writes the store
+ * first. If the run dies after that write, the page retries with the same request id, and the
+ * replay branch would answer "already done" while the block is still missing from the file. So
+ * look for the block first and write it only when it is absent. A block that is already there is
+ * left alone, which is what makes this safe to run on every replay.
+ */
+async function repair_replayed_block(ctx: Ctx, messageKey: string): Promise<null | Response> {
+	const collection = message_collection_for_key(messageKey);
+	if (collection === null) {
+		return null;
+	}
+	// Both key shapes put the channel key in the first `:` segment.
+	const channel = await read_channel_doc(ctx, messageKey.split(":")[0]!);
+	if (channel instanceof Response) {
+		return channel;
+	}
+	// An archived channel takes no new writes. Its store doc is still correct, and reconcile
+	// rebuilds the transcript if the channel is ever reopened.
+	if (channel.archived) {
+		return null;
+	}
+
+	const projection = await ensure_channel(ctx, channel);
+	if (projection instanceof Response) {
+		return projection;
+	}
+	const present = await transcript_has_block(ctx, projection.state, messageKey);
+	if (present instanceof Response) {
+		return present;
+	}
+	if (present) {
+		return null;
+	}
+
+	const read = await data_read(ctx, collection, messageKey);
+	if (read instanceof Response) {
+		return read;
+	}
+	const doc = parse_message_doc(read.document);
+	if (doc === null) {
+		return null;
+	}
+
+	const block = render_block(doc, []);
+	if (collection === "messages") {
+		const appended = await append_block(ctx, projection, channel, block);
+		return appended instanceof Response ? appended : null;
+	}
+
+	const rootKey = chat_reply_root_key(messageKey);
+	if (rootKey === null) {
+		return null;
+	}
+	const inserted = await update_block_in_transcript(ctx, projection.state, rootKey, (content) =>
+		chatbe_insert_reply_block(content, rootKey, block),
+	);
+	return inserted instanceof Response ? inserted : null;
 }
 
 async function splice_updated_block(ctx: Ctx, doc: MessageDoc) {
@@ -1108,6 +1206,17 @@ async function handle_channel_manage(ctx: Ctx, input: z.infer<typeof channel_man
 			return replayed;
 		}
 		if (replayed !== null) {
+			// The channel doc is stored, but the run may have died before the folder and tail file
+			// existed. `ensure_channel` is idempotent, so finish that half here instead of leaving a
+			// channel the page can post into with no transcript behind it.
+			const channel = await read_channel_doc(ctx, replayed.messageKey);
+			if (channel instanceof Response) {
+				return channel;
+			}
+			const ensured = await ensure_channel(ctx, channel);
+			if (ensured instanceof Response) {
+				return ensured;
+			}
 			return json_response(200, { channelKey: replayed.messageKey, replayed: true });
 		}
 

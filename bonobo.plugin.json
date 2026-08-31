@@ -48,8 +48,8 @@
 	"files": [
 		{
 			"path": "dist/backend/worker.js",
-			"sha256": "sha256:aa73a20acbac4539da79fef7af444197fcc576a9489c6a10e3fff93e564a8de4",
-			"bytes": 197636,
+			"sha256": "sha256:c23109c57dfe8dc82bc77028777bc8daa8d742e74af8e1218191f45390f5e3e0",
+			"bytes": 201134,
 			"contentType": "application/javascript"
 		},
 		{
@@ -60,8 +60,8 @@
 		},
 		{
 			"path": "dist/frontend/assets/index.js",
-			"sha256": "sha256:6f9c328d2a945ac8e72baebd877eb40537d3686ee2585692a1f5642a320c1aeb",
-			"bytes": 813711,
+			"sha256": "sha256:41fca4bddddeb7243494e0cc459b6622065930d8cb46ee248653d60c37dfe57e",
+			"bytes": 813820,
 			"contentType": "application/javascript"
 		},
 		{
