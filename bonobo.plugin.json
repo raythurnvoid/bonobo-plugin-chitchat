@@ -39,6 +39,7 @@
 		"plugin.data.write",
 		"plugin.backend.invoke",
 		"workspace.files.read",
+		"workspace.files.write",
 		"workspace.files.own-write",
 		"workspace.files.own-access",
 		"workspace.members.read"

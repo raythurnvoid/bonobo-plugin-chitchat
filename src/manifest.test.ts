@@ -61,6 +61,11 @@ describe("bonobo.plugin.json", () => {
 		// is a publish rejection. workspace.members.read is what the @-menu and the
 		// private-channel people picker read. The backend adds plugin.data.write and
 		// plugin.backend.invoke, plus own-write/own-access for the projected transcript files.
+		// workspace.files.write is here because the host refuses own-write without it: own-write
+		// narrows the same file surface, and the host keeps the base consent line visible. It adds
+		// no authority to this plugin. An invoke run takes files:write from own-write alone, and
+		// every other reader of workspace.files.write is a service-grant path, which needs
+		// plugin.service.connect. This plugin declares no service.
 		expect([...manifest.capabilities].sort()).toEqual([
 			"plugin.backend.invoke",
 			"plugin.data.read",
@@ -69,6 +74,7 @@ describe("bonobo.plugin.json", () => {
 			"workspace.files.own-access",
 			"workspace.files.own-write",
 			"workspace.files.read",
+			"workspace.files.write",
 			"workspace.members.read",
 		]);
 	});
