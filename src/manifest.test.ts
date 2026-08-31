@@ -18,6 +18,14 @@ const manifest = JSON.parse(readFileSync(new URL("../bonobo.plugin.json", import
 	version: string;
 	description: string;
 	compatibility: { bonoboPluginRuntime: string };
+	backend: {
+		entry: string;
+		moduleName: string;
+		compatibilityDate: string;
+		compatibilityFlags: string[];
+		endpoints: { id: string; path: string; serialization?: string }[];
+	};
+	userWritableCollections: string[];
 	events: unknown[];
 	pages: { id: string; title: string; entry: string; navItem?: { label: string; icon?: string } }[];
 	capabilities: string[];
@@ -48,16 +56,49 @@ describe("bonobo.plugin.json", () => {
 		expect(entry?.contentType).toBe("text/html");
 	});
 
-	test("declares exactly the data-read, user-write, files-read, and members-read capabilities", () => {
+	test("declares exactly the read/write, invoke, files, and members capabilities", () => {
 		// plugin.data.user-write requires plugin.data.read — dropping the read capability
 		// is a publish rejection. workspace.members.read is what the @-menu and the
-		// private-channel people picker read.
+		// private-channel people picker read. The backend adds plugin.data.write and
+		// plugin.backend.invoke, plus own-write/own-access for the projected transcript files.
 		expect([...manifest.capabilities].sort()).toEqual([
+			"plugin.backend.invoke",
 			"plugin.data.read",
 			"plugin.data.user-write",
+			"plugin.data.write",
+			"workspace.files.own-access",
+			"workspace.files.own-write",
 			"workspace.files.read",
 			"workspace.members.read",
 		]);
+	});
+
+	test("declares the backend, its seven endpoints, and the user-writable collections", () => {
+		expect(manifest.backend.entry).toBe("dist/backend/worker.js");
+		expect(manifest.backend.moduleName).toBe("plugin.js");
+		expect(manifest.backend.compatibilityFlags).toEqual(["nodejs_compat"]);
+		const workerEntry = manifest.files.find((file) => file.path === manifest.backend.entry);
+		expect(workerEntry?.contentType).toBe("application/javascript");
+
+		expect(manifest.backend.endpoints.map((endpoint) => endpoint.id)).toEqual([
+			"message-send",
+			"message-edit",
+			"message-delete",
+			"reply-send",
+			"reaction-toggle",
+			"channel-manage",
+			"reconcile",
+		]);
+		for (const endpoint of manifest.backend.endpoints) {
+			// Every endpoint reads-then-writes transcript files, so they all share the one
+			// installation-wide lock.
+			expect(endpoint.serialization).toBe("installation");
+			expect(endpoint.path.startsWith("/")).toBe(true);
+		}
+
+		// Messages, replies, and reactions become backend-only; members keep writing channel docs
+		// (private read cursors live in the channels collection) and cursors.
+		expect(manifest.userWritableCollections).toEqual(["channels", "cursors"]);
 	});
 
 	test("declares no events, secrets, file views, or outbound origins", () => {
@@ -93,12 +134,14 @@ describe("bonobo.plugin.json", () => {
 		expect(distManifest).toBe(rootManifest);
 	});
 
-	test("the dist bundle never calls the Function constructor", () => {
+	test("the dist bundles never call the Function constructor", () => {
 		// The mechanical publish gate rejects `Function(` in dist as dynamically-assembled
 		// code. Zod's eval probe used to trip it; the strip-zod-eval-probe transform in
 		// vite.config.ts removes it, and this pin fails the build if it ever comes back.
-		const bundle = readFileSync(new URL("../dist/frontend/assets/index.js", import.meta.url), "utf8");
-		expect(bundle).not.toMatch(/\bFunction\s*\(/);
+		const frontendBundle = readFileSync(new URL("../dist/frontend/assets/index.js", import.meta.url), "utf8");
+		expect(frontendBundle).not.toMatch(/\bFunction\s*\(/);
+		const workerBundle = readFileSync(new URL("../dist/backend/worker.js", import.meta.url), "utf8");
+		expect(workerBundle).not.toMatch(/\bFunction\s*\(/);
 	});
 
 	test("no dist text file carries a line over the 1000-character review limit", () => {

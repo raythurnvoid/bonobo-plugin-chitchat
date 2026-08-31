@@ -20,7 +20,6 @@ import {
 	chat_message_key_prefix,
 	chat_plugin_data_list_response_schema,
 	chat_PRIVATE_CHANNEL_DISCLOSURE,
-	chat_reaction_caller_key,
 	chat_REACTION_EMOJI,
 	chat_REACTION_LABELS,
 	chat_REACTION_TOKENS,
@@ -45,6 +44,7 @@ import {
 	type chat_AccumulatingStore,
 	type chat_ReactionGroup,
 } from "./chat-store";
+import { chat_invoke_backend, chat_invoke_input_too_large, chat_INVOKE_TOO_LARGE_MESSAGE } from "./chat-invoke";
 import { Dialog } from "./dialog";
 
 /**
@@ -91,6 +91,11 @@ function use_send_queue(opts: {
 	collection: "messages" | "replies";
 	keyPrefix: string;
 	userId: string;
+	/**
+	 * The sender's own display name at send time. The backend snapshots it onto the message doc
+	 * so the projected transcript can name the author without a members door.
+	 */
+	getAuthorName: () => string | null;
 	onDelivered: (doc: chat_Doc<chat_MessageValue>) => void;
 	/** Track the request in App before the append can settle or a navigation handler can run. */
 	onRequestStart: () => void;
@@ -182,18 +187,29 @@ function use_send_queue(opts: {
 			settle(active);
 		};
 
+		// The backend endpoint minting the key: `message-send` under a channel prefix,
+		// `reply-send` under a root-message prefix. The prefix is always `<target key>:`.
+		const targetKey = opts.keyPrefix.slice(0, -1);
+		const input = {
+			...(opts.collection === "messages" ? { channelKey: targetKey } : { rootMessageKey: targetKey }),
+			text: entry.text,
+			attachments: entry.attachments,
+			mentions: entry.mentions,
+			authorName: opts.getAuthorName(),
+			clientRequestId: entry.clientRequestId,
+		};
+
 		const run = () => {
 			if (activeSendsRef.current.get(entry.clientRequestId) !== active || active.cancelled) {
 				return;
 			}
+			// The invoke door caps the request body; fail fast with a clear sentence instead.
+			if (chat_invoke_input_too_large(input)) {
+				fail(chat_INVOKE_TOO_LARGE_MESSAGE);
+				return;
+			}
 			try {
-				void opts.client.data
-					.append({
-						collection: opts.collection,
-						keyPrefix: opts.keyPrefix,
-						value,
-						clientRequestId: entry.clientRequestId,
-					})
+				void chat_invoke_backend(opts.client, opts.collection === "messages" ? "message-send" : "reply-send", input)
 					.then(
 						(result) => {
 							if (activeSendsRef.current.get(entry.clientRequestId) !== active || active.cancelled) {
@@ -201,7 +217,7 @@ function use_send_queue(opts: {
 							}
 							if ("_nay" in result) {
 								if (result._nay.name === "unavailable") {
-									// The append may have committed. Replay the same request id after a bounded wait.
+									// The send may have committed. Replay the same request id after a bounded wait.
 									const delayMs = active.retryDelayMs;
 									active.retryTimer = setTimeout(() => {
 										active.retryTimer = null;
@@ -213,8 +229,12 @@ function use_send_queue(opts: {
 								fail(result._nay.message, result._nay.name === "storage_full");
 								return;
 							}
+							const key = result._yay.messageKey;
+							if (typeof key !== "string") {
+								fail("The Chitchat backend answered without a message key");
+								return;
+							}
 							setPending((prev) => prev.filter((p) => p.clientRequestId !== entry.clientRequestId));
-							const key = result._yay.key;
 							const timestamp = chat_key_timestamp(key) ?? Date.now();
 							// Show the delivered message immediately; the watch echo replaces this synthetic
 							// doc because the server revision is higher.
@@ -1235,10 +1255,17 @@ export function MessageRow(props: MessageRow_Props) {
 			setChangeUncertain(true);
 			setRowError(message);
 		};
+		// A tombstoning value is a delete; anything else is an edit of the text (and mentions).
+		// The backend stamps `editedAt`/`deletedAt` itself and updates the transcript file.
+		const isDelete = active.value.deletedAt !== null && doc.value.deletedAt === null;
 		try {
-			void client.data
-				// Keep the exact submitted value and revision. An unavailable result may hide a commit.
-				.put({ collection, key: doc.key, value: active.value, expectedRevision: active.expectedRevision })
+			void chat_invoke_backend(
+				client,
+				isDelete ? "message-delete" : "message-edit",
+				isDelete
+					? { messageKey: doc.key }
+					: { messageKey: doc.key, text: active.value.text, mentions: active.value.mentions ?? [] },
+			)
 				.then((result) => {
 					if (activeChangeRef.current !== active || active.cancelled) {
 						return;
@@ -1249,7 +1276,7 @@ export function MessageRow(props: MessageRow_Props) {
 							mark_uncertain(result._nay.message);
 							return;
 						}
-						// A stale-revision answer after an uncertain result may be the replay of a committed write.
+						// A conflict after an uncertain result may be the replay of a committed write.
 						// Keep the exact retry locked until its watch echo arrives or the member cancels it.
 						if (active.uncertain && result._nay.name === "conflict") {
 							setBusy(false);
@@ -1267,10 +1294,11 @@ export function MessageRow(props: MessageRow_Props) {
 						setRowError(result._nay.message);
 						return;
 					}
-					// Echo the revision the server stored, not a guessed `doc.revision + 1`. The store
-					// merges forward, so this echo is what the next edit compares against. A guess that
-					// is lower than the stored one refuses the member's own next edit as a conflict.
-					props.onApplyLocal({ ...doc, value: active.value, revision: result._yay.revision, updatedAt: Date.now() });
+					// Echo the revision the backend stored when it answered one (a replayed delete
+					// answers none). The store merges forward, so a too-high guess would shadow the
+					// real watch echo; the stored revision cannot.
+					const revision = typeof result._yay.revision === "number" ? result._yay.revision : doc.revision;
+					props.onApplyLocal({ ...doc, value: active.value, revision, updatedAt: Date.now() });
 					finish_change(active);
 				})
 				.catch((error: unknown) => {
@@ -1344,10 +1372,12 @@ export function MessageRow(props: MessageRow_Props) {
 			setRowError(null);
 			return;
 		}
+		// The backend stamps `editedAt` itself, so the page's own timestamp can never match the
+		// stored one. Same text plus any edit stamp proves this edit (or an identical one) landed.
 		const matches =
 			active.value.deletedAt !== null
 				? doc.value.deletedAt !== null
-				: doc.value.text === active.value.text && doc.value.editedAt === active.value.editedAt;
+				: doc.value.text === active.value.text && doc.value.editedAt !== null;
 		if (matches) {
 			finish_change(active);
 			return;
@@ -1429,12 +1459,7 @@ export function MessageRow(props: MessageRow_Props) {
 			return;
 		}
 		const removed = currentlyPressed;
-		client.data
-			.putOwned({
-				collection: "reactions",
-				key: chat_reaction_caller_key(doc.key, token),
-				value: removed ? { removed: true } : {},
-			})
+		chat_invoke_backend(client, "reaction-toggle", { targetKey: doc.key, token, on: !removed })
 			.then((result) => {
 				if ("_nay" in result) {
 					if (result._nay.name === "storage_full") {
@@ -1444,12 +1469,16 @@ export function MessageRow(props: MessageRow_Props) {
 					setRowError(result._nay.message);
 					return;
 				}
+				// The backend writes `<targetKey>:<token>:<actor>` and answers that key with the
+				// stored revision, so the local echo merges exactly like the old putOwned ack.
+				const key = typeof result._yay.key === "string" ? result._yay.key : `${doc.key}:${token}:${props.selfUserId}`;
+				const revision = typeof result._yay.revision === "number" ? result._yay.revision : 0;
 				props.onApplyReaction({
-					key: result._yay.key,
+					key,
 					targetKey: doc.key,
 					token,
 					createdBy: props.selfUserId,
-					revision: result._yay.revision,
+					revision,
 					updatedAt: Date.now(),
 					removed,
 				});
@@ -1750,6 +1779,7 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 		collection: "replies",
 		keyPrefix: chat_reply_key_prefix(root.key),
 		userId,
+		getAuthorName: () => memberNames.get(userId) ?? null,
 		onDelivered: (doc) => {
 			props.onApplyLocalReply(doc);
 		},
@@ -2782,6 +2812,7 @@ export function ChannelView(props: ChannelView_Props) {
 		collection: "messages",
 		keyPrefix: chat_message_key_prefix(channel.key),
 		userId,
+		getAuthorName: () => memberNames.get(userId) ?? null,
 		onDelivered: (doc) => {
 			messagesStoreRef.current?.apply_local(doc);
 			seenKeysRef.current?.add(doc.key);

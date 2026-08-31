@@ -42,6 +42,7 @@ import {
 	type chat_PublicUnread,
 } from "./chat-data";
 import { chat_create_window_store } from "./chat-store";
+import { chat_invoke_backend } from "./chat-invoke";
 import { ChannelView, type chat_MemberNamesApi } from "./channel-view";
 import { ChannelRowMenu } from "./channel-row-menu";
 import { Dialog } from "./dialog";
@@ -1440,11 +1441,14 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	publicChannelKeysRef.current = new Set(publicChannels.map((channel) => channel.key));
 	/** Hold the exact key and payload only while a create result may have committed. */
 	const pendingChannelCreateRef = useRef<{
+		/** Private creates mint the scope/channel key here; a public create's key comes back from the backend. */
 		key: string;
 		name: string;
 		topic: string;
 		isPrivate: boolean;
 		userIds: string[];
+		/** Public creates dedupe by this id in the backend, so an uncertain retry cannot create twice. */
+		clientRequestId: string;
 	} | null>(null);
 	const pendingPrivateCreateReconciliationRef = useRef<PendingPrivateCreateReconciliation | null>(null);
 	/** Hold one exact rename or archive until its uncertain result is settled. */
@@ -3366,8 +3370,10 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 	const handle_create_channel = (name: string, topic: string, people: { isPrivate: boolean; userIds: string[] }) => {
 		setDialogBusy(true);
 		setDialogError(null);
-		// Public channels need one put. Private channels create the scope, invitees, and this
-		// first shared document together, so a refusal cannot leave partial setup behind.
+		// Public channels go through the backend, which mints the key and dedupes by
+		// clientRequestId. Private channels still create the scope, invitees, and this first
+		// shared document together through the user door, so a refusal cannot leave partial
+		// setup behind; their transcript projection bootstraps on the first send.
 		const pending = pendingChannelCreateRef.current;
 		const retryingUncertain = channelCreateUncertain && pending !== null;
 		const attempt = retryingUncertain
@@ -3378,27 +3384,67 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 					topic,
 					isPrivate: people.isPrivate,
 					userIds: [...people.userIds],
+					clientRequestId: crypto.randomUUID(),
 				};
 		pendingChannelCreateRef.current = attempt;
 		setChannelCreateUncertain(false);
 		setChannelCreateReconciling(false);
 
 		(async (/* iife */) => {
+			const finish_created = (selectedKey: string) => {
+				// The sidebar shows the channel when the watch delivers it; select it now.
+				setSelectedKey(selectedKey);
+				// A channel this member just created has nothing unread, and the frozen cursor belongs
+				// to the channel they were reading before this one.
+				setOpenedAtLastReadAt(null);
+				close_dialog();
+			};
+
+			if (!attempt.isPrivate) {
+				const result = await chat_invoke_backend(client, "channel-manage", {
+					action: "create",
+					name: attempt.name,
+					topic: attempt.topic === "" ? null : attempt.topic,
+					clientRequestId: attempt.clientRequestId,
+				});
+				if ("_nay" in result) {
+					if (result._nay.name === "unavailable") {
+						setChannelCreateUncertain(true);
+						setChannelCreateReconciling(false);
+						setDialogBusy(false);
+						setDialogError(result._nay.message);
+						return;
+					}
+					pendingChannelCreateRef.current = null;
+					setChannelCreateUncertain(false);
+					setDialogBusy(false);
+					setDialogError(result._nay.message);
+					return;
+				}
+				const channelKey = result._yay.channelKey;
+				if (typeof channelKey !== "string") {
+					pendingChannelCreateRef.current = null;
+					setChannelCreateUncertain(false);
+					setDialogBusy(false);
+					setDialogError("The Chitchat backend answered without a channel key");
+					return;
+				}
+				finish_created(channelKey);
+				return;
+			}
+
 			const value = {
 				name: attempt.name,
 				archivedAt: null,
 				...(attempt.topic === "" ? {} : { topic: attempt.topic }),
 			} satisfies chat_ChannelValue;
-			// Keep a public retry create-only. It must never replace a row that was already stored.
-			const result = attempt.isPrivate
-				? await client.scopes.createWithDocument({
-						scopeId: attempt.key,
-						collections: chat_PRIVATE_CHANNEL_COLLECTIONS,
-						keyPrefix: attempt.key,
-						principals: attempt.userIds.map((userId) => ({ userId, level: "member" as const })),
-						document: { collection: "channels", key: attempt.key, value },
-					})
-				: await client.data.put({ collection: "channels", key: attempt.key, value, expectedRevision: 0 });
+			const result = await client.scopes.createWithDocument({
+				scopeId: attempt.key,
+				collections: chat_PRIVATE_CHANNEL_COLLECTIONS,
+				keyPrefix: attempt.key,
+				principals: attempt.userIds.map((userId) => ({ userId, level: "member" as const })),
+				document: { collection: "channels", key: attempt.key, value },
+			});
 			if ("_nay" in result) {
 				if (result._nay.name === "unavailable") {
 					setChannelCreateUncertain(true);
@@ -3407,9 +3453,9 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 					setDialogError(result._nay.message);
 					return;
 				}
-				// A public create-only conflict proves the same key was stored. A private scope may have
-				// changed or been released after that store, so read the exact current channel instead.
-				if (retryingUncertain && result._nay.name === "conflict" && attempt.isPrivate) {
+				// A private scope may have changed or been released after an uncertain store, so
+				// read the exact current channel instead.
+				if (retryingUncertain && result._nay.name === "conflict") {
 					const reconciliation: PendingPrivateCreateReconciliation = {
 						key: attempt.key,
 						running: false,
@@ -3425,21 +3471,13 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 					run_private_create_reconciliation(reconciliation);
 					return;
 				}
-				if (!(retryingUncertain && result._nay.name === "conflict")) {
-					pendingChannelCreateRef.current = null;
-					setChannelCreateUncertain(false);
-					setDialogBusy(false);
-					setDialogError(result._nay.message);
-					return;
-				}
+				pendingChannelCreateRef.current = null;
+				setChannelCreateUncertain(false);
+				setDialogBusy(false);
+				setDialogError(result._nay.message);
+				return;
 			}
-			// The sidebar shows the channel when the watch delivers it; select it now.
-			// (0.8.0 put results carry only revision and byteSize, so use the local key.)
-			setSelectedKey(attempt.key);
-			// A channel this member just created has nothing unread, and the frozen cursor belongs
-			// to the channel they were reading before this one.
-			setOpenedAtLastReadAt(null);
-			close_dialog();
+			finish_created(attempt.key);
 		})().catch((error: unknown) => {
 			setChannelCreateUncertain(true);
 			setChannelCreateReconciling(false);
@@ -3471,15 +3509,16 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 		}
 		setDialogBusy(true);
 		setDialogError(null);
-		client.data
-			// expectedRevision makes the write compare-and-set: a concurrent rename or archive
-			// from another member answers a conflict instead of being silently overwritten.
-			.put({
-				collection: "channels",
-				key: attempt.channelKey,
-				value: attempt.value,
-				expectedRevision: attempt.expectedRevision,
-			})
+		// The backend serializes channel updates on the installation lock and refreshes the
+		// projected transcript (README row, tail header) in the same run. The merged update is
+		// idempotent, so an uncertain retry repeats it safely.
+		chat_invoke_backend(client, "channel-manage", {
+			action: "update",
+			channelKey: attempt.channelKey,
+			name: attempt.value.name,
+			topic: attempt.value.topic ?? null,
+			archived: attempt.value.archivedAt !== null,
+		})
 			.then((result) => {
 				if ("_nay" in result) {
 					if (result._nay.name === "unavailable" || (retryingUncertain && result._nay.name === "conflict")) {
@@ -3519,13 +3558,7 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 			sourceRevision: channel.revision,
 			archived: false,
 		});
-		client.data
-			.put({
-				collection: "channels",
-				key: channel.key,
-				value: { ...channel.value, archivedAt: null },
-				expectedRevision: channel.revision,
-			})
+		chat_invoke_backend(client, "channel-manage", { action: "update", channelKey: channel.key, archived: false })
 			.then((result) => {
 				if ("_nay" in result) {
 					// Conflict and unavailable can race a committed winner. Let the watch settle them.

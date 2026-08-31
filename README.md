@@ -1,6 +1,6 @@
 # Bonobo Plugin Chitchat
 
-Team chat for a workspace, built entirely on the generic plugin surfaces: channels, messages, one-level threads, an 8-token reaction palette, and attachments that reference workspace files. Everything lives in the plugin's own document store; the page reads and writes through its own authenticated Convex client as the viewing member.
+Team chat for a workspace, built entirely on the generic plugin surfaces: channels, messages, one-level threads, an 8-token reaction palette, and attachments that reference workspace files. Everything lives in the plugin's own document store. The page reads through its own authenticated Convex client as the viewing member and writes `channels` and `cursors` directly; message, reply, and reaction writes go through the plugin's reviewed backend (see "Backend" below), which also renders each channel into a read-only Markdown transcript file in the workspace.
 
 ## Data model
 
@@ -19,7 +19,7 @@ The page watches at most eight private scopes. It reserves one of those slots fo
 
 The App tracks every message and reply append, edit, and delete, including retries, by channel. While a request is in flight, channel, view, and thread controls that would unmount its state are disabled. Their handlers also refuse a stale or scripted click and announce why. Leave and Delete refuse before any scope change. An `unavailable` append result is uncertain because the write may have committed. The queue stays in flight and replays the exact client request id and payload with bounded backoff until the store gives a definite result. An uncertain edit or delete keeps its exact value, timestamp, and revision locked for Retry or Cancel until a newer watch value settles it. A definite failure unlocks navigation but keeps the draft or failed append visible, so the member can retry or choose to navigate away. The durable scope activity is the unread source after a stored append, even when the sender reloads or leaves before receiving the result.
 
-Every principal can use **Leave**. A manager also gets **Delete for everyone**. Both actions wait for an in-flight send in that channel to settle, then change the scope directly. They do not write the channel document. The confirmation reads and freezes the current principal count. Exact `{ _yay: null }` uses the honest unknown-count copy and may continue without a count. An unavailable or malformed count shows Retry and keeps the destructive action disabled. When a count is known, the write sends it back so a membership change cannot turn the confirmed result into a different result. A successful non-delete Leave waits until `watchMine` omits that scope. If a manager already added the member back, a greater `membershipRevision` than the definite Leave result keeps the live channel. After an `unavailable` or thrown result, Chitchat reads that exact private channel through the authenticated HTTP door. A valid null proves this member has no current read. A valid channel is followed by an exact principal Result because the organization owner can still read it without a scope grant. If an exact list includes this member, Retry unlocks. If it excludes this member or is exact `{ _yay: null }`, Leave settles as left. Delete still says it could not be confirmed because caller absence does not prove global deletion. Failed, malformed, or wrong-channel reads and unavailable or malformed principal Results retry with bounded backoff. Cached or higher-revision scope rows cannot settle this check because another principal's change can raise the revision. After exact departure, the scope stays hidden until a fresh exact channel and exact principal list includes this member; exact null stops that re-add proof, while unavailable or malformed Results retry with bounded backoff. Cancel or unmount stops the check. The people dialog keeps exact null separate from a failed read and offers Retry after an unavailable or malformed result. It reloads the current principals after an unavailable membership change. Leaving as the last principal deletes the scope. Both delete paths release access and archive projected files, but the plugin documents stay stored until uninstall.
+Every principal can use **Leave**. A manager also gets **Delete for everyone**. Both actions wait for an in-flight send in that channel to settle, then change the scope directly. They do not write the channel document. The confirmation reads and freezes the current principal count. Exact `{ _yay: null }` uses the honest unknown-count copy and may continue without a count. An unavailable or malformed count shows Retry and keeps the destructive action disabled. When a count is known, the write sends it back so a membership change cannot turn the confirmed result into a different result. A successful non-delete Leave waits until `watchMine` omits that scope. If a manager already added the member back, a greater `membershipRevision` than the definite Leave result keeps the live channel. After an `unavailable` or thrown result, Chitchat reads that exact private channel through the authenticated HTTP door. A valid null proves this member has no current read. A valid channel is followed by an exact principal Result because the organization owner can still read it without a scope grant. If an exact list includes this member, Retry unlocks. If it excludes this member or is exact `{ _yay: null }`, Leave settles as left. Delete still says it could not be confirmed because caller absence does not prove global deletion. Failed, malformed, or wrong-channel reads and unavailable or malformed principal Results retry with bounded backoff. Cached or higher-revision scope rows cannot settle this check because another principal's change can raise the revision. After exact departure, the scope stays hidden until a fresh exact channel and exact principal list includes this member; exact null stops that re-add proof, while unavailable or malformed Results retry with bounded backoff. Cancel or unmount stops the check. The people dialog keeps exact null separate from a failed read and offers Retry after an unavailable or malformed result. It reloads the current principals after an unavailable membership change. Leaving as the last principal deletes the scope. Both delete paths release access and archive the channel's transcript files, but the plugin documents stay stored until uninstall.
 
 ### Seam contract (how the page stitches reads)
 
@@ -31,6 +31,41 @@ Every principal can use **Leave**. A manager also gets **Delete for everyone**. 
 - A companion list says whether it still covers a row. Known groups and counts still render even when the HTTP frontier has not reached that row. A healthy reaction read that is pending or has not reached the row stays neutral instead of saying unavailable or "nobody reacted". A failed or dead read still says reactions are unavailable. On an uncovered row the member can still **add** a reaction — `putOwned` writes their own key — but **removing** one stays hidden with its chip.
 - Every document read from a watch, a feed, or an HTTP page is runtime-validated (Zod) before use; invalid or foreign documents are dropped.
 - Slot spend with a channel open is still 8 + N (N ≤ 8 watched private scopes): page rails 4 + N, one messages window, three change feeds. The feeds replace the old reactions window, replies window, and thread watch, so the page stays inside 16 slots. Server subscriptions at that worst case stay under the 100-subscription backstop (16 × 6 = 96 is the honest max).
+
+## Backend (invoke endpoints and transcript files)
+
+Since 0.6.0 the plugin ships a reviewed backend (`dist/backend/worker.js`, source `src/backend/`:
+`worker.ts` routes, `markdown.ts` rendering, `state.ts` per-channel state docs, `host.ts` door
+calls). The manifest declares seven endpoints, all `serialization: "installation"` so at most one
+run mutates the installation's transcripts at a time:
+
+- `message-send` (`/messages/send`), `reply-send` (`/replies/send`) — commit the store append, then
+  append the block to the channel transcript in the same run.
+- `message-edit` (`/messages/edit`), `message-delete` (`/messages/delete`) — CAS the store document,
+  then rewrite its block (`(edited)` / `(message deleted)`).
+- `reaction-toggle` (`/reactions/toggle`) — write the owned reaction marker, then update the block's
+  `reactions:` line.
+- `channel-manage` (`/channels/manage`) — create, ensure, and update (rename/topic/archive); archive archives
+  the channel's transcript folder or file through `plugin-archive`.
+- `reconcile` (`/reconcile`) — rebuild a channel transcript from the store. The store and the file
+  system commit separately, so a run can crash between them; the store is the source of truth and
+  reconcile heals the file. Over the page caps it degrades to a truncated tail rebuild.
+
+The page calls these through `client.backend.invoke`, wrapped in `src/chat-invoke.ts`: it waits out
+`busy` answers (serialization lock and invoke rate bucket, both with `retryAfterMs`), maps the
+relayed JSON into the `_yay`/`_nay` shape the write machinery speaks, and keeps `unavailable` as a
+replay-with-same-client-request-id case exactly like the old append door. Because of this,
+`userWritableCollections` narrows the user-write door to `channels` + `cursors`; the store refuses a
+page write to `messages`, `replies`, or `reactions`. `channels` stays user-writable because private
+create writes the channel document from the page via `scopes.createWithDocument` — a known gap.
+
+Transcript layout, all files plugin-owned and read-only: public channels at `/chitchat/<slug>.md`
+plus a `README.md` index; each private channel under `/chitchat/private/<slug>-<digest8>/` where
+the digest is the first 8 hex chars of SHA-256 of the channel key — two same-named private channels
+get separate folders, and a guessed name cannot be confirmed by probing. The private folder is
+bound to the channel's data scope (`access.readScopeId`), so exactly the channel's members (and the
+organization owner) can read it. If `/chitchat` is taken by a member folder, the root falls back to
+a workspace-digest suffix.
 
 ## Known limits (accepted for the MVP)
 

@@ -54,6 +54,14 @@ export function chat_key_timestamp(key: string): number | null {
 }
 
 /**
+ * The 13-digit inverted-timestamp segment of an appended key — the exact inverse of
+ * `chat_key_timestamp`. The backend mints message and reply keys with it.
+ */
+export function chat_inverted_ms(nowMs: number): string {
+	return String(INVERTED_MS_COMPLEMENT - nowMs).padStart(13, "0");
+}
+
+/**
  * What a private channel's key starts with, and what its scope covers.
  *
  * A private channel is not a different kind of channel. It is an ordinary channel whose key sits
@@ -271,6 +279,23 @@ export const chat_message_value_schema = z.object({
 });
 
 export type chat_MessageValue = z.infer<typeof chat_message_value_schema>;
+
+/**
+ * The backend invoke endpoints, shared between the manifest, the worker router, and the page's
+ * `client.backend.invoke` calls. Every endpoint runs under the one installation-wide
+ * serialization lock so transcript read-modify-write stays ordered.
+ */
+export const chat_BACKEND_ENDPOINTS = [
+	{ id: "message-send", path: "/messages/send" },
+	{ id: "message-edit", path: "/messages/edit" },
+	{ id: "message-delete", path: "/messages/delete" },
+	{ id: "reply-send", path: "/replies/send" },
+	{ id: "reaction-toggle", path: "/reactions/toggle" },
+	{ id: "channel-manage", path: "/channels/manage" },
+	{ id: "reconcile", path: "/reconcile" },
+] as const;
+
+export type chat_BackendEndpointId = (typeof chat_BACKEND_ENDPOINTS)[number]["id"];
 
 /**
  * Label used when a roster row has no profile name. That includes a member who signed in

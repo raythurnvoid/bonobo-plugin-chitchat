@@ -179,6 +179,25 @@ function window_update(docs: unknown[], overrides: Partial<Omit<WindowUpdate, "d
 type WriteResult = { _yay: { key: string; revision: number } } | { _nay: { name?: string; message: string } };
 type AppendOpts = { collection: string; keyPrefix?: string; value: Record<string, unknown>; clientRequestId?: string };
 type PutOpts = { collection: string; key: string; value: Record<string, unknown>; expectedRevision?: number };
+type InvokeOpts = { endpoint: string; input: Record<string, unknown> };
+type InvokeResult =
+	| { _yay: { runId: string; pluginStatus: number; output: string; outputTruncated: boolean } }
+	| { _nay: { name: string; message: string; retryAfterMs?: number } };
+
+/** Wraps a backend answer the way the invoke door delivers a finished run: the body as JSON text. */
+function invoke_ok(body: Record<string, unknown>, pluginStatus = 200): InvokeResult {
+	return { _yay: { runId: "run1", pluginStatus, output: JSON.stringify(body), outputTruncated: false } };
+}
+
+/** A relayed backend refusal: a non-2xx pluginStatus still resolves `_yay`, not `_nay`. */
+function invoke_refused(pluginStatus: number, message: string): InvokeResult {
+	return invoke_ok({ message }, pluginStatus);
+}
+
+/** A door-level failure — busy, denied, unavailable — where the run may never have started. */
+function invoke_nay(name: string, message: string, retryAfterMs?: number): InvokeResult {
+	return { _nay: { name, message, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) } };
+}
 type KeyOpts = { collection: string; key: string };
 type MembersListResult =
 	| { _yay: { members: { userId: string; displayName: string | null }[]; cursor: string | null } }
@@ -294,6 +313,40 @@ function make_harness() {
 			remove: vi.fn<(opts: KeyOpts) => Promise<WriteResult>>(async () => ({ _yay: { key: "k", revision: 1 } })),
 			putOwned: vi.fn<(opts: PutOpts) => Promise<WriteResult>>(async () => ({ _yay: { key: "k", revision: 1 } })),
 			removeOwned: vi.fn<(opts: KeyOpts) => Promise<WriteResult>>(async () => ({ _yay: { key: "k", revision: 1 } })),
+		},
+		backend: {
+			// Messages, replies, reactions, and channel create/update go through the plugin backend
+			// now. The defaults mirror what the worker answers on a clean run; a test overrides the
+			// mock for refusals, lost answers, and replay checks.
+			invoke: vi.fn<(opts: InvokeOpts) => Promise<InvokeResult>>(async (opts) => {
+				const input = opts.input;
+				switch (opts.endpoint) {
+					case "message-send":
+						return invoke_ok({ messageKey: `${input.channelKey}:${inv(50_000)}:sent` });
+					case "reply-send":
+						return invoke_ok({ messageKey: `${input.rootMessageKey}:${inv(50_000)}:sent`, transcriptUpdated: true });
+					case "message-edit":
+					case "message-delete":
+						// Like the put mock above: the answered revision jumps so a test cannot pass by
+						// guessing "mine plus one" instead of reading the one the backend stored.
+						return invoke_ok({ transcriptUpdated: true, revision: (putRevision += 10) });
+					case "reaction-toggle":
+						return invoke_ok({
+							transcriptUpdated: true,
+							key: `${input.targetKey}:${input.token}:user_me`,
+							revision: 1,
+						});
+					case "channel-manage":
+						if (input.action === "create") {
+							return invoke_ok({ channelKey: crypto.randomUUID() });
+						}
+						return invoke_ok({});
+					case "reconcile":
+						return invoke_ok({ done: true });
+					default:
+						return invoke_refused(404, "Unknown endpoint");
+				}
+			}),
 		},
 		members: {
 			resolve: vi.fn(async (ids: string[]) => Object.fromEntries(ids.map((id) => [id, names[id] ?? null]))),
@@ -521,6 +574,13 @@ function list_calls(h: ReturnType<typeof make_harness>, collection?: string) {
 
 function http_page(documents: unknown[], isDone: boolean) {
 	return { documents, cursor: null, isDone };
+}
+
+/** The invoke calls the page made, optionally narrowed to one endpoint, as their `{endpoint, input}` opts. */
+function invoke_calls(h: ReturnType<typeof make_harness>, endpoint?: string) {
+	return h.raw.backend.invoke.mock.calls
+		.map(([opts]) => opts)
+		.filter((opts) => endpoint === undefined || opts.endpoint === endpoint);
 }
 
 function file_calls(h: ReturnType<typeof make_harness>, path: string) {
@@ -796,8 +856,8 @@ test("a narrow resize keeps focus in an open drawer that stays visible", async (
 
 test("a narrow resize focuses the thread region while its Back button is disabled", async () => {
 	const h = make_harness();
-	const ack = deferred<{ _yay: { key: string; revision: number } }>();
-	h.raw.data.append.mockReturnValueOnce(ack.promise);
+	const ack = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(ack.promise);
 	set_viewport_narrow(false);
 	await boot(h);
 	const message = message_doc(1_000, { rand: "thread", text: "thread root" });
@@ -809,7 +869,7 @@ test("a narrow resize focuses the thread region while its Back button is disable
 	const replyBox = within(thread).getByRole("combobox", { name: "Reply in thread" });
 	fireEvent.input(replyBox, { target: { value: "pending reply" } });
 	fireEvent.keyDown(replyBox, { key: "Enter" });
-	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(1));
+	await waitFor(() => expect(invoke_calls(h, "reply-send")).toHaveLength(1));
 	const back = within(thread).getByRole("button", { name: "Close thread" });
 	expect(back.hasAttribute("disabled")).toBe(true);
 
@@ -820,7 +880,7 @@ test("a narrow resize focuses the thread region while its Back button is disable
 	await waitFor(() => expect(document.activeElement).toBe(thread));
 
 	await act(async () => {
-		ack.resolve({ _yay: { key: "reply", revision: 1 } });
+		ack.resolve(invoke_ok({ messageKey: `${message.key}:${inv(2_000)}:rply` }));
 		await ack.promise;
 	});
 });
@@ -963,11 +1023,13 @@ test("a rename carries the channel topic and an emptied topic is removed", async
 
 	fireEvent.input(topicBox, { target: { value: "daily standups" } });
 	fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
-	expect(h.raw.data.put.mock.calls[0][0].value).toEqual({
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(1));
+	expect(invoke_calls(h, "channel-manage")[0]!.input).toEqual({
+		action: "update",
+		channelKey: CH1_KEY,
 		name: "general",
-		archivedAt: null,
 		topic: "daily standups",
+		archived: false,
 	});
 });
 
@@ -1046,7 +1108,7 @@ test("an unavailable messages window tells the member to check the connection an
 	expect(alert.textContent).not.toContain("connection returns");
 });
 
-test("create channel dialog validates the name and puts a shared doc under a client key", async () => {
+test("create channel dialog validates the name and sends the create through the backend", async () => {
 	const h = make_harness();
 	await boot(h, []);
 
@@ -1057,28 +1119,26 @@ test("create channel dialog validates the name and puts a shared doc under a cli
 	// Empty name refused locally, nothing sent.
 	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
 	expect(await within(dialog).findByRole("alert")).toBeTruthy();
-	expect(h.raw.data.put).not.toHaveBeenCalled();
+	expect(h.raw.backend.invoke).not.toHaveBeenCalled();
 
 	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "general" } });
 	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
-	// Creation goes through put with a client-generated key, so the doc is SHARED and any
-	// member can rename or archive it later. append (owner-locked docs) must not be used.
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
-	const call = h.raw.data.put.mock.calls[0][0];
-	expect(call.collection).toBe("channels");
-	expect(typeof call.key).toBe("string");
-	expect(call.key.length).toBeGreaterThan(0);
-	expect(call.value).toEqual({ name: "general", archivedAt: null });
-	expect(call.expectedRevision).toBe(0);
+	// The backend mints the key and writes the channel doc shared, so any member can rename
+	// or archive it later. The page itself no longer writes channel docs for public channels.
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(1));
+	const call = invoke_calls(h, "channel-manage")[0]!;
+	expect(call.input.action).toBe("create");
+	expect(call.input.name).toBe("general");
+	expect(call.input.topic).toBeNull();
+	expect(typeof call.input.clientRequestId).toBe("string");
+	expect(h.raw.data.put).not.toHaveBeenCalled();
 	expect(h.raw.data.append).not.toHaveBeenCalled();
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 });
 
-test("an unavailable public create retries the same create-only put and treats a conflict as committed", async () => {
+test("an unavailable public create retries the same create request, which the backend dedupes", async () => {
 	const h = make_harness();
-	h.raw.data.put
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost after send" } })
-		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Channel already exists" } });
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
 	await boot(h, []);
 
 	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
@@ -1099,16 +1159,17 @@ test("an unavailable public create retries the same create-only put and treats a
 	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
 	fireEvent.click(retry);
 
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
-	const first = h.raw.data.put.mock.calls[0]![0];
-	expect(first.expectedRevision).toBe(0);
-	expect(h.raw.data.put.mock.calls[1]![0]).toEqual(first);
+	// The retry repeats the exact request. The same clientRequestId lets the backend answer the
+	// already-committed create instead of making a second channel.
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(2));
+	const [first, second] = invoke_calls(h, "channel-manage");
+	expect(second!.input).toEqual(first!.input);
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 });
 
-test("a first public create conflict unlocks the form and a new submit uses a fresh key", async () => {
+test("a first public create conflict unlocks the form and a new submit uses a fresh request", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Channel already exists" } });
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "Channel already exists"));
 	await boot(h, []);
 
 	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
@@ -1127,16 +1188,14 @@ test("a first public create conflict unlocks the form and a new submit uses a fr
 	fireEvent.input(name, { target: { value: "random" } });
 	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
 
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
-	const first = h.raw.data.put.mock.calls[0]![0];
-	const second = h.raw.data.put.mock.calls[1]![0];
-	expect(second.key).not.toBe(first.key);
-	expect(second.value).toEqual({ name: "random", archivedAt: null });
-	expect(second.expectedRevision).toBe(0);
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(2));
+	const [first, second] = invoke_calls(h, "channel-manage");
+	expect(second!.input.clientRequestId).not.toBe(first!.input.clientRequestId);
+	expect(second!.input.name).toBe("random");
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 });
 
-test("a non-creator can rename a channel: the shared put succeeds and the dialog closes", async () => {
+test("a non-creator can rename a channel: the backend update succeeds and the dialog closes", async () => {
 	const h = make_harness();
 	// The channel was created by another member; channel docs are shared, so the rename
 	// from this member (user_me) goes through.
@@ -1147,21 +1206,20 @@ test("a non-creator can rename a channel: the shared put succeeds and the dialog
 	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "renamed" } });
 	fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
 
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
-	expect(h.raw.data.put.mock.calls[0][0]).toEqual({
-		collection: "channels",
-		key: CH1_KEY,
-		value: { name: "renamed", archivedAt: null },
-		expectedRevision: 1,
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(1));
+	expect(invoke_calls(h, "channel-manage")[0]!.input).toEqual({
+		action: "update",
+		channelKey: CH1_KEY,
+		name: "renamed",
+		topic: null,
+		archived: false,
 	});
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 });
 
-test("rename is compare-and-set: a conflict keeps the dialog open with a clear error", async () => {
+test("a rename conflict keeps the dialog open with a clear error", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({
-		_nay: { name: "conflict", message: "This document changed since it was read" },
-	});
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 	await boot(h, [{ ...channel_doc(CH1_KEY, "general"), revision: 4 }]);
 
 	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
@@ -1169,15 +1227,9 @@ test("rename is compare-and-set: a conflict keeps the dialog open with a clear e
 	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "renamed" } });
 	fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
 
-	// The put carries the revision the dialog captured, so a concurrent rename conflicts
-	// instead of being silently overwritten.
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
-	expect(h.raw.data.put.mock.calls[0][0]).toEqual({
-		collection: "channels",
-		key: CH1_KEY,
-		value: { name: "renamed", archivedAt: null },
-		expectedRevision: 4,
-	});
+	// A backend conflict means a concurrent change won; the dialog says so instead of
+	// silently overwriting.
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(1));
 	const alert = await within(dialog).findByRole("alert");
 	expect(alert.textContent).toContain("Someone else changed this channel");
 	expect(screen.getByRole("dialog")).toBeTruthy();
@@ -1188,15 +1240,11 @@ test.each(["unavailable", "thrown"] as const)(
 	async (failure) => {
 		const h = make_harness();
 		if (failure === "unavailable") {
-			h.raw.data.put.mockResolvedValueOnce({
-				_nay: { name: "unavailable", message: "Connection lost after send" },
-			});
+			h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
 		} else {
-			h.raw.data.put.mockRejectedValueOnce(new Error("Connection lost after send"));
+			h.raw.backend.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
 		}
-		h.raw.data.put.mockResolvedValueOnce({
-			_nay: { name: "conflict", message: "This document changed since it was read" },
-		});
+		h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 		await boot(h);
 
 		fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
@@ -1213,9 +1261,9 @@ test.each(["unavailable", "thrown"] as const)(
 		expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
 		fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
 
-		await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
-		const first = h.raw.data.put.mock.calls[0]![0];
-		expect(h.raw.data.put.mock.calls[1]![0]).toEqual(first);
+		await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(2));
+		const [firstUpdate, retryUpdate] = invoke_calls(h, "channel-manage");
+		expect(retryUpdate!.input).toEqual(firstUpdate!.input);
 		h.find_watch("channels")!.onUpdate(
 			watch_update([{ ...channel_doc(CH1_KEY, "renamed", null, { topic: "daily updates" }), revision: 2 }]),
 		);
@@ -1226,9 +1274,7 @@ test.each(["unavailable", "thrown"] as const)(
 
 test("an uncertain rename settles when its name and topic arrive with a concurrent archive", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "Connection lost after send" },
-	});
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
 	await boot(h);
 
 	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
@@ -1247,8 +1293,8 @@ test("an uncertain rename settles when its name and topic arrive with a concurre
 
 test("Escape cannot dismiss a channel-name dialog while its write is pending", async () => {
 	const h = make_harness();
-	const pendingPut = deferred<WriteResult>();
-	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	const pendingInvoke = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h);
 
 	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
@@ -1261,14 +1307,14 @@ test("Escape cannot dismiss a channel-name dialog while its write is pending", a
 
 	fireEvent.keyDown(dialog, { key: "Escape" });
 	expect(screen.getByRole("dialog")).toBe(dialog);
-	pendingPut.resolve({ _yay: { key: CH1_KEY, revision: 2 } });
+	pendingInvoke.resolve(invoke_ok({}));
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 });
 
 test("Escape cannot dismiss the archive dialog while its write is pending", async () => {
 	const h = make_harness();
-	const pendingPut = deferred<WriteResult>();
-	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	const pendingInvoke = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h);
 
 	fireEvent.click(await open_channel_menu_item("general", "Archive #general"));
@@ -1278,7 +1324,7 @@ test("Escape cannot dismiss the archive dialog while its write is pending", asyn
 
 	fireEvent.keyDown(dialog, { key: "Escape" });
 	expect(screen.getByRole("dialog")).toBe(dialog);
-	pendingPut.resolve({ _yay: { key: CH1_KEY, revision: 2 } });
+	pendingInvoke.resolve(invoke_ok({}));
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 });
 
@@ -1290,15 +1336,11 @@ test.each([
 	async (testCase) => {
 		const h = make_harness();
 		if (testCase.failure === "unavailable") {
-			h.raw.data.put.mockResolvedValueOnce({
-				_nay: { name: "unavailable", message: "Connection lost after send" },
-			});
+			h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
 		} else {
-			h.raw.data.put.mockRejectedValueOnce(new Error("Connection lost after send"));
+			h.raw.backend.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
 		}
-		h.raw.data.put.mockResolvedValueOnce({
-			_nay: { name: "conflict", message: "This document changed since it was read" },
-		});
+		h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 		await boot(h);
 
 		fireEvent.click(await open_channel_menu_item("general", "Archive #general"));
@@ -1309,17 +1351,16 @@ test.each([
 		expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
 		fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
 
-		await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
-		const first = h.raw.data.put.mock.calls[0]![0];
-		expect(h.raw.data.put.mock.calls[1]![0]).toEqual(first);
-		const archivedAt = first.value.archivedAt as number;
+		await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(2));
+		const [firstUpdate, retryUpdate] = invoke_calls(h, "channel-manage");
+		expect(retryUpdate!.input).toEqual(firstUpdate!.input);
 		h.find_watch("channels")!.onUpdate(
 			watch_update([
 				{
 					...channel_doc(
 						CH1_KEY,
 						testCase.matchingWatch ? "general" : "renamed",
-						testCase.matchingWatch ? archivedAt + 1 : null,
+						testCase.matchingWatch ? 123 : null,
 					),
 					revision: 2,
 				},
@@ -1339,8 +1380,8 @@ test.each([
 
 test("keyboard archive repairs focus after the channel watch moves the row", async () => {
 	const h = make_harness();
-	const pendingPut = deferred<WriteResult>();
-	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	const pendingInvoke = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1351,9 +1392,9 @@ test("keyboard archive repairs focus after the channel watch moves the row", asy
 	const confirm = within(dialog).getByRole("button", { name: "Archive channel" });
 	confirm.focus();
 	fireEvent.click(confirm);
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(1));
 
-	pendingPut.resolve({ _yay: { key: CH1_KEY, revision: 2 } });
+	pendingInvoke.resolve(invoke_ok({}));
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 	h.find_watch("channels")!.onUpdate(watch_update([{ ...channel_doc(CH1_KEY, "general", 123), revision: 2 }]));
 
@@ -1363,19 +1404,19 @@ test("keyboard archive repairs focus after the channel watch moves the row", asy
 
 test("keyboard unarchive repairs focus after the channel watch moves the row", async () => {
 	const h = make_harness();
-	const pendingPut = deferred<WriteResult>();
-	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	const pendingInvoke = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
 	const unarchive = await open_channel_menu_item("old-stuff", "Unarchive #old-stuff");
 	unarchive.focus();
 	fireEvent.click(unarchive);
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(1));
 
 	await act(async () => {
-		pendingPut.resolve({ _yay: { key: CH2_KEY, revision: 2 } });
-		await pendingPut.promise;
+		pendingInvoke.resolve(invoke_ok({}));
+		await pendingInvoke.promise;
 	});
 	h.find_watch("channels")!.onUpdate(
 		watch_update([channel_doc(CH1_KEY, "general"), { ...channel_doc(CH2_KEY, "old-stuff"), revision: 2 }]),
@@ -1390,7 +1431,7 @@ test("a delayed unarchive watch keeps focus on the control the member moved to",
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
 
 	fireEvent.click(await open_channel_menu_item("old-stuff", "Unarchive #old-stuff"));
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(1));
 	const create = screen.getByRole("button", { name: "Create channel" });
 	create.focus();
 
@@ -1404,7 +1445,7 @@ test("a delayed unarchive watch keeps focus on the control the member moved to",
 
 test("archive repairs focus when its response is lost before the committed watch update", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost after send" } });
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
 	await boot(h);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1427,7 +1468,7 @@ test("archive repairs focus when its response is lost before the committed watch
 
 test("unarchive repairs focus when its response is lost before the committed watch update", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost after send" } });
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
 	const utils = await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1446,9 +1487,7 @@ test("unarchive repairs focus when its response is lost before the committed wat
 
 test("archive conflict repairs focus when the winner arrives through the watch", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({
-		_nay: { name: "conflict", message: "This document changed since it was read" },
-	});
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 	await boot(h);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1467,9 +1506,7 @@ test("archive conflict repairs focus when the winner arrives through the watch",
 
 test("unarchive conflict repairs focus when the winner arrives through the watch", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({
-		_nay: { name: "conflict", message: "This document changed since it was read" },
-	});
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 	const utils = await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1488,7 +1525,7 @@ test("unarchive conflict repairs focus when the winner arrives through the watch
 
 test("a missing background private channel settles unarchive and repairs focus", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost after send" } });
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
 	const utils = await boot_sidebar(
 		h,
 		[channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans", 123)],
@@ -1510,10 +1547,10 @@ test("a missing background private channel settles unarchive and repairs focus",
 
 test("one conflicted unarchive cannot remove an overlapping successful request's focus repair", async () => {
 	const h = make_harness();
-	const successfulPut = deferred<WriteResult>();
-	h.raw.data.put
-		.mockReturnValueOnce(successfulPut.promise)
-		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This document changed since it was read" } });
+	const successfulInvoke = deferred<InvokeResult>();
+	h.raw.backend.invoke
+		.mockReturnValueOnce(successfulInvoke.promise)
+		.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1524,11 +1561,11 @@ test("one conflicted unarchive cannot remove an overlapping successful request's
 	const second = await open_channel_menu_item("old-stuff", "Unarchive #old-stuff");
 	second.focus();
 	fireEvent.click(second);
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(2));
 
 	await act(async () => {
-		successfulPut.resolve({ _yay: { key: CH2_KEY, revision: 2 } });
-		await successfulPut.promise;
+		successfulInvoke.resolve(invoke_ok({}));
+		await successfulInvoke.promise;
 	});
 	h.find_watch("channels")!.onUpdate(
 		watch_update([channel_doc(CH1_KEY, "general"), { ...channel_doc(CH2_KEY, "old-stuff"), revision: 2 }]),
@@ -1540,7 +1577,7 @@ test("one conflicted unarchive cannot remove an overlapping successful request's
 
 test("a newer opposite update discards an uncertain move without stealing focus later", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockRejectedValueOnce(new Error("Connection lost after send"));
+	h.raw.backend.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
 	await boot(h);
 
 	fireEvent.click(await open_channel_menu_item("general", "Archive #general"));
@@ -1791,7 +1828,7 @@ test("an incomplete messages window says the view may be stale, not that message
 
 // #region send flow
 
-test("Enter sends, Shift+Enter does not, and the send appends under the channel prefix", async () => {
+test("Enter sends, Shift+Enter does not, and the send invokes the backend under the channel key", async () => {
 	const h = make_harness();
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
@@ -1799,20 +1836,23 @@ test("Enter sends, Shift+Enter does not, and the send appends under the channel 
 	const input = await screen.findByRole("combobox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "line one" } });
 	fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
-	expect(h.raw.data.append).not.toHaveBeenCalled();
+	expect(h.raw.backend.invoke).not.toHaveBeenCalled();
 
 	fireEvent.keyDown(input, { key: "Enter" });
-	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(1));
-	const call = h.raw.data.append.mock.calls[0][0];
-	expect(call.collection).toBe("messages");
-	expect(call.keyPrefix).toBe(`${CH1_KEY}:`);
-	expect(call.value).toEqual({ text: "line one", attachments: [], editedAt: null, deletedAt: null });
+	await waitFor(() => expect(invoke_calls(h, "message-send")).toHaveLength(1));
+	const call = invoke_calls(h, "message-send")[0]!;
+	expect(call.input.channelKey).toBe(CH1_KEY);
+	expect(call.input.text).toBe("line one");
+	expect(call.input.attachments).toEqual([]);
+	expect(call.input.mentions).toEqual([]);
+	expect(typeof call.input.clientRequestId).toBe("string");
+	expect(h.raw.data.append).not.toHaveBeenCalled();
 });
 
 test("an in-flight send disables Send, shows the pending row, and the ack keeps the message", async () => {
 	const h = make_harness();
-	const ack = deferred<{ _yay: { key: string; revision: number } }>();
-	h.raw.data.append.mockReturnValueOnce(ack.promise);
+	const ack = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(ack.promise);
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
@@ -1824,7 +1864,7 @@ test("an in-flight send disables Send, shows the pending row, and the ack keeps 
 	expect(await screen.findAllByText("Sending…")).toBeTruthy();
 	await waitFor(() => expect(screen.getByRole("button", { name: "Sending…" }).hasAttribute("disabled")).toBe(true));
 
-	ack.resolve({ _yay: { key: `${CH1_KEY}:${inv(9_000)}:sent`, revision: 1 } });
+	ack.resolve(invoke_ok({ messageKey: `${CH1_KEY}:${inv(9_000)}:sent` }));
 	await waitFor(() => {
 		expect(screen.queryByText("Sending…")).toBeNull();
 		expect(screen.getByText("hello there")).toBeTruthy();
@@ -1834,8 +1874,8 @@ test("an in-flight send disables Send, shows the pending row, and the ack keeps 
 
 test("an in-flight top-level send blocks a channel switch, and a late failure keeps Retry visible", async () => {
 	const h = make_harness();
-	const ack = deferred<{ _yay: { key: string; revision: number } }>();
-	h.raw.data.append.mockReturnValueOnce(ack.promise);
+	const ack = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(ack.promise);
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
@@ -1856,8 +1896,9 @@ test("an in-flight top-level send blocks a channel switch, and a late failure ke
 	).toBeTruthy();
 	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(true));
 
+	// A definite refusal, not a lost answer: unavailable would replay silently instead of failing.
 	await act(async () => {
-		ack.reject(new Error("late top-level failed"));
+		ack.resolve(invoke_refused(500, "late top-level failed"));
 		await Promise.resolve();
 	});
 	const failedRow = screen.getByText("late top-level send").closest(".message") as HTMLElement;
@@ -1866,12 +1907,9 @@ test("an in-flight top-level send blocks a channel switch, and a late failure ke
 	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(false));
 });
 
-test("a failed send surfaces the _nay message and Retry reuses the same clientRequestId", async () => {
+test("a failed send surfaces the refusal message and Retry reuses the same clientRequestId", async () => {
 	const h = make_harness();
-	h.raw.data.append
-		.mockResolvedValueOnce({ _nay: { message: "Rate limited — try again in a few seconds" } })
-		.mockResolvedValueOnce({ _yay: { key: `${CH1_KEY}:${inv(9_000)}:sent`, revision: 1 } })
-		.mockResolvedValueOnce({ _yay: { key: `${CH1_KEY}:${inv(9_100)}:snd2`, revision: 1 } });
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(429, "Rate limited — try again in a few seconds"));
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
@@ -1883,27 +1921,27 @@ test("a failed send surfaces the _nay message and Retry reuses the same clientRe
 	expect(alert.textContent).toContain("Rate limited — try again in a few seconds");
 
 	fireEvent.click(screen.getByRole("button", { name: "Retry sending message" }));
-	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(2));
-	// The retry replays the SAME logical send: identical clientRequestId, so the door
+	await waitFor(() => expect(invoke_calls(h, "message-send")).toHaveLength(2));
+	// The retry replays the SAME logical send: identical clientRequestId, so the backend
 	// dedupes instead of writing twice.
-	const firstId = h.raw.data.append.mock.calls[0][0].clientRequestId;
-	const retryId = h.raw.data.append.mock.calls[1][0].clientRequestId;
+	const sends = invoke_calls(h, "message-send");
+	const firstId = sends[0]!.input.clientRequestId;
 	expect(typeof firstId).toBe("string");
-	expect(retryId).toBe(firstId);
+	expect(sends[1]!.input.clientRequestId).toBe(firstId);
 
 	// A fresh send mints a fresh id.
 	await waitFor(() => expect(screen.queryByText("Sending…")).toBeNull());
 	fireEvent.input(input, { target: { value: "second message" } });
 	fireEvent.keyDown(input, { key: "Enter" });
-	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(3));
-	expect(h.raw.data.append.mock.calls[2][0].clientRequestId).not.toBe(firstId);
+	await waitFor(() => expect(invoke_calls(h, "message-send")).toHaveLength(3));
+	expect(invoke_calls(h, "message-send")[2]!.input.clientRequestId).not.toBe(firstId);
 });
 
 test("a storage_full refusal becomes one announced channel state and stops the composer", async () => {
 	const h = make_harness();
-	h.raw.data.append.mockResolvedValueOnce({
-		_nay: { name: "storage_full", message: "This plugin has used its 10000 document slots" },
-	});
+	h.raw.backend.invoke.mockResolvedValueOnce(
+		invoke_nay("storage_full", "This plugin has used its 10000 document slots"),
+	);
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
@@ -1925,7 +1963,7 @@ test("a storage_full refusal becomes one announced channel state and stops the c
 
 test("an unavailable send retry timer stops when the page unmounts", async () => {
 	const h = make_harness();
-	h.raw.data.append.mockResolvedValue({ _nay: { name: "unavailable", message: "Reply lost" } });
+	h.raw.backend.invoke.mockResolvedValue(invoke_nay("unavailable", "Reply lost"));
 	const { unmount } = await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
@@ -1936,13 +1974,13 @@ test("an unavailable send retry timer stops when the page unmounts", async () =>
 			fireEvent.keyDown(composer_box("Message #general"), { key: "Enter" });
 			await Promise.resolve();
 		});
-		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
+		expect(h.raw.backend.invoke).toHaveBeenCalledTimes(1);
 
 		unmount();
 		await act(async () => {
 			await vi.advanceTimersByTimeAsync(60_000);
 		});
-		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
+		expect(h.raw.backend.invoke).toHaveBeenCalledTimes(1);
 	} finally {
 		vi.useRealTimers();
 	}
@@ -1954,8 +1992,8 @@ test("an unavailable send retry timer stops when the page unmounts", async () =>
 
 test("a remote arrival announces author and preview; the user's own send never announces", async () => {
 	const h = make_harness();
-	const ack = deferred<{ _yay: { key: string; revision: number } }>();
-	h.raw.data.append.mockReturnValueOnce(ack.promise);
+	const ack = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(ack.promise);
 	const { container } = await boot(h);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	messages.onUpdate(window_update([]));
@@ -1973,7 +2011,7 @@ test("a remote arrival announces author and preview; the user's own send never a
 	);
 	await screen.findAllByText("my own words");
 	expect(announcer_text(container)).not.toContain("my own words");
-	ack.resolve({ _yay: { key: ownKey, revision: 1 } });
+	ack.resolve(invoke_ok({ messageKey: ownKey }));
 
 	// Remote arrival: announced as "<author>: <preview>".
 	messages.onUpdate(
@@ -2100,7 +2138,7 @@ test("edit and delete exist only on own messages", async () => {
 	expect(within(otherRow).queryByRole("button", { name: "Delete" })).toBeNull();
 });
 
-test("editing an own message puts the new text and renders the (edited) marker", async () => {
+test("editing an own message sends the new text through the backend and renders the (edited) marker", async () => {
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
@@ -2112,12 +2150,9 @@ test("editing an own message puts the new text and renders the (edited) marker",
 	fireEvent.input(editBox, { target: { value: "after" } });
 	fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
-	const call = h.raw.data.put.mock.calls[0][0];
-	expect(call.collection).toBe("messages");
-	expect(call.key).toBe(doc.key);
-	expect(call.value.text).toBe("after");
-	expect(typeof call.value.editedAt).toBe("number");
+	// The backend stamps `editedAt` itself; the page only names the message and the new text.
+	await waitFor(() => expect(invoke_calls(h, "message-edit")).toHaveLength(1));
+	expect(invoke_calls(h, "message-edit")[0]!.input).toEqual({ messageKey: doc.key, text: "after", mentions: [] });
 	expect(await screen.findByText("(edited)")).toBeTruthy();
 	expect(screen.getByText("after")).toBeTruthy();
 	await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit" })));
@@ -2141,8 +2176,8 @@ test("Cancel closes an edit and restores focus to its Edit button", async () => 
 
 test("a pending message edit freezes its draft and ignores Escape until a refusal settles", async () => {
 	const h = make_harness();
-	const pendingPut = deferred<WriteResult>();
-	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	const pendingInvoke = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
@@ -2162,18 +2197,18 @@ test("a pending message edit freezes its draft and ignores Escape until a refusa
 	expect(screen.getByRole("textbox", { name: "Edit message" })).toBe(editBox);
 	expect(editBox.value).toBe("submitted draft");
 
-	pendingPut.resolve({ _nay: { name: "conflict", message: "Message changed" } });
+	pendingInvoke.resolve(invoke_refused(409, "Message changed"));
 	expect((await screen.findByRole("alert")).textContent).toContain("Message changed");
 	expect(editBox.readOnly).toBe(false);
 	expect(editBox.value).toBe("submitted draft");
-	expect(h.raw.data.put.mock.calls[0]![0].value.text).toBe("submitted draft");
+	expect(invoke_calls(h, "message-edit")[0]!.input.text).toBe("submitted draft");
 });
 
 test("an unavailable message edit retries the exact write and stays locked until its watch echo", async () => {
 	const h = make_harness();
-	const firstPut = deferred<WriteResult>();
-	const retryPut = deferred<WriteResult>();
-	h.raw.data.put.mockReturnValueOnce(firstPut.promise).mockReturnValueOnce(retryPut.promise);
+	const firstInvoke = deferred<InvokeResult>();
+	const retryInvoke = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(firstInvoke.promise).mockReturnValueOnce(retryInvoke.promise);
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
@@ -2198,14 +2233,13 @@ test("an unavailable message edit retries the exact write and stays locked until
 	expect(screen.getByRole("region", { name: "Thread" })).toBe(panel);
 	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(true));
 	await waitFor(() => expect(close.hasAttribute("disabled")).toBe(true));
-	const submitted = h.raw.data.put.mock.calls[0]![0];
-	expect(submitted.expectedRevision).toBe(doc.revision);
-	expect(submitted.value.text).toBe("submitted once");
-	expect(typeof submitted.value.editedAt).toBe("number");
+	const submitted = invoke_calls(h, "message-edit")[0]!;
+	expect(submitted.input.messageKey).toBe(doc.key);
+	expect(submitted.input.text).toBe("submitted once");
 
 	await act(async () => {
-		firstPut.resolve({ _nay: { name: "unavailable", message: "The edit result was lost" } });
-		await firstPut.promise;
+		firstInvoke.resolve(invoke_nay("unavailable", "The edit result was lost"));
+		await firstInvoke.promise;
 	});
 	expect((await within(panel).findByRole("alert")).textContent).toContain("The edit result was lost");
 	expect(editBox.readOnly).toBe(true);
@@ -2213,12 +2247,20 @@ test("an unavailable message edit retries the exact write and stays locked until
 	expect(random.hasAttribute("disabled")).toBe(true);
 
 	fireEvent.click(within(panel).getByRole("button", { name: "Retry" }));
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
-	expect(h.raw.data.put.mock.calls[1]![0]).toEqual(submitted);
+	await waitFor(() => expect(invoke_calls(h, "message-edit")).toHaveLength(2));
+	expect(invoke_calls(h, "message-edit")[1]!.input).toEqual(submitted.input);
 
+	// The watch echo carries the backend's own editedAt stamp, not one the page chose.
 	await act(async () => {
 		messages.onUpdate(
-			window_update([{ ...doc, value: submitted.value, revision: doc.revision + 1, updatedAt: 2_000 }]),
+			window_update([
+				{
+					...doc,
+					value: { ...doc.value, text: "submitted once", editedAt: 2_000 },
+					revision: doc.revision + 1,
+					updatedAt: 2_000,
+				},
+			]),
 		);
 		await Promise.resolve();
 	});
@@ -2229,17 +2271,15 @@ test("an unavailable message edit retries the exact write and stays locked until
 
 	// The late replay result belongs to the request the watch already proved.
 	await act(async () => {
-		retryPut.resolve({ _nay: { name: "conflict", message: "Already stored" } });
-		await retryPut.promise;
+		retryInvoke.resolve(invoke_refused(409, "Already stored"));
+		await retryInvoke.promise;
 	});
 	expect(screen.queryByText("Already stored")).toBeNull();
 });
 
 test("a newer different watch value settles an uncertain edit as a conflict", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "The edit result was lost" },
-	});
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "The edit result was lost"));
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
@@ -2268,15 +2308,13 @@ test("a newer different watch value settles an uncertain edit as a conflict", as
 	expect(editBox.value).toBe("keep my draft");
 	expect((screen.getByRole("button", { name: "#random" }) as HTMLButtonElement).disabled).toBe(false);
 	fireEvent.click(screen.getByRole("button", { name: "Save" }));
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
-	expect(h.raw.data.put.mock.calls[1]![0].expectedRevision).toBe(2);
+	await waitFor(() => expect(invoke_calls(h, "message-edit")).toHaveLength(2));
+	expect(invoke_calls(h, "message-edit")[1]!.input.text).toBe("keep my draft");
 });
 
 test("a newer tombstone ends an uncertain edit and focuses the stable message row", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "The edit result was lost" },
-	});
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "The edit result was lost"));
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
@@ -2363,10 +2401,9 @@ test("deleting an own message confirms in a dialog, puts a tombstone, and render
 	const dialog = await screen.findByRole("dialog");
 	fireEvent.click(within(dialog).getByRole("button", { name: "Delete message" }));
 
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
-	const call = h.raw.data.put.mock.calls[0][0];
-	expect(call.key).toBe(doc.key);
-	expect(typeof call.value.deletedAt).toBe("number");
+	// The backend stamps the tombstone itself; the page only names the message.
+	await waitFor(() => expect(invoke_calls(h, "message-delete")).toHaveLength(1));
+	expect(invoke_calls(h, "message-delete")[0]!.input).toEqual({ messageKey: doc.key });
 	const deleted = await screen.findByText("Message deleted");
 	const row = deleted.closest("[data-key]") as HTMLElement;
 	await waitFor(() => expect(document.activeElement).toBe(row));
@@ -2376,8 +2413,8 @@ test("deleting an own message confirms in a dialog, puts a tombstone, and render
 
 test("Escape cannot close a delete confirmation while its write is pending", async () => {
 	const h = make_harness();
-	const pendingPut = deferred<WriteResult>();
-	h.raw.data.put.mockReturnValueOnce(pendingPut.promise);
+	const pendingInvoke = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "mine", text: "to remove", createdBy: "user_me" });
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
@@ -2392,16 +2429,16 @@ test("Escape cannot close a delete confirmation while its write is pending", asy
 	expect(screen.getByRole("dialog")).toBe(dialog);
 	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
 
-	pendingPut.resolve({ _yay: { key: doc.key, revision: 2 } });
+	pendingInvoke.resolve(invoke_ok({ transcriptUpdated: true, revision: 2 }));
 	expect(await screen.findByText("Message deleted")).toBeTruthy();
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 });
 
 test("a thrown message delete retries the exact tombstone and stays locked until its watch echo", async () => {
 	const h = make_harness();
-	const firstPut = deferred<WriteResult>();
-	const retryPut = deferred<WriteResult>();
-	h.raw.data.put.mockReturnValueOnce(firstPut.promise).mockReturnValueOnce(retryPut.promise);
+	const firstInvoke = deferred<InvokeResult>();
+	const retryInvoke = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(firstInvoke.promise).mockReturnValueOnce(retryInvoke.promise);
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	const doc = message_doc(1_000, { rand: "mine", text: "to remove", createdBy: "user_me" });
@@ -2413,14 +2450,13 @@ test("a thrown message delete retries the exact tombstone and stays locked until
 	const dialog = await screen.findByRole("dialog");
 	fireEvent.click(within(dialog).getByRole("button", { name: "Delete message" }));
 	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(true));
-	const submitted = h.raw.data.put.mock.calls[0]![0];
-	expect(submitted.expectedRevision).toBe(doc.revision);
-	expect(typeof submitted.value.deletedAt).toBe("number");
+	const submitted = invoke_calls(h, "message-delete")[0]!;
+	expect(submitted.input).toEqual({ messageKey: doc.key });
 
 	await act(async () => {
-		firstPut.reject(new Error("Connection ended after delete"));
+		firstInvoke.reject(new Error("Connection ended after delete"));
 		try {
-			await firstPut.promise;
+			await firstInvoke.promise;
 		} catch {
 			// The row turns the transport rejection into the exact retry state below.
 		}
@@ -2430,12 +2466,14 @@ test("a thrown message delete retries the exact tombstone and stays locked until
 	expect(random.hasAttribute("disabled")).toBe(true);
 
 	fireEvent.click(within(dialog).getByRole("button", { name: "Retry delete" }));
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
-	expect(h.raw.data.put.mock.calls[1]![0]).toEqual(submitted);
+	await waitFor(() => expect(invoke_calls(h, "message-delete")).toHaveLength(2));
+	expect(invoke_calls(h, "message-delete")[1]!.input).toEqual(submitted.input);
 
 	await act(async () => {
 		messages.onUpdate(
-			window_update([{ ...doc, value: submitted.value, revision: doc.revision + 1, updatedAt: 2_000 }]),
+			window_update([
+				{ ...doc, value: { ...doc.value, deletedAt: 2_000 }, revision: doc.revision + 1, updatedAt: 2_000 },
+			]),
 		);
 		await Promise.resolve();
 	});
@@ -2444,17 +2482,15 @@ test("a thrown message delete retries the exact tombstone and stays locked until
 	await waitFor(() => expect(random.hasAttribute("disabled")).toBe(false));
 
 	await act(async () => {
-		retryPut.resolve({ _nay: { name: "conflict", message: "Already deleted" } });
-		await retryPut.promise;
+		retryInvoke.resolve(invoke_refused(409, "Already deleted"));
+		await retryInvoke.promise;
 	});
 	expect(screen.queryByText("Already deleted")).toBeNull();
 });
 
 test("a newer live message settles an uncertain delete as a conflict", async () => {
 	const h = make_harness();
-	h.raw.data.put.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "The delete result was lost" },
-	});
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "The delete result was lost"));
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	const doc = message_doc(1_000, { rand: "mine", text: "to remove", createdBy: "user_me" });
@@ -2483,8 +2519,8 @@ test("a newer live message settles an uncertain delete as a conflict", async () 
 	expect(within(dialog).getByRole("button", { name: "Delete message" })).toBeTruthy();
 	expect((screen.getByRole("button", { name: "#random" }) as HTMLButtonElement).disabled).toBe(false);
 	fireEvent.click(within(dialog).getByRole("button", { name: "Delete message" }));
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
-	expect(h.raw.data.put.mock.calls[1]![0].expectedRevision).toBe(2);
+	await waitFor(() => expect(invoke_calls(h, "message-delete")).toHaveLength(2));
+	expect(invoke_calls(h, "message-delete")[1]!.input).toEqual({ messageKey: doc.key });
 });
 
 test("a plain text-only message row keeps its action buttons focusable", async () => {
@@ -2505,7 +2541,7 @@ test("a plain text-only message row keeps its action buttons focusable", async (
 	expect(document.activeElement).toBe(reply);
 });
 
-test("a second edit compares against the revision the first write stored, and a stale one conflicts", async () => {
+test("a second edit follows the first before any watch echo, and a conflict keeps the editor open", async () => {
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "mine", text: "first", createdBy: "user_me" });
@@ -2520,24 +2556,21 @@ test("a second edit compares against the revision the first write stored, and a 
 	};
 
 	await save("second");
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(1));
-	const storedRevision = (await h.raw.data.put.mock.results[0].value)._yay.revision;
+	await waitFor(() => expect(invoke_calls(h, "message-edit")).toHaveLength(1));
 	await screen.findByText("second");
 
-	// The server now holds `storedRevision`, and the window has not delivered it back yet. A
-	// second edit that compared against the doc as it was first read would be refused as a
-	// conflict, telling the member their own message changed under them.
+	// The window has not delivered the stored value back yet. The local echo must carry the
+	// answered revision, or this second edit would settle against a stale row.
 	await save("third");
-	await waitFor(() => expect(h.raw.data.put).toHaveBeenCalledTimes(2));
-	expect(h.raw.data.put.mock.calls[1][0].expectedRevision).toBe(storedRevision);
+	await waitFor(() => expect(invoke_calls(h, "message-edit")).toHaveLength(2));
+	expect(invoke_calls(h, "message-edit")[1]!.input.text).toBe("third");
 	expect(await screen.findByText("third")).toBeTruthy();
 
-	// A revision the server has moved past is a real conflict, and the row says so without
-	// changing what it shows.
-	h.raw.data.put.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Revision mismatch" } });
+	// A backend conflict is a real refusal, and the row says so without changing what it shows.
+	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "Revision mismatch"));
 	await save("fourth");
 	expect(await screen.findByText("Revision mismatch")).toBeTruthy();
-	expect(h.raw.data.put.mock.calls[2][0].value.text).toBe("fourth");
+	expect(invoke_calls(h, "message-edit")[2]!.input.text).toBe("fourth");
 	// The editor stays open holding the unsaved text, and the stored message did not change.
 	fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 	expect(await screen.findByText("third")).toBeTruthy();
@@ -2548,7 +2581,7 @@ test("a second edit compares against the revision the first write stored, and a 
 
 // #region reactions
 
-test("reaction chips group by createdBy, expose aria-pressed, and toggle putOwned with a removed marker", async () => {
+test("reaction chips group by createdBy, expose aria-pressed, and toggle through the backend", async () => {
 	const h = make_harness();
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "m1", text: "react to me" });
@@ -2568,20 +2601,17 @@ test("reaction chips group by createdBy, expose aria-pressed, and toggle putOwne
 	const otherChip = screen.getByRole("button", { name: "Party, 1 reaction" });
 	expect(otherChip.getAttribute("aria-pressed")).toBe("false");
 
-	// Toggling my own reaction off writes a removed marker on the same owned key.
+	// Toggling my own reaction off asks the backend to write the removed marker.
 	fireEvent.click(mineChip);
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
-	expect(h.raw.data.putOwned.mock.calls[0][0]).toEqual({
-		collection: "reactions",
-		key: `${doc.key}:heart`,
-		value: { removed: true },
-	});
+	await waitFor(() => expect(invoke_calls(h, "reaction-toggle")).toHaveLength(1));
+	expect(invoke_calls(h, "reaction-toggle")[0]!.input).toEqual({ targetKey: doc.key, token: "heart", on: false });
+	expect(h.raw.data.putOwned).not.toHaveBeenCalled();
 	expect(h.raw.data.removeOwned).not.toHaveBeenCalled();
 
-	// Toggling a reaction I do not hold adds my owned doc.
+	// Toggling a reaction I do not hold turns it on under my own id.
 	fireEvent.click(otherChip);
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2));
-	expect(h.raw.data.putOwned.mock.calls[1][0]).toEqual({ collection: "reactions", key: `${doc.key}:party`, value: {} });
+	await waitFor(() => expect(invoke_calls(h, "reaction-toggle")).toHaveLength(2));
+	expect(invoke_calls(h, "reaction-toggle")[1]!.input).toEqual({ targetKey: doc.key, token: "party", on: true });
 });
 
 test("a forged reaction doc with a mismatched key tail counts under createdBy", async () => {
@@ -2617,8 +2647,8 @@ test("the add-reaction palette opens, picks a token, and returns focus to the op
 	await waitFor(() => expect(document.activeElement?.getAttribute("aria-label")).toBe("Thumbs up"));
 
 	fireEvent.click(within(palette).getByRole("button", { name: "Rocket" }));
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
-	expect(h.raw.data.putOwned.mock.calls[0][0].key).toBe(`${doc.key}:rocket`);
+	await waitFor(() => expect(invoke_calls(h, "reaction-toggle")).toHaveLength(1));
+	expect(invoke_calls(h, "reaction-toggle")[0]!.input).toEqual({ targetKey: doc.key, token: "rocket", on: true });
 	await waitFor(() => expect(document.activeElement).toBe(opener));
 });
 
@@ -2716,13 +2746,16 @@ test("a healthy row below the reactions frontier stays neutral without claiming 
 	expect(oldRow.querySelector(".message-reactions")).toBeNull();
 
 	// The remove path is hidden, not refused: with no chips there is nothing to un-react. The add
-	// path stays live, because `putOwned` writes the member's own key with the same empty value
-	// whether or not it is already there. Refusing both would stop reactions on every message past
-	// the coverage frontier, which in a busy channel is a couple of days back.
+	// path stays live, because turning a reaction on is idempotent at the backend whether or not
+	// it is already there. Refusing both would stop reactions on every message past the coverage
+	// frontier, which in a busy channel is a couple of days back.
 	await pick_reaction(oldRow, "Heart");
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
-	expect(h.raw.data.putOwned.mock.calls[0][0].key).toBe(`${row_key(oldRow)}:heart`);
-	expect(h.raw.data.removeOwned).not.toHaveBeenCalled();
+	await waitFor(() => expect(invoke_calls(h, "reaction-toggle")).toHaveLength(1));
+	expect(invoke_calls(h, "reaction-toggle")[0]!.input).toEqual({
+		targetKey: row_key(oldRow),
+		token: "heart",
+		on: true,
+	});
 });
 
 test("a row the reactions list does reach still writes the reaction", async () => {
@@ -2730,7 +2763,7 @@ test("a row the reactions list does reach still writes the reaction", async () =
 	await boot_two_roots(h);
 
 	await pick_reaction(row_of("old root"), "Heart");
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
+	await waitFor(() => expect(invoke_calls(h, "reaction-toggle")).toHaveLength(1));
 });
 
 test("an incomplete companion list makes every row uncovered, however deep it reached", async () => {
@@ -2756,7 +2789,7 @@ test("an incomplete companion list makes every row uncovered, however deep it re
 	expect(within(newRow).getByRole("button", { name: "View thread" })).toBeTruthy();
 
 	await pick_reaction(newRow, "Heart");
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
+	await waitFor(() => expect(invoke_calls(h, "reaction-toggle")).toHaveLength(1));
 	expect(h.raw.data.removeOwned).not.toHaveBeenCalled();
 });
 
@@ -3334,21 +3367,21 @@ test("the thread panel opens with focus inside, replies append under the root, c
 	const replyBox = within(panel).getByRole("combobox", { name: "Reply in thread" });
 	fireEvent.input(replyBox, { target: { value: "a reply" } });
 	fireEvent.keyDown(replyBox, { key: "Enter" });
-	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(1));
-	const call = h.raw.data.append.mock.calls[0][0];
-	expect(call.collection).toBe("replies");
-	expect(call.keyPrefix).toBe(`${doc.key}:`);
+	await waitFor(() => expect(invoke_calls(h, "reply-send")).toHaveLength(1));
+	expect(invoke_calls(h, "reply-send")[0]!.input.rootMessageKey).toBe(doc.key);
+	expect(invoke_calls(h, "reply-send")[0]!.input.text).toBe("a reply");
 
 	fireEvent.click(closeButton);
 	await waitFor(() => expect(screen.queryByRole("region", { name: "Thread" })).toBeNull());
-	// Focus returns to the exact reply trigger of that root message.
-	expect(document.activeElement?.textContent).toContain("Reply in thread");
+	// Focus returns to the root's reply trigger — the thread summary now, since the sent reply
+	// gave the root a reply count.
+	expect(document.activeElement?.textContent).toContain("1 reply");
 });
 
 test("an in-flight reply blocks a thread switch, and a late failure keeps Retry visible", async () => {
 	const h = make_harness();
-	const ack = deferred<{ _yay: { key: string; revision: number } }>();
-	h.raw.data.append.mockReturnValueOnce(ack.promise);
+	const ack = deferred<InvokeResult>();
+	h.raw.backend.invoke.mockReturnValueOnce(ack.promise);
 	await boot(h);
 	const rootA = message_doc(1_000, { rand: "aaam", text: "root a" });
 	const rootB = message_doc(2_000, { rand: "bbbm", text: "root b" });
@@ -3405,8 +3438,9 @@ test("an in-flight reply blocks a thread switch, and a late failure keeps Retry 
 	expect(await screen.findByRole("region", { name: "Thread" })).toBe(panel);
 	expect(within(panel).getByText("late reply")).toBeTruthy();
 
+	// A definite refusal, not a lost answer: unavailable would replay silently instead of failing.
 	await act(async () => {
-		ack.reject(new Error("late reply failed"));
+		ack.resolve(invoke_refused(500, "late reply failed"));
 		await Promise.resolve();
 	});
 	expect(await within(panel).findByRole("button", { name: "Retry sending message" })).toBeTruthy();
@@ -4370,8 +4404,8 @@ test("the picker lists workspace files and a picked file rides the next send", a
 	const input = screen.getByRole("combobox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "see attached" } });
 	fireEvent.keyDown(input, { key: "Enter" });
-	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(1));
-	expect(h.raw.data.append.mock.calls[0][0].value.attachments).toEqual([{ fileNodeId: "n1", name: "spec.pdf" }]);
+	await waitFor(() => expect(invoke_calls(h, "message-send")).toHaveLength(1));
+	expect(invoke_calls(h, "message-send")[0]!.input.attachments).toEqual([{ fileNodeId: "n1", name: "spec.pdf" }]);
 });
 
 // #endregion attachments
@@ -8631,18 +8665,18 @@ test("the composer's @-menu stores the member's id, and Enter picks before it se
 
 	// Enter while the menu is open picks — it must not send.
 	fireEvent.keyDown(textarea, { key: "Enter" });
-	expect(h.raw.data.append).not.toHaveBeenCalled();
+	expect(h.raw.backend.invoke).not.toHaveBeenCalled();
 	await waitFor(() => expect(textarea.value).toBe("Hi @Bob "));
 
 	// The next Enter sends, and the stored mention is the member's ID, not the display name —
 	// a rename must not orphan old mentions' targets.
 	fireEvent.keyDown(textarea, { key: "Enter" });
-	const append = await waitFor(() => {
-		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
-		return h.raw.data.append.mock.calls[0]![0] as AppendOpts;
+	const send = await waitFor(() => {
+		expect(invoke_calls(h, "message-send")).toHaveLength(1);
+		return invoke_calls(h, "message-send")[0]!;
 	});
-	expect(append.value.text).toBe("Hi @Bob");
-	expect(append.value.mentions).toEqual(["user_other"]);
+	expect(send.input.text).toBe("Hi @Bob");
+	expect(send.input.mentions).toEqual(["user_other"]);
 });
 
 test("a pointer press in the textarea closes the @-menu, so Enter sends instead of picking", async () => {
@@ -8658,12 +8692,12 @@ test("a pointer press in the textarea closes the @-menu, so Enter sends instead 
 	// next Enter would pick from a menu the user already left.
 	fireEvent.pointerDown(textarea);
 	fireEvent.keyDown(textarea, { key: "Enter" });
-	const append = await waitFor(() => {
-		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
-		return h.raw.data.append.mock.calls[0]![0] as AppendOpts;
+	const send = await waitFor(() => {
+		expect(invoke_calls(h, "message-send")).toHaveLength(1);
+		return invoke_calls(h, "message-send")[0]!;
 	});
-	expect(append.value.text).toBe("Hi @ob");
-	expect(append.value.mentions).toBeUndefined();
+	expect(send.input.text).toBe("Hi @ob");
+	expect(send.input.mentions).toEqual([]);
 });
 
 test("moving the caret with an arrow key closes the @-menu, so Enter sends instead of picking", async () => {
@@ -8676,12 +8710,12 @@ test("moving the caret with an arrow key closes the @-menu, so Enter sends inste
 
 	fireEvent.keyDown(textarea, { key: "ArrowLeft" });
 	fireEvent.keyDown(textarea, { key: "Enter" });
-	const append = await waitFor(() => {
-		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
-		return h.raw.data.append.mock.calls[0]![0] as AppendOpts;
+	const send = await waitFor(() => {
+		expect(invoke_calls(h, "message-send")).toHaveLength(1);
+		return invoke_calls(h, "message-send")[0]!;
 	});
-	expect(append.value.text).toBe("Hi @ob");
-	expect(append.value.mentions).toBeUndefined();
+	expect(send.input.text).toBe("Hi @ob");
+	expect(send.input.mentions).toEqual([]);
 });
 
 test("a roster refusal is not cached for later composers", async () => {
@@ -8765,12 +8799,12 @@ test("the @-menu shows a short explanation when the roster is not_consented, and
 	// Escape closes the explanation; the next Enter sends the typed words as plain text.
 	fireEvent.keyDown(textarea, { key: "Escape" });
 	fireEvent.keyDown(textarea, { key: "Enter" });
-	const append = await waitFor(() => {
-		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
-		return h.raw.data.append.mock.calls[0]![0] as AppendOpts;
+	const send = await waitFor(() => {
+		expect(invoke_calls(h, "message-send")).toHaveLength(1);
+		return invoke_calls(h, "message-send")[0]!;
 	});
-	expect(append.value.text).toBe("ping @B");
-	expect(append.value.mentions).toBeUndefined();
+	expect(send.input.text).toBe("ping @B");
+	expect(send.input.mentions).toEqual([]);
 });
 
 test("a member with no display name is offered under the anonymous fallback, and send stores their id", async () => {
@@ -8793,11 +8827,11 @@ test("a member with no display name is offered under the anonymous fallback, and
 	fireEvent.keyDown(textarea, { key: "Enter" });
 	await waitFor(() => expect(textarea.value).toBe(`@${chat_ANONYMOUS_MEMBER_LABEL} `));
 	fireEvent.keyDown(textarea, { key: "Enter" });
-	const append = await waitFor(() => {
-		expect(h.raw.data.append).toHaveBeenCalledTimes(1);
-		return h.raw.data.append.mock.calls[0]![0] as AppendOpts;
+	const send = await waitFor(() => {
+		expect(invoke_calls(h, "message-send")).toHaveLength(1);
+		return invoke_calls(h, "message-send")[0]!;
 	});
-	expect(append.value.mentions).toEqual(["user_anon"]);
+	expect(send.input.mentions).toEqual(["user_anon"]);
 });
 
 test("the roster is paged once per session and not fetched again on later @ keystrokes", async () => {
@@ -9016,11 +9050,9 @@ test.each([
 	},
 );
 
-test("a private append with a lost response remains unread after the sender reloads", async () => {
+test("a private send with a lost response remains unread after the sender reloads", async () => {
 	const first = make_harness();
-	first.raw.data.append.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "The message may have been stored" },
-	});
+	first.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "The message may have been stored"));
 	const { textarea, unmount } = await open_private_composer(first);
 	type_in_composer(textarea, "stored before reload");
 	await act(async () => {
@@ -9028,8 +9060,8 @@ test("a private append with a lost response remains unread after the sender relo
 		await Promise.resolve();
 		await Promise.resolve();
 	});
-	expect(first.raw.data.append).toHaveBeenCalledTimes(1);
-	const request = first.raw.data.append.mock.calls[0]![0];
+	expect(invoke_calls(first, "message-send")).toHaveLength(1);
+	const request = invoke_calls(first, "message-send")[0]!;
 	unmount();
 
 	const second = make_harness();
@@ -9043,7 +9075,7 @@ test("a private append with a lost response remains unread after the sender relo
 	await waitFor(() =>
 		expect(within(nav).getByRole("button", { name: /^#secret-plans/ }).className).toContain("is-unread"),
 	);
-	expect(request.clientRequestId).toMatch(/^[0-9a-f-]{36}$/);
+	expect(request.input.clientRequestId).toMatch(/^[0-9a-f-]{36}$/);
 	expect(first.raw.data.put).not.toHaveBeenCalled();
 	expect(second.raw.data.put).not.toHaveBeenCalled();
 });
@@ -9065,9 +9097,9 @@ test("an unavailable private send replays one request while navigation and Leave
 		{ userId: "user_me", level: "manage" },
 		{ userId: "user_other", level: "member" },
 	]);
-	const replay = deferred<{ _yay: { key: string; revision: number } }>();
-	h.raw.data.append
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "The reply may have been lost" } })
+	const replay = deferred<InvokeResult>();
+	h.raw.backend.invoke
+		.mockResolvedValueOnce(invoke_nay("unavailable", "The reply may have been lost"))
 		.mockReturnValueOnce(replay.promise);
 	const { textarea } = await open_private_composer(h);
 
@@ -9076,8 +9108,8 @@ test("an unavailable private send replays one request while navigation and Leave
 		fireEvent.keyDown(textarea, { key: "Enter" });
 		await Promise.resolve();
 	});
-	expect(h.raw.data.append).toHaveBeenCalledTimes(1);
-	const firstAppend = h.raw.data.append.mock.calls[0]![0];
+	expect(invoke_calls(h, "message-send")).toHaveLength(1);
+	const firstSend = invoke_calls(h, "message-send")[0]!;
 
 	const unreads = screen.getByRole("button", { name: "Unreads" });
 	expect(unreads.hasAttribute("disabled")).toBe(true);
@@ -9093,14 +9125,14 @@ test("an unavailable private send replays one request while navigation and Leave
 	);
 	expect(h.raw.scopes.removePrincipal).not.toHaveBeenCalled();
 
-	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(2), { timeout: 2_500 });
-	expect(h.raw.data.append.mock.calls[1]![0]).toEqual(firstAppend);
+	await waitFor(() => expect(invoke_calls(h, "message-send")).toHaveLength(2), { timeout: 2_500 });
+	expect(invoke_calls(h, "message-send")[1]!.input).toEqual(firstSend.input);
 	expect(unreads.hasAttribute("disabled")).toBe(true);
 	fireEvent.click(leave);
 	expect(h.raw.scopes.removePrincipal).not.toHaveBeenCalled();
 
 	await act(async () => {
-		replay.resolve({ _yay: { key: `${PRIVATE_KEY}:${inv(50_000)}:sent`, revision: 1 } });
+		replay.resolve(invoke_ok({ messageKey: `${PRIVATE_KEY}:${inv(50_000)}:sent` }));
 		await Promise.resolve();
 		await Promise.resolve();
 	});
@@ -9118,9 +9150,9 @@ test("an unavailable private reply replays one request and unlocks its thread af
 	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([rootA, rootB]));
 	await screen.findByText("private root a");
 
-	const replay = deferred<{ _yay: { key: string; revision: number } }>();
-	h.raw.data.append
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "The reply may have been lost" } })
+	const replay = deferred<InvokeResult>();
+	h.raw.backend.invoke
+		.mockResolvedValueOnce(invoke_nay("unavailable", "The reply may have been lost"))
 		.mockReturnValueOnce(replay.promise);
 	const rowA = screen.getByText("private root a").closest("[data-key]") as HTMLElement;
 	fireEvent.click(within(rowA).getByRole("button", { name: "Reply in thread" }));
@@ -9132,10 +9164,9 @@ test("an unavailable private reply replays one request and unlocks its thread af
 		fireEvent.keyDown(replyBox, { key: "Enter" });
 		await Promise.resolve();
 	});
-	expect(h.raw.data.append).toHaveBeenCalledTimes(1);
-	const firstAppend = h.raw.data.append.mock.calls[0]![0];
-	expect(firstAppend.collection).toBe("replies");
-	expect(firstAppend.keyPrefix).toBe(`${rootA.key}:`);
+	expect(invoke_calls(h, "reply-send")).toHaveLength(1);
+	const firstReply = invoke_calls(h, "reply-send")[0]!;
+	expect(firstReply.input.rootMessageKey).toBe(rootA.key);
 
 	const close = within(panel).getByRole("button", { name: "Close thread" });
 	const rowB = screen.getByText("private root b").closest("[data-key]") as HTMLElement;
@@ -9146,12 +9177,12 @@ test("an unavailable private reply replays one request and unlocks its thread af
 	fireEvent.click(switchThread);
 	expect(screen.getByRole("region", { name: "Thread" })).toBe(panel);
 
-	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(2), { timeout: 2_500 });
-	expect(h.raw.data.append.mock.calls[1]![0]).toEqual(firstAppend);
+	await waitFor(() => expect(invoke_calls(h, "reply-send")).toHaveLength(2), { timeout: 2_500 });
+	expect(invoke_calls(h, "reply-send")[1]!.input).toEqual(firstReply.input);
 	expect(close.hasAttribute("disabled")).toBe(true);
 
 	await act(async () => {
-		replay.resolve({ _yay: { key: `${rootA.key}:${inv(51_000)}:repl`, revision: 1 } });
+		replay.resolve(invoke_ok({ messageKey: `${rootA.key}:${inv(51_000)}:repl`, transcriptUpdated: true }));
 		await Promise.resolve();
 		await Promise.resolve();
 	});
@@ -9167,11 +9198,11 @@ test("Leave waits for a delayed send, then removes the member without a channel 
 		{ userId: "user_me", level: "manage" },
 		{ userId: "user_other", level: "member" },
 	]);
-	const append = deferred<{ _yay: { key: string; revision: number } }>();
+	const send = deferred<InvokeResult>();
 	const events: string[] = [];
-	h.raw.data.append.mockImplementationOnce(() => {
-		events.push("append");
-		return append.promise;
+	h.raw.backend.invoke.mockImplementationOnce(() => {
+		events.push("invoke");
+		return send.promise;
 	});
 	h.raw.scopes.removePrincipal.mockImplementationOnce(async () => {
 		events.push("scopes.removePrincipal");
@@ -9181,7 +9212,7 @@ test("Leave waits for a delayed send, then removes the member without a channel 
 
 	type_in_composer(textarea, "committed before leave");
 	fireEvent.keyDown(textarea, { key: "Enter" });
-	await waitFor(() => expect(h.raw.data.append).toHaveBeenCalledTimes(1));
+	await waitFor(() => expect(invoke_calls(h, "message-send")).toHaveLength(1));
 	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
 	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
 	const leave = await within(dialog).findByRole("button", { name: "Leave channel" });
@@ -9192,7 +9223,7 @@ test("Leave waits for a delayed send, then removes the member without a channel 
 	expect(h.raw.scopes.removePrincipal).not.toHaveBeenCalled();
 
 	await act(async () => {
-		append.resolve({ _yay: { key: `${PRIVATE_KEY}:${inv(50_000)}:sent`, revision: 1 } });
+		send.resolve(invoke_ok({ messageKey: `${PRIVATE_KEY}:${inv(50_000)}:sent` }));
 		await Promise.resolve();
 		await Promise.resolve();
 	});
@@ -9201,7 +9232,7 @@ test("Leave waits for a delayed send, then removes the member without a channel 
 
 	fireEvent.click(leave);
 	await waitFor(() => expect(h.raw.scopes.removePrincipal).toHaveBeenCalledTimes(1));
-	expect(events).toEqual(["append", "scopes.removePrincipal"]);
+	expect(events).toEqual(["invoke", "scopes.removePrincipal"]);
 	expect(h.raw.data.put).not.toHaveBeenCalled();
 });
 // #endregion unreads, views, mentions
