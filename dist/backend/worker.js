@@ -5298,6 +5298,7 @@ function files_write(ctx, path, content) {
 		{
 			path,
 			content,
+			nonCollaborative: true,
 			access: { readOnly: true },
 		},
 		files_write_answer_schema,

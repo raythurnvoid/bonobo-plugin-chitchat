@@ -200,7 +200,14 @@ function files_write(ctx: Ctx, path: string, content: string) {
 	return door(
 		ctx,
 		"/api/v1/files/write",
-		{ path, content, access: { readOnly: true } },
+		// A transcript is a derived file this backend rewrites whole, and it must come back byte for
+		// byte the way it was written. A collaborative file is stored by parsing the markdown into
+		// the editor's document and serializing it back, and that round trip keeps no HTML comments,
+		// so the `<!-- chitchat:msg:<key> -->` marker above every block was silently lost. The replay
+		// guard looks that marker up to decide whether a block is already in the file, so with the
+		// markers gone it always decided "missing" and appended a second copy of the same message.
+		// The door reads this flag only when the write creates the file.
+		{ path, content, nonCollaborative: true, access: { readOnly: true } },
 		files_write_answer_schema,
 	);
 }

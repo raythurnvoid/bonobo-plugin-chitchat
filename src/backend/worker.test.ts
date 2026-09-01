@@ -27,6 +27,8 @@ function create_fake_host() {
 	/** Scripted one-shot refusals by door path. */
 	const refusals = new Map<string, { status: number; body: unknown }>();
 	const calls: string[] = [];
+	/** Every `/api/v1/files/write` body, so a test can read the flags the door was sent. */
+	const fileWrites: Record<string, unknown>[] = [];
 
 	const collection_of = (name: string) => {
 		const existing = collections.get(name);
@@ -80,6 +82,7 @@ function create_fake_host() {
 		occupiedFolderPaths,
 		refusals,
 		calls,
+		fileWrites,
 		seed_doc(
 			collection: string,
 			key: string,
@@ -156,6 +159,7 @@ function create_fake_host() {
 				return { status: 200, body: { path: body.path, nodeId: `node-${body.path}`, content } };
 			}
 			if (path === "/api/v1/files/write") {
+				fileWrites.push(body);
 				files.set(body.path as string, body.content as string);
 				return { status: 200, body: { path: body.path, nodeId: `node-${body.path}`, contentType: "text/markdown" } };
 			}
@@ -275,6 +279,28 @@ describe("message-send", () => {
 		expect(tail).toContain(`<!-- chitchat:msg:${messageKey} -->`);
 		expect(tail).toContain("**Alice**");
 		expect(tail).toContain("hello world");
+	});
+
+	test("every transcript write asks the host for a non-collaborative file", async () => {
+		seed_public_channel();
+
+		await invoke("message-send", {
+			channelKey: "chan-public",
+			text: "hello",
+			authorName: "Alice",
+			clientRequestId: "req-noncollab",
+		});
+
+		// A collaborative file is stored by parsing the markdown into the editor's document and
+		// serializing it back, and that round trip keeps no HTML comments. The marker line above
+		// every block is an HTML comment, and the replay guard looks it up to decide whether a block
+		// is already in the file, so a collaborative transcript loses the markers and every replay
+		// appends a second copy of the same message. Nothing in this fake can catch that, because it
+		// stores the text verbatim — assert the flag the host needs instead.
+		expect(fake.fileWrites.length).toBeGreaterThan(0);
+		for (const write of fake.fileWrites) {
+			expect(write).toMatchObject({ nonCollaborative: true });
+		}
 	});
 
 	test("replaying the same clientRequestId answers the stored key and appends nothing", async () => {
