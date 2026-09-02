@@ -133,6 +133,8 @@ type WatchDeathInfo = { reason?: string; message?: string };
 type WatchSub = {
 	opts: { collection: string; keyPrefix?: string; limit: number };
 	onUpdate: (update: WatchUpdate | null, info?: WatchDeathInfo) => void;
+	// Only the direct Convex subscription (the cursors read) has one.
+	onError?: (error: Error) => void;
 	unsubscribed: boolean;
 };
 
@@ -269,13 +271,15 @@ function make_harness() {
 		// reference. It lands in the same watch list, so `find_watch("cursors", …)` answers for it.
 		api: { plugins_data: { watch_documents: { door: "watch_documents" } } },
 		convex: {
-			onUpdate: vi.fn((query: unknown, args: WatchSub["opts"], onUpdate: WatchSub["onUpdate"]) => {
-				const sub: WatchSub = { opts: args, onUpdate, unsubscribed: false };
-				watches.push(sub);
-				return () => {
-					sub.unsubscribed = true;
-				};
-			}),
+			onUpdate: vi.fn(
+				(query: unknown, args: WatchSub["opts"], onUpdate: WatchSub["onUpdate"], onError: WatchSub["onError"]) => {
+					const sub: WatchSub = { opts: args, onUpdate, onError, unsubscribed: false };
+					watches.push(sub);
+					return () => {
+						sub.unsubscribed = true;
+					};
+				},
+			),
 		},
 		data: {
 			watch: vi.fn((opts: WatchSub["opts"], onUpdate: WatchSub["onUpdate"]) => {
@@ -7557,6 +7561,26 @@ test("the public cursor watch ignores foreign prefix docs and non-owned exact do
 	// Only the exact owned row stamped for this member may clear the unread mark.
 	cursors.onUpdate(watch_update([cursor_doc({ [CH2_KEY]: 3_000 }, 6)]));
 	await waitFor(() => expect(randomRow().className).not.toContain("is-unread"));
+});
+
+test("a failed cursors query drops the cursor map, so everything recent shows unread again", async () => {
+	const h = make_harness();
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	const randomRow = () => within(nav).getByRole("button", { name: /^#random/ });
+
+	// Bob wrote in #random at t=2000 and this member's cursor is past it, so nothing is unread.
+	h.find_recent("messages")!.onUpdate(
+		watch_update([message_doc(2_000, { channelKey: CH2_KEY, createdBy: "user_other" })]),
+	);
+	const cursors = h.find_watch("cursors", "me:user_me")!;
+	cursors.onUpdate(watch_update([cursor_doc({ [CH2_KEY]: 3_000 }, 3)]));
+	await waitFor(() => expect(randomRow().className).not.toContain("is-unread"));
+
+	// The direct Convex subscription fails. The page keeps running with no cursor map, and with
+	// no cursor Bob's message counts as unread again.
+	cursors.onError!(new Error("query failed"));
+	await waitFor(() => expect(randomRow().className).toContain("is-unread"));
 });
 
 test("a message newer than the cursor marks its channel unread, and a newer cursor clears it", async () => {
