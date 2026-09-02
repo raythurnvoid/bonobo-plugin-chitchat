@@ -34,6 +34,8 @@ const convex_fake = vi.hoisted(() => {
 		status: Status;
 		loadOlderCalls: number;
 		lastLoadMore: number | null;
+		/** Paginated subscriptions only: the first page size the page asked for. */
+		initialNumItems: number | null;
 		listeners: Set<() => void>;
 		onUpdate: (update: unknown) => void;
 		onError: (error: Error) => void;
@@ -75,6 +77,7 @@ const convex_fake = vi.hoisted(() => {
 			status: "LoadingFirstPage",
 			loadOlderCalls: 0,
 			lastLoadMore: null,
+			initialNumItems: null,
 			listeners: new Set(),
 			onUpdate: (update) => {
 				flush(() => {
@@ -177,9 +180,14 @@ vi.mock("convex/react", async () => {
 		}, [keys, version]);
 	}
 
-	function usePaginatedQuery(ref: Ref, args: Record<string, unknown>, _options: { initialNumItems: number }) {
+	function usePaginatedQuery(ref: Ref, args: Record<string, unknown>, options: { initialNumItems: number }) {
 		use_fake_subscriptions([{ door: ref.door, opts: args }]);
 		const sub = convex_fake.live(convex_fake.key_of(ref.door, args));
+		if (sub !== undefined) {
+			// Keep the page size so a test can assert it. The value never changes for a given
+			// subscription, so writing it on every render is safe.
+			sub.initialNumItems = options.initialNumItems;
+		}
 		if (sub?.error) {
 			throw sub.error;
 		}
@@ -3923,6 +3931,7 @@ test("Load older asks the timeline for the next page and issues no HTTP request"
 
 	await screen.findByText("live one");
 	fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+	expect(messages.initialNumItems).toBe(100);
 	expect(messages.loadOlderCalls).toBe(1);
 	expect(messages.lastLoadMore).toBe(100);
 	expect(list_calls(h, "messages")).toHaveLength(0);

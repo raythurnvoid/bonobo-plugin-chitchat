@@ -107,13 +107,13 @@ Preact through `preact/compat`, which is smaller. Two things forced the move:
 Pin Ariakit **exactly**. The `^0.4.19` range resolves to 0.4.38, which is a different lineage
 (`@ariakit/react-components`) that ships raw `src/*.tsx`.
 
-A published plugin file may not exceed **900,000 bytes**. Measured on this bundle:
+A published plugin file may not exceed **900,000 bytes**. The shipped row below is the current build. The two rows above it were measured on 0.6.4 and are kept for the ratio between build settings, not as current byte counts:
 
 | Build                              | Bytes   |
 | ---------------------------------- | ------- |
 | React, no minification             | 947,309 |
 | Identifier names preserved         | 908,086 |
-| Full esbuild minify, then prettier | 806,033 |
+| Full esbuild minify, then prettier | 798,680 |
 
 So the readable build does not fit and identifier names have to go. `vite.config.ts` minifies the
 JavaScript, and the build script then reformats it with prettier, which puts it back on 28,315 lines
