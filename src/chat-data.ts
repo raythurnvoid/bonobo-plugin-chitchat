@@ -361,7 +361,7 @@ export function chat_mention_ids_still_in_text(chosen: Iterable<readonly [string
 }
 
 /**
- * Copy for a refused `members.list`. `not_consented` is the ordinary state until an admin
+ * Copy for a refused roster read. `not_consented` is the ordinary state until an admin
  * accepts `workspace.members.read`; other names share one line so the composer never looks broken.
  */
 export function chat_mention_roster_refusal_copy(name: string): string {
@@ -714,7 +714,7 @@ export const chat_files_list_response_schema = z.object({
 });
 
 /**
- * Response of `POST /api/v1/plugin-data/list`, the deep-history fallback's envelope.
+ * Response of `POST /api/v1/plugin-data/list`, the envelope of the companion and thread lists.
  *
  * `fetchJson` resolves `unknown`. Validate each public-document envelope here so paging can use its
  * key even when the collection-specific validator later drops its value.

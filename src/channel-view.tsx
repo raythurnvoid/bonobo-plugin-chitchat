@@ -1,4 +1,5 @@
-import type { BonoboUiFrontendClient, BonoboUiMember } from "bonobo-plugin-sdk/frontend";
+import type { BonoboUiFrontendClient } from "bonobo-plugin-sdk/frontend";
+import { usePaginatedQuery, useQuery } from "convex/react";
 import type { CSSProperties, ChangeEvent, KeyboardEvent, PointerEvent } from "react";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Paperclip } from "lucide-react";
@@ -44,18 +45,19 @@ import {
 	type chat_AccumulatingStore,
 	type chat_ReactionGroup,
 } from "./chat-store";
+import { chat_list_members, type chat_Member } from "./chat-doors";
 import { chat_invoke_backend, chat_invoke_input_too_large, chat_INVOKE_TOO_LARGE_MESSAGE } from "./chat-invoke";
 import { Dialog } from "./dialog";
 
 /**
- * Member display names resolved through the SDK's members API, cached in the App. The object
+ * Member display names resolved through the member doors, cached in the App. The object
  * keeps one identity for the page's lifetime (the App re-renders consumers itself when a
  * resolution lands), so watch effects may safely list it as a dependency.
  */
 export type chat_MemberNamesApi = {
 	/** undefined = not resolved yet; null = missing or deleted user ("Former member"). */
 	get: (userId: string) => string | null | undefined;
-	/** Resolves unknown ids through the SDK's members API; already-known ids are skipped. */
+	/** Resolves unknown ids through the `resolve_member_display` door; already-known ids are skipped. */
 	resolve: (userIds: string[]) => Promise<void>;
 };
 
@@ -558,7 +560,7 @@ const MENTION_ROSTER_PAGE_SIZE = 100;
  */
 const MENTION_ROSTER_MAX_PAGES = 10;
 
-type MentionRoster = { status: "ready"; members: BonoboUiMember[] } | { status: "refused"; name: string };
+type MentionRoster = { status: "ready"; members: chat_Member[] } | { status: "refused"; name: string };
 
 const mention_roster_cache = new WeakMap<BonoboUiFrontendClient, MentionRoster>();
 const mention_roster_inflight = new WeakMap<BonoboUiFrontendClient, Promise<MentionRoster>>();
@@ -591,10 +593,10 @@ function load_mention_roster(client: BonoboUiFrontendClient): Promise<MentionRos
 }
 
 async function fetch_mention_roster(client: BonoboUiFrontendClient): Promise<MentionRoster> {
-	const members: BonoboUiMember[] = [];
+	const members: chat_Member[] = [];
 	let cursor: string | undefined;
 	for (let page = 0; page < MENTION_ROSTER_MAX_PAGES; page += 1) {
-		const result = await client.members.list({
+		const result = await chat_list_members(client, {
 			limit: MENTION_ROSTER_PAGE_SIZE,
 			...(cursor === undefined ? {} : { cursor }),
 		});
@@ -1718,26 +1720,17 @@ function PendingRow(props: { pending: PendingSend; onRetry: () => void }) {
 // #region thread panel
 
 /**
- * What a dead subscription means for one part of the channel. `subject` names that part, so each
- * dead view says what stopped updating instead of all of them sharing one vague sentence.
+ * What a refused read means for one part of the channel. `subject` names that part, so each dead
+ * view says what stopped updating instead of all of them sharing one vague sentence. A door answers
+ * null for a lapsed session and for lost access alike; only the clock tells them apart.
  */
-function watch_death_message(reason: string | undefined, subject: string) {
-	// Names no cause. The commonest trigger is an uninstall or a revoked installation, and telling
-	// a member their permissions changed sends them to an admin over something they did not cause.
-	if (reason === "denied") {
-		return `Chitchat can no longer read ${subject}. Reload the page to try again.`;
-	}
-	if (reason === "session_expired") {
+function watch_death_message(client: BonoboUiFrontendClient, subject: string) {
+	if (Date.now() >= client.session.expiresAt()) {
 		return `This Chitchat session expired, so ${subject} stopped updating. Reload the page to continue.`;
 	}
-	if (reason === "unavailable") {
-		return `Chitchat cannot reach ${subject} right now. Check your connection and reload the page.`;
-	}
-	if (reason === "capacity") {
-		return `Chitchat has too many live views open, so ${subject} stopped updating. Reload the page.`;
-	}
-
-	return `Chitchat stopped reading ${subject}. Reload the page to try again.`;
+	// Names no cause. The commonest trigger is an uninstall or a revoked installation, and telling
+	// a member their permissions changed sends them to an admin over something they did not cause.
+	return `Chitchat can no longer read ${subject}. Reload the page to try again.`;
 }
 
 type ThreadPanel_Props = {
@@ -1939,8 +1932,6 @@ type ChannelView_Props = {
 	client: BonoboUiFrontendClient;
 	userId: string;
 	channel: chat_Doc<chat_ChannelValue>;
-	/** Restart private reads in place after this member's scope membership changes. */
-	readGeneration: number;
 	memberNames: chat_MemberNamesApi;
 	announce: (text: string) => void;
 	/**
@@ -1969,9 +1960,6 @@ type ChannelView_Props = {
 	openedAtLastReadAt: number | null;
 };
 
-/** The loadOlder/unsubscribe handle `client.data.watchWindow` returns. */
-type WindowHandle = ReturnType<BonoboUiFrontendClient["data"]["watchWindow"]>;
-
 /**
  * The part of a companion's coverage the render reads. The refs feed the catch-up loop,
  * which runs inside a list callback and must see the value that just arrived; this state
@@ -1982,17 +1970,18 @@ type CompanionCoverageState = {
 	deepestRoot: string | null;
 	incomplete: boolean;
 	/**
-	 * The subscription died, so nothing new will ever arrive. Its last values are frozen, and the
-	 * most confident of them — an exact reply count — would be the stalest thing on the row.
+	 * The change feed was refused, so nothing new arrives until it answers again. Its last values
+	 * are frozen, and the most confident of them — an exact reply count — would be the stalest
+	 * thing on the row.
 	 */
-	death: { reason?: string } | null;
+	dead: boolean;
 };
 
 const INITIAL_COMPANION_COVERAGE: CompanionCoverageState = {
 	hasMore: true,
 	deepestRoot: null,
 	incomplete: false,
-	death: null,
+	dead: false,
 };
 
 /**
@@ -2002,15 +1991,15 @@ const INITIAL_COMPANION_COVERAGE: CompanionCoverageState = {
  * dead feed covers nothing, because it stopped hearing about changes anywhere in its range.
  */
 function companion_covers_root(coverage: CompanionCoverageState, rootKey: string) {
-	if (coverage.incomplete || coverage.death !== null) {
+	if (coverage.incomplete || coverage.dead) {
 		return false;
 	}
 
 	return !coverage.hasMore || (coverage.deepestRoot !== null && rootKey < coverage.deepestRoot);
 }
 
-/** How many documents one deep-history page asks for. The route's own ceiling is 100. */
-const DEEP_HISTORY_PAGE_SIZE = 100;
+/** How many documents one companion or thread list asks for. The route's own ceiling is 100. */
+const LIST_PAGE_SIZE = 100;
 /** First wait after a failed companion list. Failure recovery, not a refresh poll. */
 const COMPANION_RETRY_INITIAL_MS = 1_000;
 /** Longest wait between companion-list retries. */
@@ -2089,7 +2078,7 @@ function reaction_groups_for_row(
 	key: string,
 ): chat_ReactionGroup[] | "pending" | "unknown" {
 	// A dead or gapped list cannot speak for any row, even one we already grouped.
-	if (coverage.incomplete || coverage.death !== null) {
+	if (coverage.incomplete || coverage.dead) {
 		return "unknown";
 	}
 	const groups = groupsByTarget.get(key);
@@ -2108,7 +2097,7 @@ function reply_count_for_row(
 	counts: Map<string, { count: number; latestAt: number }>,
 	key: string,
 ): number | "unknown" {
-	if (coverage.incomplete || coverage.death !== null) {
+	if (coverage.incomplete || coverage.dead) {
 		return "unknown";
 	}
 	const entry = counts.get(key);
@@ -2136,41 +2125,7 @@ type ChannelBody_CssVars = {
 };
 
 /**
- * The deep-history control, once the reactive window has stopped growing.
- *
- * `failed` covers every non-ok response, because `fetchJson` throws on all of them. A 429 sets
- * `retryAt`, which disables the control until the wait passes and then returns it to idle; every
- * other failure leaves `retryAt` null and offers a Retry button instead.
- */
-type DeepHistoryState =
-	| { kind: "idle" }
-	| { kind: "loading" }
-	| { kind: "exhausted" }
-	| { kind: "failed"; message: string; retryAt: number | null };
-
-/**
- * Reads `retryAfterMs` out of a 429 body. The body is whatever the route sent, so a bad shape or
- * unparseable text answers null and the caller falls back to a short wait.
- */
-function read_retry_after_ms(responseText: unknown) {
-	if (typeof responseText !== "string") {
-		return null;
-	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(responseText);
-	} catch {
-		return null;
-	}
-	if (typeof parsed !== "object" || parsed === null) {
-		return null;
-	}
-	const value = (parsed as { retryAfterMs?: unknown }).retryAfterMs;
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
-}
-
-/**
- * One open channel: message log, reactive document windows, composer, and thread panel.
+ * One open channel: message log, live document reads, composer, and thread panel.
  * The parent keys this component by channel key, so every mount owns exactly one channel.
  */
 export function ChannelView(props: ChannelView_Props) {
@@ -2178,7 +2133,6 @@ export function ChannelView(props: ChannelView_Props) {
 		client,
 		userId,
 		channel,
-		readGeneration,
 		memberNames,
 		announce,
 		threadRootKey,
@@ -2192,38 +2146,34 @@ export function ChannelView(props: ChannelView_Props) {
 	} = props;
 	const [messages, setMessages] = useState<chat_Doc<chat_MessageValue>[]>([]);
 	const [messagesLoaded, setMessagesLoaded] = useState(false);
-	const [messagesDeath, setMessagesDeath] = useState<{ reason?: string } | null>(null);
-	const [messagesWindow, setMessagesWindow] = useState({ hasMore: false, atCapacity: false, incomplete: false });
+	const [messagesDead, setMessagesDead] = useState(false);
 	const [reactionDocs, setReactionDocs] = useState<chat_ReactionDoc[]>([]);
 	const [channelReplies, setChannelReplies] = useState<chat_Doc<chat_MessageValue>[]>([]);
 	const [reactionCoverage, setReactionCoverage] = useState<CompanionCoverageState>(INITIAL_COMPANION_COVERAGE);
 	const [replyCoverage, setReplyCoverage] = useState<CompanionCoverageState>(INITIAL_COMPANION_COVERAGE);
 	const [storageFull, setStorageFull] = useState<string | null>(null);
-	const [deepHistory, setDeepHistory] = useState<DeepHistoryState>({ kind: "idle" });
 	const [threadWidth, setThreadWidth] = useState(DEFAULT_THREAD_WIDTH);
 	const [bodyWidth, setBodyWidth] = useState(0);
 	const [messagesSince, setMessagesSince] = useState<number | null>(null);
 	const [repliesSince, setRepliesSince] = useState<number | null>(null);
 	const [reactionsSince, setReactionsSince] = useState<number | null>(null);
-	const [feedsReadGeneration, setFeedsReadGeneration] = useState<number | null>(null);
 	const [threadRepliesLoaded, setThreadRepliesLoaded] = useState(false);
 	const [threadRepliesTruncated, setThreadRepliesTruncated] = useState(false);
 	const [threadRepliesError, setThreadRepliesError] = useState<string | null>(null);
 	const messagesStoreRef = useRef<chat_AccumulatingStore<chat_Doc<chat_MessageValue>> | null>(null);
 	const repliesStoreRef = useRef<chat_AccumulatingStore<chat_Doc<chat_MessageValue>> | null>(null);
 	const reactionsStoreRef = useRef<chat_AccumulatingStore<chat_ReactionDoc> | null>(null);
-	const messagesWindowRef = useRef<WindowHandle | null>(null);
 	const reactionsCoverageRef = useRef<CompanionCoverageState | null>(null);
 	const repliesCoverageRef = useRef<CompanionCoverageState | null>(null);
 	const oldestRootRef = useRef<string | null>(null);
-	// The oldest key the reactive WINDOW itself delivered, kept apart from the merged store. An
-	// HTTP page merges older keys into that store forever, and reading the fencepost back off it
-	// would drag both companions into paging history the window never asked for.
+	// The oldest key the timeline itself delivered, kept apart from the merged store. A change
+	// feed can merge keys into that store that the timeline never asked for, and reading the
+	// fencepost back off it would drag both companions into paging history for those.
 	const windowOldestKeyRef = useRef<string | null>(null);
-	/** The raw window frontier held when the member asked the SDK to extend older history. */
+	/** The raw timeline frontier held when the member asked for older history. */
 	const windowHistoryFenceRef = useRef<string | null>(null);
-	/** The last key the previous HTTP page returned. The next page continues strictly after it. */
-	const httpOldestKeyRef = useRef<string | null>(null);
+	/** Counts announcement rounds, so a late name lookup cannot announce over a newer arrival. */
+	const announcementVersionRef = useRef(0);
 	const companionHttpFenceRef = useRef<{ reactions: string | null; replies: string | null }>({
 		reactions: null,
 		replies: null,
@@ -2254,6 +2204,14 @@ export function ChannelView(props: ChannelView_Props) {
 	const requestCountRef = useRef(0);
 	const channelPrefix = chat_message_key_prefix(channel.key);
 	const privateScopeId = chat_channel_is_private(channel.key) ? channel.key : undefined;
+	// The messages timeline. The first page grows with new arrivals, and every loaded page stays
+	// live for edits and deletions. A refused read answers an empty final page, so a channel this
+	// member may not read shows nothing rather than an error.
+	const timeline = usePaginatedQuery(
+		client.api.plugins_data.watch_documents_page,
+		{ collection: "messages", keyPrefix: channelPrefix },
+		{ initialNumItems: 100 },
+	);
 
 	// Update a ref before App state paints, so a same-turn thread action cannot unmount the request.
 	const handle_request_start = () => {
@@ -2295,16 +2253,6 @@ export function ChannelView(props: ChannelView_Props) {
 		setChannelReplies(store.get_sorted());
 	};
 
-	const apply_message_docs = (docs: unknown[]) => {
-		const store = messagesStoreRef.current;
-		if (store === null) {
-			return [];
-		}
-		const applied = store.apply_window(docs);
-		setMessages(store.get_sorted());
-		return applied;
-	};
-
 	const set_companion_coverage = (
 		collection: "reactions" | "replies",
 		pageDocs: ({ key: string } & { targetKey?: string })[],
@@ -2338,8 +2286,8 @@ export function ChannelView(props: ChannelView_Props) {
 			incomplete,
 			// Keep a dead feed dead. An HTTP list that was already in flight must not wipe the
 			// death flag, or chips look live again while later hearts never arrive.
-			death:
-				(collection === "reactions" ? reactionsCoverageRef.current?.death : repliesCoverageRef.current?.death) ?? null,
+			dead:
+				(collection === "reactions" ? reactionsCoverageRef.current?.dead : repliesCoverageRef.current?.dead) ?? false,
 		};
 		if (collection === "reactions") {
 			reactionsCoverageRef.current = next;
@@ -2371,7 +2319,7 @@ export function ChannelView(props: ChannelView_Props) {
 
 	const schedule_companion_retry = (collection: "reactions" | "replies") => {
 		const coverage = collection === "reactions" ? reactionsCoverageRef.current : repliesCoverageRef.current;
-		if (coverage?.death != null) {
+		if (coverage?.dead) {
 			return;
 		}
 		const slot = companionRetryRef.current[collection];
@@ -2392,7 +2340,7 @@ export function ChannelView(props: ChannelView_Props) {
 			return;
 		}
 		const coverage = collection === "reactions" ? reactionsCoverageRef.current : repliesCoverageRef.current;
-		if (coverage?.death != null) {
+		if (coverage?.dead) {
 			return;
 		}
 		companionInflightRef.current[collection] = true;
@@ -2402,7 +2350,7 @@ export function ChannelView(props: ChannelView_Props) {
 			collection,
 			keyPrefix: channelPrefix,
 			...(fence === null ? {} : { keyStartExclusive: fence }),
-			limit: DEEP_HISTORY_PAGE_SIZE,
+			limit: LIST_PAGE_SIZE,
 		})
 			.then((page) => {
 				if (!companionMountedRef.current || companionGenerationRef.current !== generation) {
@@ -2443,16 +2391,15 @@ export function ChannelView(props: ChannelView_Props) {
 				companionInflightRef.current[collection] = false;
 				set_companion_coverage(collection, [], [], true, true);
 				// Failure recovery with backoff, not a periodic refresh: one timer, stop on
-				// success, never on a dead feed. The SDK can deliver a cached snapshot before
-				// this list fails, and then the feed will not fire again, so a quiet tab still
-				// needs this timer.
+				// success, never on a dead feed. The feed can deliver before this list fails,
+				// and then it will not fire again, so a quiet tab still needs this timer.
 				schedule_companion_retry(collection);
 			});
 	};
 
 	const retry_incomplete_companion = (collection: "reactions" | "replies") => {
 		const coverage = collection === "reactions" ? reactionsCoverageRef.current : repliesCoverageRef.current;
-		if (coverage === null || !coverage.incomplete || coverage.death !== null) {
+		if (coverage === null || !coverage.incomplete || coverage.dead) {
 			return;
 		}
 		clear_companion_retry(collection);
@@ -2473,7 +2420,7 @@ export function ChannelView(props: ChannelView_Props) {
 		}
 		for (const collection of ["reactions", "replies"] as const) {
 			const coverage = collection === "reactions" ? reactionsCoverageRef.current : repliesCoverageRef.current;
-			if (coverage === null || !coverage.hasMore || coverage.incomplete || coverage.death !== null) {
+			if (coverage === null || !coverage.hasMore || coverage.incomplete || coverage.dead) {
 				continue;
 			}
 			if (coverage.deepestRoot === null || coverage.deepestRoot < oldestRoot) {
@@ -2493,24 +2440,19 @@ export function ChannelView(props: ChannelView_Props) {
 			return;
 		}
 		feedsStartedRef.current = true;
-		// One fence for all three feeds: the newest messages-window updatedAt. Companion lists
-		// do not pick their own. A lower fence only over-delivers, and the merge already dedups.
-		// The query is inclusive, so subscribe at this value as-is — not plus one.
-		setFeedsReadGeneration(readGeneration);
+		// One fence for all three feeds: the newest timeline updatedAt. Companion lists do not
+		// pick their own. A lower fence only over-delivers, and the merge already dedups. The
+		// query is inclusive, so subscribe at this value as-is — not plus one.
 		setMessagesSince(fence);
 		setRepliesSince(fence);
 		setReactionsSince(fence);
 	};
 
-	// Messages window: the host retains loaded history, so each update is the whole window.
-	// The accumulating store stays as the merge seam for optimistic local echoes (its
-	// revision-forward rule), plus remote-arrival detection for the announcer.
+	// One mount owns one channel. Create the stores and the companion bookkeeping here, and stop
+	// every companion timer on unmount. StrictMode replays this pair, so the companion fences and
+	// in-flight flags reset each time the mount runs.
 	useEffect(() => {
-		let active = true;
-		let announcementVersion = 0;
-		// Keep cached rows and the mounted composer while a membership change replaces the reads.
-		const store = messagesStoreRef.current ?? chat_create_accumulating_store(chat_validate_message_doc);
-		messagesStoreRef.current = store;
+		messagesStoreRef.current ??= chat_create_accumulating_store(chat_validate_message_doc);
 		repliesStoreRef.current ??= chat_create_accumulating_store(chat_validate_message_doc);
 		reactionsStoreRef.current ??= chat_create_accumulating_store(chat_validate_reaction_doc);
 		companionGenerationRef.current += 1;
@@ -2522,251 +2464,229 @@ export function ChannelView(props: ChannelView_Props) {
 		reset_companion_retry("replies");
 		reactionsCoverageRef.current = null;
 		repliesCoverageRef.current = null;
-		setReactionCoverage(INITIAL_COMPANION_COVERAGE);
-		setReplyCoverage(INITIAL_COMPANION_COVERAGE);
-		setFeedsReadGeneration(null);
-		setMessagesSince(null);
-		setRepliesSince(null);
-		setReactionsSince(null);
-		windowHistoryFenceRef.current = null;
-		const watchWindow = client.data.watchWindow(
-			{ collection: "messages", keyPrefix: chat_message_key_prefix(channel.key), pageSize: 100 },
-			(update, info) => {
-				if (update === null) {
-					setMessagesDeath({ reason: info?.reason });
-					return;
-				}
-				setMessagesDeath(null);
-				const windowDocs = store.apply_window(update.docs);
-				setMessages(store.get_sorted());
-				setMessagesLoaded(true);
-				setMessagesWindow({ hasMore: update.hasMore, atCapacity: update.atCapacity, incomplete: update.incomplete });
-				// Read the server-ordered raw frontier off this delivery. A foreign value still occupies
-				// the shared store and must not hide older valid messages or companion rows.
-				const windowOldestKey = update.docs.at(-1)?.key ?? null;
-				windowOldestKeyRef.current = windowOldestKey;
-				oldestRootRef.current = windowOldestKey === null ? null : chat_root_message_key(windowOldestKey);
-				start_feeds_if_needed(update.docs);
-				if (reactionsCoverageRef.current === null && !companionInflightRef.current.reactions) {
-					list_companion("reactions");
-				}
-				if (repliesCoverageRef.current === null && !companionInflightRef.current.replies) {
-					list_companion("replies");
-				}
-				evaluate_companion_catch_up();
-
-				const seen = seenKeysRef.current;
-				// The first window is existing history, never announced.
-				if (seen === null) {
-					seenKeysRef.current = new Set(windowDocs.map((doc) => doc.key));
-					return;
-				}
-				const historyFence = windowHistoryFenceRef.current;
-				if (historyFence !== null) {
-					const historyFenceIndex = update.docs.findIndex((doc) => doc.key === historyFence);
-					if (historyFenceIndex < 0) {
-						windowHistoryFenceRef.current = null;
-					} else {
-						// The host orders this array. Rows below the old frontier are loaded history, while a
-						// concurrent newer row is above it and must still reach the announcer.
-						const historyDocs = update.docs.slice(historyFenceIndex + 1);
-						for (const historyDoc of historyDocs) {
-							seen.add(historyDoc.key);
-						}
-						// The SDK can report atCapacity before its sixth tail has delivered. Keep the
-						// fence through that state so the later tail still reads as history.
-						if (historyDocs.length > 0 || !update.hasMore) {
-							windowHistoryFenceRef.current = null;
-						}
-					}
-				}
-				// Announce only messages authored by OTHER members. The user's own sends must
-				// never reach the announcer — the log itself is aria-live="off" for the same reason.
-				const arrivals = windowDocs.filter(
-					(doc) => !seen.has(doc.key) && doc.createdBy !== userId && doc.value.deletedAt === null,
-				);
-				for (const doc of windowDocs) {
-					seen.add(doc.key);
-				}
-				const currentAnnouncementVersion = arrivals.length > 0 ? ++announcementVersion : announcementVersion;
-				if (arrivals.length === 1) {
-					const arrival = arrivals[0];
-					memberNames
-						.resolve([arrival.createdBy])
-						.then(() => {
-							if (!active || currentAnnouncementVersion !== announcementVersion) {
-								return;
-							}
-							const name = memberNames.get(arrival.createdBy) ?? null;
-							const text = arrival.value.text;
-							const preview = text.length > 80 ? `${text.slice(0, 80)}…` : text;
-							announce(`${name ?? "Former member"}: ${preview}`);
-						})
-						.catch(() => {
-							if (!active || currentAnnouncementVersion !== announcementVersion) {
-								return;
-							}
-							announce(`New message in #${channelNameRef.current}`);
-						});
-				} else if (arrivals.length > 1) {
-					// Coalesce a burst into one announcement.
-					announce(`${arrivals.length} new messages in #${channelNameRef.current}`);
-				}
-			},
-		);
-		messagesWindowRef.current = watchWindow;
 		return () => {
-			active = false;
 			companionMountedRef.current = false;
 			reset_companion_retry("reactions");
 			reset_companion_retry("replies");
-			messagesWindowRef.current = null;
-			watchWindow.unsubscribe();
 		};
-	}, [client, channel.key, readGeneration, userId, memberNames, announce]);
+	}, []);
 
+	// Messages timeline: Convex keeps every loaded page live, so each delivery is the whole
+	// list. The accumulating store stays as the merge seam for optimistic local echoes (its
+	// revision-forward rule), plus remote-arrival detection for the announcer.
+	useEffect(() => {
+		const store = messagesStoreRef.current;
+		if (timeline.status === "LoadingFirstPage" || store === null) {
+			return;
+		}
+		const windowDocs = store.apply_window(timeline.results);
+		setMessages(store.get_sorted());
+		setMessagesLoaded(true);
+		// Read the server-ordered raw frontier off this delivery. A foreign value still occupies
+		// the shared store and must not hide older valid messages or companion rows.
+		const windowOldestKey = timeline.results.at(-1)?.key ?? null;
+		windowOldestKeyRef.current = windowOldestKey;
+		oldestRootRef.current = windowOldestKey === null ? null : chat_root_message_key(windowOldestKey);
+		start_feeds_if_needed(timeline.results);
+		if (reactionsCoverageRef.current === null && !companionInflightRef.current.reactions) {
+			list_companion("reactions");
+		}
+		if (repliesCoverageRef.current === null && !companionInflightRef.current.replies) {
+			list_companion("replies");
+		}
+		evaluate_companion_catch_up();
+
+		const seen = seenKeysRef.current;
+		// The first page is existing history, never announced.
+		if (seen === null) {
+			seenKeysRef.current = new Set(windowDocs.map((doc) => doc.key));
+			return;
+		}
+		const historyFence = windowHistoryFenceRef.current;
+		if (historyFence !== null) {
+			const historyFenceIndex = timeline.results.findIndex((doc) => doc.key === historyFence);
+			if (historyFenceIndex < 0) {
+				windowHistoryFenceRef.current = null;
+			} else {
+				// The server orders this array. Rows below the old frontier are loaded history, while a
+				// concurrent newer row is above it and must still reach the announcer.
+				const historyDocs = timeline.results.slice(historyFenceIndex + 1);
+				for (const historyDoc of historyDocs) {
+					seen.add(historyDoc.key);
+				}
+				// A newer row can land while the older page is still loading. Keep the fence through
+				// that state so the page still reads as history when it arrives.
+				if (historyDocs.length > 0 || timeline.status !== "LoadingMore") {
+					windowHistoryFenceRef.current = null;
+				}
+			}
+		}
+		// Announce only messages authored by OTHER members. The user's own sends must
+		// never reach the announcer — the log itself is aria-live="off" for the same reason.
+		const arrivals = windowDocs.filter(
+			(doc) => !seen.has(doc.key) && doc.createdBy !== userId && doc.value.deletedAt === null,
+		);
+		for (const doc of windowDocs) {
+			seen.add(doc.key);
+		}
+		const currentAnnouncementVersion =
+			arrivals.length > 0 ? ++announcementVersionRef.current : announcementVersionRef.current;
+		if (arrivals.length === 1) {
+			const arrival = arrivals[0];
+			memberNames
+				.resolve([arrival.createdBy])
+				.then(() => {
+					if (!companionMountedRef.current || currentAnnouncementVersion !== announcementVersionRef.current) {
+						return;
+					}
+					const name = memberNames.get(arrival.createdBy) ?? null;
+					const text = arrival.value.text;
+					const preview = text.length > 80 ? `${text.slice(0, 80)}…` : text;
+					announce(`${name ?? "Former member"}: ${preview}`);
+				})
+				.catch(() => {
+					if (!companionMountedRef.current || currentAnnouncementVersion !== announcementVersionRef.current) {
+						return;
+					}
+					announce(`New message in #${channelNameRef.current}`);
+				});
+		} else if (arrivals.length > 1) {
+			// Coalesce a burst into one announcement.
+			announce(`${arrivals.length} new messages in #${channelNameRef.current}`);
+		}
+	}, [timeline.results, timeline.status, userId, memberNames, announce]);
+
+	// The change feeds. Each one is a live query pinned at its own `since`; a delivery moves that
+	// fence forward, which re-subscribes at the new value. A null answer is a refusal: the feed is
+	// dead until the door answers again, and the rows it fed stay as they were.
 	const feed_scope_args = privateScopeId === undefined ? {} : { scopeId: privateScopeId };
+	const messagesFeed = useQuery(
+		client.api.plugins_data.watch_changes,
+		messagesSince === null
+			? "skip"
+			: { collection: "messages", limit: 100, updatedSince: messagesSince, ...feed_scope_args },
+	);
+	const repliesFeed = useQuery(
+		client.api.plugins_data.watch_changes,
+		repliesSince === null ? "skip" : { collection: "replies", limit: 100, updatedSince: repliesSince, ...feed_scope_args },
+	);
+	const reactionsFeed = useQuery(
+		client.api.plugins_data.watch_changes,
+		reactionsSince === null
+			? "skip"
+			: { collection: "reactions", limit: 100, updatedSince: reactionsSince, ...feed_scope_args },
+	);
 
 	useEffect(() => {
-		if (messagesSince === null || feedsReadGeneration !== readGeneration) {
+		if (messagesFeed === undefined || messagesSince === null) {
 			return;
 		}
-		const unsubscribe = client.data.watchChanges(
-			{ collection: "messages", limit: 100, updatedSince: messagesSince, ...feed_scope_args },
-			(update, info) => {
-				if (update === null) {
-					setMessagesDeath({ reason: info?.reason });
-					return;
-				}
-				setMessagesDeath(null);
-				const store = messagesStoreRef.current;
-				if (store === null) {
-					return;
-				}
-				const mine = docs_in_prefix(update.docs, channelPrefix);
-				store.apply_window(mine);
-				setMessages(store.get_sorted());
-				if (update.truncated && windowOldestKeyRef.current !== null) {
-					list_plugin_documents(client, {
-						collection: "messages",
-						keyPrefix: channelPrefix,
-						keyStartExclusive: windowOldestKeyRef.current,
-						limit: DEEP_HISTORY_PAGE_SIZE,
-					})
-						.then((page) => {
-							apply_message_docs(page.documents);
-						})
-						.catch(() => {});
-				}
-				const newest = newest_raw_updated_at(update.docs);
-				const nextSince = next_feed_since({
-					current: messagesSince,
-					newest,
-					truncated: update.truncated,
-				});
-				if (nextSince !== null) {
-					setMessagesSince(nextSince);
-				}
-			},
-		);
-		return unsubscribe;
-	}, [client, channel.key, messagesSince, feedsReadGeneration, readGeneration, privateScopeId, channelPrefix]);
+		if (messagesFeed === null) {
+			setMessagesDead(true);
+			return;
+		}
+		setMessagesDead(false);
+		const store = messagesStoreRef.current;
+		if (store === null) {
+			return;
+		}
+		const mine = docs_in_prefix(messagesFeed.docs, channelPrefix);
+		store.apply_window(mine);
+		setMessages(store.get_sorted());
+		const newest = newest_raw_updated_at(messagesFeed.docs);
+		const nextSince = next_feed_since({
+			current: messagesSince,
+			newest,
+			truncated: messagesFeed.truncated,
+		});
+		if (nextSince !== null) {
+			setMessagesSince(nextSince);
+		}
+	}, [messagesFeed, messagesSince, channelPrefix]);
 
 	useEffect(() => {
-		if (repliesSince === null || feedsReadGeneration !== readGeneration) {
+		if (repliesFeed === undefined || repliesSince === null) {
 			return;
 		}
-		const unsubscribe = client.data.watchChanges(
-			{ collection: "replies", limit: 100, updatedSince: repliesSince, ...feed_scope_args },
-			(update, info) => {
-				if (update === null) {
-					clear_companion_retry("replies");
-					const previous = repliesCoverageRef.current ?? {
-						hasMore: false,
-						deepestRoot: null,
-						incomplete: false,
-						death: null,
-					};
-					const next = { ...previous, incomplete: false, death: { reason: info?.reason } };
-					repliesCoverageRef.current = next;
-					setReplyCoverage(next);
-					return;
-				}
-				const store = repliesStoreRef.current;
-				if (store === null) {
-					return;
-				}
-				const previous = repliesCoverageRef.current;
-				if (previous !== null && previous.death !== null) {
-					const next = { ...previous, death: null };
-					repliesCoverageRef.current = next;
-					setReplyCoverage(next);
-				}
-				const mine = docs_in_prefix(update.docs, channelPrefix);
-				store.apply_window(mine);
-				setChannelReplies(store.get_sorted());
-				retry_incomplete_companion("replies");
-				const newest = newest_raw_updated_at(update.docs);
-				const nextSince = next_feed_since({
-					current: repliesSince,
-					newest,
-					truncated: update.truncated,
-				});
-				if (nextSince !== null) {
-					setRepliesSince(nextSince);
-				}
-			},
-		);
-		return unsubscribe;
-	}, [client, channel.key, repliesSince, feedsReadGeneration, readGeneration, privateScopeId, channelPrefix]);
+		if (repliesFeed === null) {
+			clear_companion_retry("replies");
+			const previous = repliesCoverageRef.current ?? {
+				hasMore: false,
+				deepestRoot: null,
+				incomplete: false,
+				dead: false,
+			};
+			const next = { ...previous, incomplete: false, dead: true };
+			repliesCoverageRef.current = next;
+			setReplyCoverage(next);
+			return;
+		}
+		const store = repliesStoreRef.current;
+		if (store === null) {
+			return;
+		}
+		const previous = repliesCoverageRef.current;
+		if (previous !== null && previous.dead) {
+			const next = { ...previous, dead: false };
+			repliesCoverageRef.current = next;
+			setReplyCoverage(next);
+		}
+		const mine = docs_in_prefix(repliesFeed.docs, channelPrefix);
+		store.apply_window(mine);
+		setChannelReplies(store.get_sorted());
+		retry_incomplete_companion("replies");
+		const newest = newest_raw_updated_at(repliesFeed.docs);
+		const nextSince = next_feed_since({
+			current: repliesSince,
+			newest,
+			truncated: repliesFeed.truncated,
+		});
+		if (nextSince !== null) {
+			setRepliesSince(nextSince);
+		}
+	}, [repliesFeed, repliesSince, channelPrefix]);
 
 	useEffect(() => {
-		if (reactionsSince === null || feedsReadGeneration !== readGeneration) {
+		if (reactionsFeed === undefined || reactionsSince === null) {
 			return;
 		}
-		const unsubscribe = client.data.watchChanges(
-			{ collection: "reactions", limit: 100, updatedSince: reactionsSince, ...feed_scope_args },
-			(update, info) => {
-				if (update === null) {
-					clear_companion_retry("reactions");
-					const previous = reactionsCoverageRef.current ?? {
-						hasMore: false,
-						deepestRoot: null,
-						incomplete: false,
-						death: null,
-					};
-					const next = { ...previous, incomplete: false, death: { reason: info?.reason } };
-					reactionsCoverageRef.current = next;
-					setReactionCoverage(next);
-					return;
-				}
-				const store = reactionsStoreRef.current;
-				if (store === null) {
-					return;
-				}
-				const previous = reactionsCoverageRef.current;
-				if (previous !== null && previous.death !== null) {
-					const next = { ...previous, death: null };
-					reactionsCoverageRef.current = next;
-					setReactionCoverage(next);
-				}
-				const mine = docs_in_prefix(update.docs, channelPrefix);
-				store.apply_window(mine);
-				setReactionDocs(store.get_sorted());
-				retry_incomplete_companion("reactions");
-				const newest = newest_raw_updated_at(update.docs);
-				const nextSince = next_feed_since({
-					current: reactionsSince,
-					newest,
-					truncated: update.truncated,
-				});
-				if (nextSince !== null) {
-					setReactionsSince(nextSince);
-				}
-			},
-		);
-		return unsubscribe;
-	}, [client, channel.key, reactionsSince, feedsReadGeneration, readGeneration, privateScopeId, channelPrefix]);
+		if (reactionsFeed === null) {
+			clear_companion_retry("reactions");
+			const previous = reactionsCoverageRef.current ?? {
+				hasMore: false,
+				deepestRoot: null,
+				incomplete: false,
+				dead: false,
+			};
+			const next = { ...previous, incomplete: false, dead: true };
+			reactionsCoverageRef.current = next;
+			setReactionCoverage(next);
+			return;
+		}
+		const store = reactionsStoreRef.current;
+		if (store === null) {
+			return;
+		}
+		const previous = reactionsCoverageRef.current;
+		if (previous !== null && previous.dead) {
+			const next = { ...previous, dead: false };
+			reactionsCoverageRef.current = next;
+			setReactionCoverage(next);
+		}
+		const mine = docs_in_prefix(reactionsFeed.docs, channelPrefix);
+		store.apply_window(mine);
+		setReactionDocs(store.get_sorted());
+		retry_incomplete_companion("reactions");
+		const newest = newest_raw_updated_at(reactionsFeed.docs);
+		const nextSince = next_feed_since({
+			current: reactionsSince,
+			newest,
+			truncated: reactionsFeed.truncated,
+		});
+		if (nextSince !== null) {
+			setReactionsSince(nextSince);
+		}
+	}, [reactionsFeed, reactionsSince, channelPrefix]);
 
 	useEffect(() => {
 		const on_visibility = () => {
@@ -2794,7 +2714,7 @@ export function ChannelView(props: ChannelView_Props) {
 		list_plugin_documents(client, {
 			collection: "replies",
 			keyPrefix: chat_reply_key_prefix(threadRootKey),
-			limit: DEEP_HISTORY_PAGE_SIZE,
+			limit: LIST_PAGE_SIZE,
 		})
 			.then((page) => {
 				if (cancelled) {
@@ -2814,7 +2734,7 @@ export function ChannelView(props: ChannelView_Props) {
 		return () => {
 			cancelled = true;
 		};
-	}, [client, threadRootKey, readGeneration]);
+	}, [client, threadRootKey]);
 
 	const queue = use_send_queue({
 		client,
@@ -2874,108 +2794,12 @@ export function ChannelView(props: ChannelView_Props) {
 		}
 	}, [messages, queue.pending.length]);
 
-	// The SDK window retains everything it loaded, so "load older" is one call on the window
-	// handle; the extended window arrives as a normal update.
+	// Every loaded page stays live, so "load older" is one call on the timeline; the longer list
+	// arrives as a normal delivery, and the fence tells the announcer those rows are history.
 	const handle_load_older = () => {
-		const window = messagesWindowRef.current;
-		if (window === null) {
-			return;
-		}
 		windowHistoryFenceRef.current = windowOldestKeyRef.current;
-		window.loadOlder();
+		timeline.loadMore(100);
 	};
-
-	/**
-	 * Once the window has spent its intervals, older history comes over HTTP instead.
-	 *
-	 * The continuation is a fencepost, not a cursor. The route now takes a cursor beside a key range,
-	 * but it binds each cursor to the exact range it was issued for and refuses one sent back with a
-	 * different range. A fencepost is just a key, so it needs no such binding and it survives a page
-	 * reload. The first press continues from the window's own oldest key, so nothing the window
-	 * already holds is fetched again.
-	 */
-	const handle_load_older_http = () => {
-		const fencepost = httpOldestKeyRef.current ?? windowOldestKeyRef.current;
-		if (fencepost === null) {
-			return;
-		}
-		setDeepHistory({ kind: "loading" });
-		client
-			.fetchJson("/api/v1/plugin-data/list", {
-				body: {
-					collection: "messages",
-					keyPrefix: chat_message_key_prefix(channel.key),
-					keyStartExclusive: fencepost,
-					limit: DEEP_HISTORY_PAGE_SIZE,
-				},
-			})
-			.then((raw: unknown) => {
-				const parsed = chat_plugin_data_list_response_schema.safeParse(raw);
-				if (!parsed.success) {
-					setDeepHistory({ kind: "failed", message: "Unexpected response for older messages.", retryAt: null });
-					return;
-				}
-				const store = messagesStoreRef.current;
-				if (store === null) {
-					return;
-				}
-				if (parsed.data.documents.length === 0 && !parsed.data.isDone) {
-					setDeepHistory({
-						kind: "failed",
-						message: "Older messages returned an incomplete page. Please retry.",
-						retryAt: null,
-					});
-					return;
-				}
-				const lastEnvelope = parsed.data.documents.at(-1);
-				if (lastEnvelope !== undefined) {
-					// Continue from the last valid envelope, even when this Chitchat version drops its value.
-					httpOldestKeyRef.current = lastEnvelope.key;
-				}
-				// The store merges by key, so a page that overlaps what is already held adds nothing.
-				const merged = store.apply_window(parsed.data.documents);
-				setMessages(store.get_sorted());
-				for (const doc of merged) {
-					// These rows are history. They must never reach the announcer as new arrivals.
-					seenKeysRef.current?.add(doc.key);
-				}
-				// `isDone` is the route's own exhaustion signal. A page that happens to be exactly
-				// full is not the end, and treating it as one would hide real history.
-				setDeepHistory(parsed.data.isDone ? { kind: "exhausted" } : { kind: "idle" });
-			})
-			.catch((error: unknown) => {
-				// `fetchJson` throws on every non-ok response, so 429 is one branch of many. Only the
-				// throttled one names a wait and clears itself; the rest hand back a Retry.
-				const status = (error as { status?: unknown }).status;
-				if (status !== 429) {
-					setDeepHistory({ kind: "failed", message: chat_get_error_message(error), retryAt: null });
-					return;
-				}
-				const retryAfterMs = read_retry_after_ms((error as { responseText?: unknown }).responseText) ?? 1_000;
-				setDeepHistory({
-					kind: "failed",
-					message: "Older messages are being loaded too quickly. Waiting a moment before you can try again.",
-					retryAt: Date.now() + retryAfterMs,
-				});
-			});
-	};
-
-	// The throttle clears itself: the bucket refills at two tokens a second, so the control returns
-	// to idle on its own rather than staying dead for the life of the frame. It never re-requests.
-	useEffect(() => {
-		if (deepHistory.kind !== "failed" || deepHistory.retryAt === null) {
-			return;
-		}
-		const timer = setTimeout(
-			() => {
-				setDeepHistory({ kind: "idle" });
-			},
-			Math.max(0, deepHistory.retryAt - Date.now()),
-		);
-		return () => {
-			clearTimeout(timer);
-		};
-	}, [deepHistory]);
 
 	// The separator publishes its range to assistive tech, and that range is the container's width
 	// minus the log floor. Reading the element during render would give a number from the previous
@@ -3093,16 +2917,6 @@ export function ChannelView(props: ChannelView_Props) {
 	const threadWidthMaximum = Math.max(MIN_THREAD_WIDTH, bodyWidth - MIN_LOG_WIDTH);
 	const threadWidthEffective = clamp_thread_width(threadWidth);
 
-	if (messagesDeath !== null && privateScopeId === undefined) {
-		return (
-			<div className="channel">
-				<div className="channel-dead" role="alert">
-					{watch_death_message(messagesDeath.reason, `messages in #${channel.value.name}`)}
-				</div>
-			</div>
-		);
-	}
-
 	return (
 		<div className="channel">
 			<header className="channel-head">
@@ -3132,55 +2946,23 @@ export function ChannelView(props: ChannelView_Props) {
 					aria-live="off"
 					aria-label={`Messages in #${channel.value.name}`}
 				>
-					{messagesDeath !== null ? (
+					{messagesDead ? (
 						<div className="channel-status is-error" role="alert">
-							{watch_death_message(messagesDeath.reason, `messages in #${channel.value.name}`)}
+							{watch_death_message(client, `messages in #${channel.value.name}`)}
 						</div>
 					) : null}
-					{messagesLoaded && messagesWindow.hasMore && !messagesWindow.atCapacity ? (
+					{/* The hook says whether older pages exist. While one loads, the button stays on
+					    screen but disabled, so focus does not fall off it. */}
+					{messagesLoaded && (timeline.status === "CanLoadMore" || timeline.status === "LoadingMore") ? (
 						<div className="log-older">
-							<button type="button" className="button" onClick={handle_load_older}>
+							<button
+								type="button"
+								className="button"
+								disabled={timeline.status === "LoadingMore"}
+								onClick={handle_load_older}
+							>
 								Load older
 							</button>
-						</div>
-					) : null}
-					{/* The live window has spent its intervals. Deeper history still exists and is
-					    readable over HTTP, so the capacity state is a working control, not a dead end.
-					    The log itself is aria-live="off", so the state line carries role="status" or
-					    reaching capacity would be announced to nobody. */}
-					{messagesLoaded && messagesWindow.hasMore && messagesWindow.atCapacity ? (
-						<div className="log-older">
-							<span className="channel-status" role="status">
-								{deepHistory.kind === "loading"
-									? "Loading older messages…"
-									: deepHistory.kind === "exhausted"
-										? `You have reached the start of #${channel.value.name}.`
-										: "The live view stopped growing. Older messages load on request."}
-							</span>
-							{deepHistory.kind === "exhausted" ? null : (
-								<button
-									type="button"
-									className="button"
-									disabled={
-										deepHistory.kind === "loading" || (deepHistory.kind === "failed" && deepHistory.retryAt !== null)
-									}
-									onClick={handle_load_older_http}
-								>
-									Load older messages
-								</button>
-							)}
-							{deepHistory.kind === "failed" ? (
-								<span className="channel-status is-error" role="alert">
-									{deepHistory.message}
-								</span>
-							) : null}
-						</div>
-					) : null}
-					{/* Nothing is missing from this view — the rows are all still here. What the store
-					    holds for the range it lost is frozen at the last value it heard about. */}
-					{messagesWindow.incomplete ? (
-						<div className="channel-status" role="alert">
-							Older messages in view may be out of date.
 						</div>
 					) : null}
 					{reactionCoverage.incomplete || replyCoverage.incomplete ? (
@@ -3188,14 +2970,14 @@ export function ChannelView(props: ChannelView_Props) {
 							Some reactions and replies in this range could not be loaded.
 						</div>
 					) : null}
-					{reactionCoverage.death !== null ? (
+					{reactionCoverage.dead ? (
 						<div className="channel-status is-error" role="alert">
-							{watch_death_message(reactionCoverage.death.reason, "reactions in this channel")}
+							{watch_death_message(client, "reactions in this channel")}
 						</div>
 					) : null}
-					{replyCoverage.death !== null ? (
+					{replyCoverage.dead ? (
 						<div className="channel-status is-error" role="alert">
-							{watch_death_message(replyCoverage.death.reason, "reply counts in this channel")}
+							{watch_death_message(client, "reply counts in this channel")}
 						</div>
 					) : null}
 					{!messagesLoaded ? (

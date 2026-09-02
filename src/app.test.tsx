@@ -1,18 +1,212 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type {
-	BonoboUiFrontendClient,
-	BonoboUiScopePrincipal,
-	BonoboUiScopePrincipalListResult,
-	BonoboUiTheme,
-} from "bonobo-plugin-sdk/frontend";
+import type { BonoboUiFrontendClient, BonoboUiTheme } from "bonobo-plugin-sdk/frontend";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { App } from "./app";
+import { App, ChatErrorBoundary } from "./app";
 import {
 	chat_ANONYMOUS_MEMBER_LABEL,
 	chat_mention_roster_refusal_copy,
 	chat_PRIVATE_CHANNEL_COLLECTIONS,
 } from "./chat-data";
+import type { chat_Member, chat_ScopePrincipal } from "./chat-doors";
+
+/**
+ * The fake behind `convex/react`. The real hooks need a `ConvexReactClient` with a WebSocket and
+ * a server behind it. These tests assert what the page asks for and how it renders the answers,
+ * not the transport, so every hook call becomes one fake subscription keyed by door and arguments.
+ * A test finds that subscription and delivers a value, `null` (a refused read), or an error.
+ *
+ * `vi.hoisted` lifts this above the imports, because `vi.mock` runs before them and needs it.
+ */
+const convex_fake = vi.hoisted(() => {
+	type Status = "LoadingFirstPage" | "CanLoadMore" | "LoadingMore" | "Exhausted";
+	type Sub = {
+		door: string;
+		opts: Record<string, unknown>;
+		key: string;
+		refs: number;
+		unsubscribed: boolean;
+		loaded: boolean;
+		value: unknown;
+		error: Error | null;
+		/** Paginated subscriptions only: the rows and the hook status. */
+		results: unknown[];
+		status: Status;
+		loadOlderCalls: number;
+		lastLoadMore: number | null;
+		listeners: Set<() => void>;
+		onUpdate: (update: unknown) => void;
+		onError: (error: Error) => void;
+	};
+	const subs: Sub[] = [];
+	let version = 0;
+	// The harness swaps this for React's `act`, so every delivery renders before the next one.
+	// Two deliveries in a row then both reach the page, the way two SDK callbacks used to; the
+	// hooks alone would only ever see the last one.
+	let flush = (run: () => void) => run();
+	const set_flush = (next: (run: () => void) => void) => {
+		flush = next;
+	};
+	const notify = (sub: Sub) => {
+		version += 1;
+		for (const listener of [...sub.listeners]) {
+			listener();
+		}
+	};
+	const key_of = (door: string, opts: Record<string, unknown>) => `${door}:${JSON.stringify(opts)}`;
+	const live = (key: string) => subs.findLast((sub) => !sub.unsubscribed && sub.key === key);
+	const acquire = (door: string, opts: Record<string, unknown>) => {
+		const key = key_of(door, opts);
+		const existing = live(key);
+		if (existing !== undefined) {
+			existing.refs += 1;
+			return existing;
+		}
+		const sub: Sub = {
+			door,
+			opts,
+			key,
+			refs: 1,
+			unsubscribed: false,
+			loaded: false,
+			value: undefined,
+			error: null,
+			results: [],
+			status: "LoadingFirstPage",
+			loadOlderCalls: 0,
+			lastLoadMore: null,
+			listeners: new Set(),
+			onUpdate: (update) => {
+				flush(() => {
+					sub.loaded = true;
+					sub.error = null;
+					if (door === "watch_documents_page") {
+						const page = update as { docs: unknown[]; hasMore: boolean; stillLoading?: boolean };
+						sub.results = page.docs;
+						sub.status = page.stillLoading ? "LoadingMore" : page.hasMore ? "CanLoadMore" : "Exhausted";
+					} else {
+						sub.value = update;
+					}
+					notify(sub);
+				});
+			},
+			onError: (error) => {
+				flush(() => {
+					sub.loaded = true;
+					sub.error = error;
+					notify(sub);
+				});
+			},
+		};
+		subs.push(sub);
+		return sub;
+	};
+	// The real `useQueries` re-subscribes to a changed set inside one commit and keeps the answers
+	// it already had. Ending a subscription in a microtask gives the fake that same window: a
+	// cleanup followed at once by a fresh subscribe revives the same fake instead of starting over.
+	const release = (sub: Sub) => {
+		sub.refs -= 1;
+		queueMicrotask(() => {
+			if (sub.refs <= 0) {
+				sub.unsubscribed = true;
+			}
+		});
+	};
+	return { subs, key_of, live, acquire, release, notify, set_flush, version: () => version };
+});
+
+vi.mock("convex/react", async () => {
+	const React = await import("react");
+	type Ref = { door: string };
+	type Entry = { door: string; opts: Record<string, unknown> };
+	const NO_RESULTS: unknown[] = [];
+
+	/** Subscribes the component to every entry; the returned version changes on each delivery. */
+	function use_fake_subscriptions(entries: Entry[]) {
+		const keys = entries.map((entry) => convex_fake.key_of(entry.door, entry.opts)).join("|");
+		const subscribe = React.useCallback(
+			(onChange: () => void) => {
+				const subs = entries.map((entry) => convex_fake.acquire(entry.door, entry.opts));
+				for (const sub of subs) {
+					sub.listeners.add(onChange);
+				}
+				return () => {
+					for (const sub of subs) {
+						sub.listeners.delete(onChange);
+						convex_fake.release(sub);
+					}
+				};
+			},
+			// The entries only change when the keys do.
+			[keys],
+		);
+		return React.useSyncExternalStore(subscribe, convex_fake.version);
+	}
+
+	function useQuery(ref: Ref, args: Record<string, unknown> | "skip") {
+		use_fake_subscriptions(args === "skip" ? [] : [{ door: ref.door, opts: args }]);
+		if (args === "skip") {
+			return undefined;
+		}
+		const sub = convex_fake.live(convex_fake.key_of(ref.door, args));
+		if (sub === undefined || !sub.loaded) {
+			return undefined;
+		}
+		if (sub.error !== null) {
+			throw sub.error;
+		}
+		return sub.value;
+	}
+
+	function useQueries(queries: Record<string, { query: Ref; args: Record<string, unknown> }>) {
+		const entries = Object.entries(queries).map(([name, query]) => ({
+			name,
+			door: query.query.door,
+			opts: query.args,
+		}));
+		const version = use_fake_subscriptions(entries);
+		const keys = entries.map((entry) => convex_fake.key_of(entry.door, entry.opts)).join("|");
+		// Keep the record's identity until a delivery or a set change, like the real hook.
+		return React.useMemo(() => {
+			const result: Record<string, unknown> = {};
+			for (const entry of entries) {
+				const sub = convex_fake.live(convex_fake.key_of(entry.door, entry.opts));
+				result[entry.name] = sub === undefined || !sub.loaded ? undefined : (sub.error ?? sub.value);
+			}
+			return result;
+		}, [keys, version]);
+	}
+
+	function usePaginatedQuery(ref: Ref, args: Record<string, unknown>, _options: { initialNumItems: number }) {
+		use_fake_subscriptions([{ door: ref.door, opts: args }]);
+		const sub = convex_fake.live(convex_fake.key_of(ref.door, args));
+		if (sub?.error) {
+			throw sub.error;
+		}
+		const status = sub?.status ?? "LoadingFirstPage";
+		return {
+			results: sub?.results ?? NO_RESULTS,
+			status,
+			isLoading: status === "LoadingFirstPage" || status === "LoadingMore",
+			loadMore: (numItems: number) => {
+				if (sub === undefined) {
+					return;
+				}
+				sub.loadOlderCalls += 1;
+				sub.lastLoadMore = numItems;
+				sub.status = "LoadingMore";
+				convex_fake.notify(sub);
+			},
+		};
+	}
+
+	return {
+		ConvexProvider: (props: { children: React.ReactNode }) => props.children,
+		useQuery,
+		useQueries,
+		usePaginatedQuery,
+	};
+});
 
 function inv(epochMs: number): string {
 	return String(9_999_999_999_999 - epochMs).padStart(13, "0");
@@ -125,17 +319,15 @@ function reaction_doc(targetKey: string, token: string, createdBy: string, keyTa
 	};
 }
 
+/** What the document reads answer: `watch_documents`, `watch_recent`, and `watch_changes`. */
 type WatchUpdate = { docs: unknown[]; truncated: boolean };
 
-/** The death payload the SDK hands a watch alongside its final null. */
-type WatchDeathInfo = { reason?: string; message?: string };
+type FakeSub = (typeof convex_fake)["subs"][number];
 
-type WatchSub = {
+/** One `watch_documents` subscription. `null` is a refused read. */
+type WatchSub = Omit<FakeSub, "opts" | "onUpdate"> & {
 	opts: { collection: string; keyPrefix?: string; limit: number };
-	onUpdate: (update: WatchUpdate | null, info?: WatchDeathInfo) => void;
-	// Only the direct Convex subscription (the cursors read) has one.
-	onError?: (error: Error) => void;
-	unsubscribed: boolean;
+	onUpdate: (update: WatchUpdate | null) => void;
 };
 
 /** Builds one watch update payload; `truncated` defaults to a read that reached everything. */
@@ -143,7 +335,8 @@ function watch_update(docs: unknown[], truncated = false): WatchUpdate {
 	return { docs, truncated };
 }
 
-type RecentSub = {
+/** One `watch_recent` subscription. */
+type RecentSub = Omit<FakeSub, "opts" | "onUpdate"> & {
 	opts: {
 		collection: string;
 		limit: number;
@@ -152,34 +345,36 @@ type RecentSub = {
 		before?: number;
 		scopeId?: string;
 	};
-	onUpdate: (update: WatchUpdate | null, info?: WatchDeathInfo) => void;
-	unsubscribed: boolean;
+	onUpdate: (update: WatchUpdate | null) => void;
 };
 
-type ChangesSub = {
+/** One `watch_changes` subscription. */
+type ChangesSub = Omit<FakeSub, "opts" | "onUpdate"> & {
 	opts: { collection: string; limit: number; updatedSince?: number; scopeId?: string };
-	onUpdate: (update: WatchUpdate | null, info?: WatchDeathInfo) => void;
-	unsubscribed: boolean;
+	onUpdate: (update: WatchUpdate | null) => void;
 };
 
-type WindowUpdate = { docs: unknown[]; hasMore: boolean; atCapacity: boolean; incomplete: boolean };
+/**
+ * What a `watch_documents_page` delivery carries: every loaded row, oldest last, and whether an
+ * older page exists. `stillLoading` keeps the hook in its loading-more state, the way the real
+ * hook stays there when the first page re-delivers while a later page is still on its way.
+ */
+type WindowUpdate = { docs: unknown[]; hasMore: boolean; stillLoading?: boolean };
 
-type WindowSub = {
-	opts: { collection: string; keyPrefix?: string; pageSize: number };
-	onUpdate: (update: WindowUpdate | null, info?: WatchDeathInfo) => void;
-	unsubscribed: boolean;
-	loadOlderCalls: number;
+/** One `usePaginatedQuery` subscription on `watch_documents_page`. */
+type WindowSub = Omit<FakeSub, "opts" | "onUpdate"> & {
+	opts: { collection: string; keyPrefix?: string };
+	onUpdate: (update: WindowUpdate) => void;
 };
 
-/** Builds one watchWindow update payload; flags default to a fully covered window. */
+/** Builds one timeline delivery; the flags default to a list with nothing older. */
 function window_update(docs: unknown[], overrides: Partial<Omit<WindowUpdate, "docs">> = {}): WindowUpdate {
-	return { docs, hasMore: false, atCapacity: false, incomplete: false, ...overrides };
+	return { docs, hasMore: false, ...overrides };
 }
 
 // The two fields the plugin actually reads off a write: `key` for the send queue, `revision`
-// for the next compare-and-set. The real SDK also answers `byteSize`, which nothing here reads.
+// for the next compare-and-set. The real door also answers `byteSize`, which nothing here reads.
 type WriteResult = { _yay: { key: string; revision: number } } | { _nay: { name?: string; message: string } };
-type AppendOpts = { collection: string; keyPrefix?: string; value: Record<string, unknown>; clientRequestId?: string };
 type PutOpts = { collection: string; key: string; value: Record<string, unknown>; expectedRevision?: number };
 type InvokeOpts = { endpoint: string; input: Record<string, unknown> };
 type InvokeResult =
@@ -200,10 +395,8 @@ function invoke_refused(pluginStatus: number, message: string): InvokeResult {
 function invoke_nay(name: string, message: string, retryAfterMs?: number): InvokeResult {
 	return { _nay: { name, message, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) } };
 }
-type KeyOpts = { collection: string; key: string };
-type MembersListResult =
-	| { _yay: { members: { userId: string; displayName: string | null }[]; cursor: string | null } }
-	| { _nay: { name: string; message: string } };
+/** What `list_members` answers: a page, the consent refusal, or null for lost access. */
+type MembersListAnswer = { members: chat_Member[]; cursor: string | null } | { refusal: "not_consented" } | null;
 type ScopeChangeResult =
 	| { _yay: { scopeId: string; deleted: boolean; membershipRevision: number } }
 	| { _nay: { name?: string; message: string } };
@@ -221,14 +414,34 @@ type ScopeFixture = Omit<ScopeEntry, "membershipRevision" | "appendActivity"> & 
 	appendActivity?: (Omit<ScopeEntry["appendActivity"][number], "sequence"> & { sequence?: number })[];
 };
 type ScopeChangeOpts = { scopeId: string; expectedPrincipalCount?: number };
-type ScopeWatchCallback = (scopes: ScopeEntry[] | null, info?: WatchDeathInfo) => void;
+type ScopePrincipalInput = { userId: string; level: "member" | "manage" };
+/** The `user_manage_scope` action, as the page sends it. */
+type ScopeAction =
+	| { kind: "create"; scopeId: string; keyPrefix: string; collections: string[] }
+	| {
+			kind: "create_with_document";
+			scopeId: string;
+			keyPrefix: string;
+			collections: string[];
+			principals: ScopePrincipalInput[];
+			document: { collection: string; key: string; value: Record<string, unknown> };
+	  }
+	| { kind: "set_principal"; scopeId: string; userId: string; level: "member" | "manage" }
+	| ({ kind: "remove_principal"; userId: string } & ScopeChangeOpts)
+	| ({ kind: "delete" } & ScopeChangeOpts);
+
+/** One `watch_my_scopes` subscription. */
+type ScopesSub = Omit<FakeSub, "opts" | "onUpdate"> & {
+	opts: Record<string, never>;
+	onUpdate: (scopes: ScopeEntry[] | null) => void;
+};
 
 function make_harness() {
+	// A second harness in one test stands for a reload: nothing the first page subscribed to may
+	// answer the new one. Deliveries render through `act`, so each one reaches the page.
+	convex_fake.subs.length = 0;
+	convex_fake.set_flush((run) => act(run));
 	let putRevision = 1;
-	const watches: WatchSub[] = [];
-	const recents: RecentSub[] = [];
-	const windows: WindowSub[] = [];
-	const changes: ChangesSub[] = [];
 	const names: Record<string, string | null> = { user_me: "Me", user_other: "Bob", user_third: "Cleo" };
 	const scopeMembershipRevisions = new Map<string, number>();
 	const next_scope_membership_revision = (scopeId: string) => {
@@ -237,15 +450,147 @@ function make_harness() {
 		return revision;
 	};
 	/**
-	 * Every call the page makes that changes or reads a scope, in order, next to the data writes.
+	 * Every call the page makes that changes a scope, in order, next to the data writes.
 	 * The order is the point: a channel document written before its scope exists can never be made
 	 * private afterwards, because a scope refuses a key range that already holds documents.
 	 */
 	const calls: { op: string; args: Record<string, unknown> }[] = [];
-	/** What `scopes.listPrincipals` answers per scope. A missing entry answers null, as the server does. */
-	const scopePrincipals = new Map<string, { userId: string; level: "member" | "manage" }[]>();
-	/** Live subscribers to `scopes.watchMine`, so a test can hand the page a private range. */
-	const scopeWatchers: ScopeWatchCallback[] = [];
+	/** What `watch_scope_principals` answers per scope. A missing entry answers null, as the server does. */
+	const scopePrincipals = new Map<string, chat_ScopePrincipal[]>();
+	/**
+	 * The `user_manage_scope` answers, one function per action kind so a test can queue one
+	 * kind's refusal without touching the others. The door below dispatches on `action.kind`.
+	 */
+	const scopes = {
+		create: vi.fn(async (opts: { scopeId: string; collections: string[]; keyPrefix: string }) => {
+			calls.push({ op: "scopes.create", args: { ...opts } });
+			// The server puts the creator in with `manage`, so the fake does too — the people
+			// dialog decides whether to offer its controls from exactly that.
+			scopePrincipals.set(opts.scopeId, [{ userId: "user_me", level: "manage" }]);
+			return {
+				_yay: {
+					scopeId: opts.scopeId,
+					deleted: false,
+					membershipRevision: next_scope_membership_revision(opts.scopeId),
+				},
+			};
+		}),
+		create_with_document: vi.fn<
+			(opts: {
+				scopeId: string;
+				collections: string[];
+				keyPrefix: string;
+				principals: ScopePrincipalInput[];
+				document: { collection: string; key: string; value: Record<string, unknown> };
+			}) => Promise<ScopeChangeResult>
+		>(async (opts) => {
+			calls.push({ op: "scopes.create_with_document", args: { ...opts } });
+			scopePrincipals.set(opts.scopeId, [{ userId: "user_me", level: "manage" }, ...opts.principals]);
+			return {
+				_yay: {
+					scopeId: opts.scopeId,
+					deleted: false,
+					membershipRevision: next_scope_membership_revision(opts.scopeId),
+				},
+			};
+		}),
+		set_principal: vi.fn<
+			(opts: { scopeId: string; userId: string; level: "member" | "manage" }) => Promise<ScopeChangeResult>
+		>(async (opts) => {
+			calls.push({ op: "scopes.set_principal", args: { ...opts } });
+			const current = scopePrincipals.get(opts.scopeId) ?? [];
+			scopePrincipals.set(opts.scopeId, [
+				...current.filter((principal) => principal.userId !== opts.userId),
+				{ userId: opts.userId, level: opts.level },
+			]);
+			return {
+				_yay: {
+					scopeId: opts.scopeId,
+					deleted: false,
+					membershipRevision: next_scope_membership_revision(opts.scopeId),
+				},
+			};
+		}),
+		remove_principal: vi.fn<(opts: ScopeChangeOpts & { userId: string }) => Promise<ScopeChangeResult>>(
+			async (opts) => {
+				calls.push({ op: "scopes.remove_principal", args: { ...opts } });
+				scopePrincipals.set(
+					opts.scopeId,
+					(scopePrincipals.get(opts.scopeId) ?? []).filter((principal) => principal.userId !== opts.userId),
+				);
+				return {
+					_yay: {
+						scopeId: opts.scopeId,
+						deleted: false,
+						membershipRevision: next_scope_membership_revision(opts.scopeId),
+					},
+				};
+			},
+		),
+		delete: vi.fn<(opts: ScopeChangeOpts) => Promise<ScopeChangeResult>>(async (opts) => {
+			calls.push({ op: "scopes.delete", args: { ...opts } });
+			scopePrincipals.delete(opts.scopeId);
+			return {
+				_yay: {
+					scopeId: opts.scopeId,
+					deleted: true,
+					membershipRevision: next_scope_membership_revision(opts.scopeId),
+				},
+			};
+		}),
+	};
+	/**
+	 * The one-shot doors the page calls through `client.convex.query` and `client.convex.mutation`.
+	 * A rejected promise is what a Convex call does when the server throws or the connection is
+	 * gone, so a test that wants a lost answer rejects here.
+	 */
+	const doors = {
+		resolve_member_display: vi.fn(async (args: { userIds: string[] }) => ({
+			members: Object.fromEntries(args.userIds.map((id) => [id, names[id] ?? null])),
+		})),
+		list_members: vi.fn<(args: { limit: number; cursor?: string }) => Promise<MembersListAnswer>>(async () => ({
+			members: Object.entries(names).map(([userId, displayName]) => ({ userId, displayName })),
+			cursor: null,
+		})),
+		watch_scope_principals: vi.fn<(args: { scopeId: string }) => Promise<chat_ScopePrincipal[] | null>>(
+			async (args) => scopePrincipals.get(args.scopeId) ?? null,
+		),
+		user_put_owned_document: vi.fn<(opts: PutOpts) => Promise<WriteResult>>(async () => ({
+			_yay: { key: "k", revision: 1 },
+		})),
+		user_manage_scope: vi.fn(async (args: { action: ScopeAction }): Promise<ScopeChangeResult> => {
+			const action = args.action;
+			switch (action.kind) {
+				case "create": {
+					const { kind: _kind, ...rest } = action;
+					return scopes.create(rest);
+				}
+				case "create_with_document": {
+					const { kind: _kind, ...rest } = action;
+					return scopes.create_with_document(rest);
+				}
+				case "set_principal": {
+					const { kind: _kind, ...rest } = action;
+					return scopes.set_principal(rest);
+				}
+				case "remove_principal": {
+					const { kind: _kind, ...rest } = action;
+					return scopes.remove_principal(rest);
+				}
+				case "delete": {
+					const { kind: _kind, ...rest } = action;
+					return scopes.delete(rest);
+				}
+			}
+		}),
+	};
+	const call_door = (ref: { door: string }, args: unknown) => {
+		const door = (doors as Record<string, ((args: never) => Promise<unknown>) | undefined>)[ref.door];
+		if (door === undefined) {
+			throw new Error(`No fake answers the ${ref.door} door`);
+		}
+		return door(args as never);
+	};
 	const client = {
 		context: {
 			kind: "page",
@@ -260,74 +605,37 @@ function make_harness() {
 		getToken: vi.fn(async () => "tok"),
 		refreshToken: vi.fn(async () => "tok"),
 		fetchJson: vi.fn<(path: string, init?: FetchInit) => Promise<unknown>>(async (path: string) => {
-			// Companion HTTP lists run after the first messages-window delivery. An empty finished
-			// page covers every rendered row, which is the ordinary test default.
+			// Companion HTTP lists run after the first timeline delivery. An empty finished page
+			// covers every rendered row, which is the ordinary test default.
 			if (path === "/api/v1/plugin-data/list") {
 				return { documents: [], cursor: null, isDone: true };
 			}
 			throw new Error("fetchJson not stubbed");
 		}),
-		// The cursors read is a direct call on the frame's Convex client with the typed door
-		// reference. It lands in the same watch list, so `find_watch("cursors", …)` answers for it.
-		api: { plugins_data: { watch_documents: { door: "watch_documents" } } },
-		convex: {
-			onUpdate: vi.fn(
-				(query: unknown, args: WatchSub["opts"], onUpdate: WatchSub["onUpdate"], onError: WatchSub["onError"]) => {
-					const sub: WatchSub = { opts: args, onUpdate, onError, unsubscribed: false };
-					watches.push(sub);
-					return () => {
-						sub.unsubscribed = true;
-					};
-				},
-			),
+		// The typed door references. The fake hooks and `call_door` only read `door` off them.
+		api: {
+			plugins_data: {
+				watch_documents: { door: "watch_documents" },
+				watch_documents_page: { door: "watch_documents_page" },
+				watch_recent: { door: "watch_recent" },
+				watch_changes: { door: "watch_changes" },
+				watch_my_scopes: { door: "watch_my_scopes" },
+				watch_scope_principals: { door: "watch_scope_principals" },
+				resolve_member_display: { door: "resolve_member_display" },
+				list_members: { door: "list_members" },
+				user_put_owned_document: { door: "user_put_owned_document" },
+				user_manage_scope: { door: "user_manage_scope" },
+			},
 		},
-		data: {
-			watch: vi.fn((opts: WatchSub["opts"], onUpdate: WatchSub["onUpdate"]) => {
-				const sub: WatchSub = { opts, onUpdate, unsubscribed: false };
-				watches.push(sub);
-				return () => {
-					sub.unsubscribed = true;
-				};
-			}),
-			watchRecent: vi.fn((opts: RecentSub["opts"], onUpdate: RecentSub["onUpdate"]) => {
-				const sub: RecentSub = { opts, onUpdate, unsubscribed: false };
-				recents.push(sub);
-				return () => {
-					sub.unsubscribed = true;
-				};
-			}),
-			watchWindow: vi.fn((opts: WindowSub["opts"], onUpdate: WindowSub["onUpdate"]) => {
-				const sub: WindowSub = { opts, onUpdate, unsubscribed: false, loadOlderCalls: 0 };
-				windows.push(sub);
-				return {
-					loadOlder: () => {
-						sub.loadOlderCalls += 1;
-					},
-					unsubscribe: () => {
-						sub.unsubscribed = true;
-					},
-				};
-			}),
-			watchChanges: vi.fn((opts: ChangesSub["opts"], onUpdate: ChangesSub["onUpdate"]) => {
-				const sub: ChangesSub = { opts, onUpdate, unsubscribed: false };
-				changes.push(sub);
-				return () => {
-					sub.unsubscribed = true;
-				};
-			}),
-			append: vi.fn<(opts: AppendOpts) => Promise<WriteResult>>(async () => ({
-				_yay: { key: `${CH1_KEY}:${inv(50_000)}:sent`, revision: 1 },
-			})),
-			// A stored revision does not have to be the caller's revision plus one: another member's
-			// write can land in between. The mock jumps, so a test cannot pass by guessing the next
-			// number instead of reading the one the write answered.
-			put: vi.fn<(opts: PutOpts) => Promise<WriteResult>>(async (opts: PutOpts) => {
-				calls.push({ op: "put", args: { collection: opts.collection, key: opts.key } });
-				return { _yay: { key: "k", revision: (putRevision += 10) } };
-			}),
-			remove: vi.fn<(opts: KeyOpts) => Promise<WriteResult>>(async () => ({ _yay: { key: "k", revision: 1 } })),
-			putOwned: vi.fn<(opts: PutOpts) => Promise<WriteResult>>(async () => ({ _yay: { key: "k", revision: 1 } })),
-			removeOwned: vi.fn<(opts: KeyOpts) => Promise<WriteResult>>(async () => ({ _yay: { key: "k", revision: 1 } })),
+		convex: {
+			query: vi.fn(call_door),
+			mutation: vi.fn(call_door),
+		},
+		session: {
+			// An hour of session left. A test moves this into the past to make a refusal read as
+			// a lapsed session.
+			expiresAt: vi.fn(() => Date.now() + 60 * 60 * 1_000),
+			fetchJwt: vi.fn(async () => "tok"),
 		},
 		backend: {
 			// Messages, replies, reactions, and channel create/update go through the plugin backend
@@ -342,8 +650,8 @@ function make_harness() {
 						return invoke_ok({ messageKey: `${input.rootMessageKey}:${inv(50_000)}:sent`, transcriptUpdated: true });
 					case "message-edit":
 					case "message-delete":
-						// Like the put mock above: the answered revision jumps so a test cannot pass by
-						// guessing "mine plus one" instead of reading the one the backend stored.
+						// The answered revision jumps so a test cannot pass by guessing "mine plus one"
+						// instead of reading the one the backend stored.
 						return invoke_ok({ transcriptUpdated: true, revision: (putRevision += 10) });
 					case "reaction-toggle":
 						return invoke_ok({
@@ -363,138 +671,41 @@ function make_harness() {
 				}
 			}),
 		},
-		members: {
-			resolve: vi.fn(async (ids: string[]) => Object.fromEntries(ids.map((id) => [id, names[id] ?? null]))),
-			list: vi.fn<(opts: { limit: number; cursor?: string | null }) => Promise<MembersListResult>>(async () => ({
-				_yay: {
-					members: Object.entries(names).map(([userId, displayName]) => ({ userId, displayName })),
-					cursor: null,
-				},
-			})),
-		},
-		scopes: {
-			create: vi.fn(async (opts: { scopeId: string; collections: string[]; keyPrefix: string }) => {
-				calls.push({ op: "scopes.create", args: { ...opts } });
-				// The server puts the creator in with `manage`, so the fake does too — the people
-				// dialog decides whether to offer its controls from exactly that.
-				scopePrincipals.set(opts.scopeId, [{ userId: "user_me", level: "manage" }]);
-				return {
-					_yay: {
-						scopeId: opts.scopeId,
-						deleted: false,
-						membershipRevision: next_scope_membership_revision(opts.scopeId),
-					},
-				};
-			}),
-			createWithDocument: vi.fn<
-				(opts: {
-					scopeId: string;
-					collections: string[];
-					keyPrefix: string;
-					principals: { userId: string; level: "member" | "manage" }[];
-					document: { collection: string; key: string; value: Record<string, unknown> };
-				}) => Promise<ScopeChangeResult>
-			>(async (opts) => {
-				calls.push({ op: "scopes.createWithDocument", args: { ...opts } });
-				scopePrincipals.set(opts.scopeId, [{ userId: "user_me", level: "manage" }, ...opts.principals]);
-				return {
-					_yay: {
-						scopeId: opts.scopeId,
-						deleted: false,
-						membershipRevision: next_scope_membership_revision(opts.scopeId),
-					},
-				};
-			}),
-			setPrincipal: vi.fn<
-				(opts: { scopeId: string; userId: string; level: "member" | "manage" }) => Promise<ScopeChangeResult>
-			>(async (opts) => {
-				calls.push({ op: "scopes.setPrincipal", args: { ...opts } });
-				const current = scopePrincipals.get(opts.scopeId) ?? [];
-				scopePrincipals.set(opts.scopeId, [
-					...current.filter((principal) => principal.userId !== opts.userId),
-					{ userId: opts.userId, level: opts.level },
-				]);
-				return {
-					_yay: {
-						scopeId: opts.scopeId,
-						deleted: false,
-						membershipRevision: next_scope_membership_revision(opts.scopeId),
-					},
-				};
-			}),
-			removePrincipal: vi.fn<(opts: ScopeChangeOpts & { userId: string }) => Promise<ScopeChangeResult>>(
-				async (opts) => {
-					calls.push({ op: "scopes.removePrincipal", args: { ...opts } });
-					scopePrincipals.set(
-						opts.scopeId,
-						(scopePrincipals.get(opts.scopeId) ?? []).filter((principal) => principal.userId !== opts.userId),
-					);
-					return {
-						_yay: {
-							scopeId: opts.scopeId,
-							deleted: false,
-							membershipRevision: next_scope_membership_revision(opts.scopeId),
-						},
-					};
-				},
-			),
-			delete: vi.fn<(opts: ScopeChangeOpts) => Promise<ScopeChangeResult>>(async (opts) => {
-				calls.push({ op: "scopes.delete", args: { ...opts } });
-				scopePrincipals.delete(opts.scopeId);
-				return {
-					_yay: {
-						scopeId: opts.scopeId,
-						deleted: true,
-						membershipRevision: next_scope_membership_revision(opts.scopeId),
-					},
-				};
-			}),
-			listPrincipals: vi.fn<(opts: { scopeId: string }) => Promise<BonoboUiScopePrincipalListResult>>(async (opts) => ({
-				_yay: scopePrincipals.get(opts.scopeId) ?? null,
-			})),
-			watchMine: vi.fn((onUpdate: ScopeWatchCallback) => {
-				scopeWatchers.push(onUpdate);
-				return () => {
-					const index = scopeWatchers.indexOf(onUpdate);
-					if (index >= 0) {
-						scopeWatchers.splice(index, 1);
-					}
-				};
-			}),
-		},
+		doors,
+		scopes,
 		theme: {
 			// The SDK applies the host theme to the document itself; the page never reads it.
 			current: vi.fn<() => BonoboUiTheme | null>(() => null),
 			subscribe: vi.fn(() => () => {}),
 		},
 	};
-	// The key prefix is matched exactly, `undefined` included: the page now opens a second channels
-	// watch per private range, so "the channels watch with no prefix" has to mean the public one.
+	const subs_of = (door: string) => convex_fake.subs.filter((sub) => sub.door === door);
+	const live_subs = (door: string) => subs_of(door).filter((sub) => !sub.unsubscribed);
+	// The key prefix is matched exactly, `undefined` included: the page opens a second channels
+	// read per private range, so "the channels read with no prefix" has to mean the public one.
 	const find_watch = (collection: string, keyPrefix?: string) => {
-		const matches = watches.filter(
-			(sub) => !sub.unsubscribed && sub.opts.collection === collection && sub.opts.keyPrefix === keyPrefix,
+		const matches = live_subs("watch_documents").filter(
+			(sub) => sub.opts.collection === collection && sub.opts.keyPrefix === keyPrefix,
 		);
-		return matches[matches.length - 1];
+		return matches.at(-1) as unknown as WatchSub | undefined;
 	};
 	const find_recent = (collection: string) => {
-		const matches = recents.filter((sub) => !sub.unsubscribed && sub.opts.collection === collection);
-		return matches[matches.length - 1];
+		const matches = live_subs("watch_recent").filter((sub) => sub.opts.collection === collection);
+		return matches.at(-1) as unknown as RecentSub | undefined;
 	};
 	const find_window = (collection: string, keyPrefix?: string) => {
-		const matches = windows.filter(
-			(sub) =>
-				!sub.unsubscribed &&
-				sub.opts.collection === collection &&
-				(keyPrefix === undefined || sub.opts.keyPrefix === keyPrefix),
+		const matches = live_subs("watch_documents_page").filter(
+			(sub) => sub.opts.collection === collection && (keyPrefix === undefined || sub.opts.keyPrefix === keyPrefix),
 		);
-		return matches[matches.length - 1];
+		return matches.at(-1) as unknown as WindowSub | undefined;
 	};
 	const find_changes = (collection: string, scopeId?: string) => {
-		const matches = changes.filter(
-			(sub) => !sub.unsubscribed && sub.opts.collection === collection && sub.opts.scopeId === scopeId,
+		const matches = live_subs("watch_changes").filter(
+			(sub) => sub.opts.collection === collection && sub.opts.scopeId === scopeId,
 		);
-		return matches[matches.length - 1];
+		return matches.at(-1) as unknown as ChangesSub | undefined;
 	};
+	const find_scopes = () => live_subs("watch_my_scopes").at(-1) as unknown as ScopesSub | undefined;
 	/** Delivers the scope list the way the server does after somebody changes who is in a range. */
 	const send_scopes = (scopes: ScopeFixture[]) => {
 		const delivered = scopes.map((scope) => ({
@@ -509,29 +720,36 @@ function make_harness() {
 		for (const scope of delivered) {
 			scopeMembershipRevisions.set(scope.scopeId, scope.membershipRevision);
 		}
-		for (const listener of [...scopeWatchers]) {
-			listener(delivered);
-		}
+		find_scopes()?.onUpdate(delivered);
 	};
-	/** Ends the newest scope watch the way the SDK does before its one final null delivery. */
-	const send_scope_death = (reason: string) => {
-		const listener = scopeWatchers.pop();
-		if (listener === undefined) {
-			throw new Error("No live scope watch");
+	/** Refuses the scope list: the door answers null when the caller may not read it any more. */
+	const send_scope_death = () => {
+		const sub = find_scopes();
+		if (sub === undefined) {
+			throw new Error("No live scope read");
 		}
-		listener(null, { reason, message: `Scope watch ${reason}` });
+		sub.onUpdate(null);
 	};
 	return {
 		client: client as unknown as BonoboUiFrontendClient,
 		raw: client,
-		watches,
-		recents,
-		windows,
-		changes,
+		get watches() {
+			return subs_of("watch_documents") as unknown as WatchSub[];
+		},
+		get recents() {
+			return subs_of("watch_recent") as unknown as RecentSub[];
+		},
+		get windows() {
+			return subs_of("watch_documents_page") as unknown as WindowSub[];
+		},
+		get changes() {
+			return subs_of("watch_changes") as unknown as ChangesSub[];
+		},
 		find_watch,
 		find_recent,
 		find_window,
 		find_changes,
+		find_scopes,
 		send_scopes,
 		send_scope_death,
 		calls,
@@ -1100,10 +1318,7 @@ test("a rename carries the channel topic and an emptied topic is removed", async
 test('permission-lost: a "denied" channels death names no cause and offers a reload', async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_watch("channels")!.onUpdate(null, {
-		reason: "denied",
-		message: "This plugin no longer has access to its data",
-	});
+	h.find_watch("channels")!.onUpdate(null);
 
 	const alert = await screen.findByRole("alert");
 	// The commonest trigger is an uninstall or a revoked installation. Telling a member their
@@ -1116,61 +1331,53 @@ test('permission-lost: a "denied" channels death names no cause and offers a rel
 	expect(screen.queryByRole("log")).toBeNull();
 });
 
-test("the other channels-death reasons each say something different", async () => {
-	// Keep each cause clear, and give a connection death the manual recovery this page needs.
-	const cases = [
-		{ reason: "session_expired", contains: "session expired" },
-		{ reason: "unavailable", contains: "cannot reach its data" },
-		{ reason: "capacity", contains: "too many live views" },
-	];
-
-	for (const { reason, contains } of cases) {
-		const h = make_harness();
-		render(<App client={h.client} />);
-		h.find_watch("channels")!.onUpdate(watch_update([channel_doc(CH1_KEY, "general")]));
-		h.find_watch("channels")!.onUpdate(null, { reason, message: "x" });
-
-		const alert = await screen.findByRole("alert");
-		expect(alert.textContent?.toLowerCase()).toContain(contains);
-		if (reason === "unavailable") {
-			expect(alert.textContent).toMatch(/reload/iu);
-			expect(alert.textContent).not.toContain("connection returns");
-		}
-		cleanup();
-	}
-});
-
-test("a null messages window shows the channel-level alert", async () => {
+test("a refused channels read after the session lapsed says the session expired", async () => {
 	const h = make_harness();
 	await boot(h);
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(null);
-
-	// A bare null carries no reason, so the page says what it knows — the read stopped — and does
-	// not guess at a cause the SDK did not give it.
-	const alert = await screen.findByRole("alert");
-	expect(alert.textContent).toContain("Chitchat stopped reading messages in #general");
-});
-
-test("a dead messages window names its reason", async () => {
-	const h = make_harness();
-	await boot(h);
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(null, { reason: "session_expired" } satisfies WatchDeathInfo);
+	// The door answers the same null for a lapsed session and for lost access. Only the clock,
+	// which the SDK keeps from the host's last token, tells the page which one to say.
+	h.raw.session.expiresAt.mockReturnValue(Date.now() - 1);
+	h.find_watch("channels")!.onUpdate(null);
 
 	const alert = await screen.findByRole("alert");
 	expect(alert.textContent).toContain("session expired");
-	expect(alert.textContent).not.toContain("permissions");
-});
-
-test("an unavailable messages window tells the member to check the connection and reload", async () => {
-	const h = make_harness();
-	await boot(h);
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(null, { reason: "unavailable" } satisfies WatchDeathInfo);
-
-	const alert = await screen.findByRole("alert");
-	expect(alert.textContent).toContain("Check your connection");
 	expect(alert.textContent).toMatch(/reload/iu);
-	expect(alert.textContent).not.toContain("connection returns");
+	expect(screen.queryByRole("log")).toBeNull();
 });
+
+test.each([
+	{ lapsed: false, contains: "Check your connection" },
+	{ lapsed: true, contains: "session expired" },
+])("a live read that throws lands in the error boundary (session lapsed: $lapsed)", async ({ lapsed, contains }) => {
+	const h = make_harness();
+	if (lapsed) {
+		h.raw.session.expiresAt.mockReturnValue(Date.now() - 1);
+	}
+	// React reports the caught error on the console; that noise is expected here.
+	const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+	try {
+		render(
+			<ChatErrorBoundary client={h.client}>
+				<App client={h.client} />
+			</ChatErrorBoundary>,
+		);
+		h.find_watch("channels")!.onUpdate(watch_update([channel_doc(CH1_KEY, "general")]));
+		await screen.findByRole("navigation", { name: "Channels" });
+
+		// A query throws when the caller has no plugin identity any more.
+		h.find_watch("channels")!.onError(new Error("Unauthenticated"));
+		const alert = await screen.findByRole("alert");
+		expect(alert.textContent).toContain(contains);
+		expect(alert.textContent).toMatch(/reload/iu);
+		expect(screen.queryByRole("navigation", { name: "Channels" })).toBeNull();
+	} finally {
+		consoleError.mockRestore();
+	}
+});
+
+
+
+
 
 test("create channel dialog validates the name and sends the create through the backend", async () => {
 	const h = make_harness();
@@ -1195,8 +1402,6 @@ test("create channel dialog validates the name and sends the create through the 
 	expect(call.input.name).toBe("general");
 	expect(call.input.topic).toBeNull();
 	expect(typeof call.input.clientRequestId).toBe("string");
-	expect(h.raw.data.put).not.toHaveBeenCalled();
-	expect(h.raw.data.append).not.toHaveBeenCalled();
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 });
 
@@ -1740,19 +1945,6 @@ test("a message row's action cluster sits inside the row element the stylesheet 
 	expect(actions).toBeTruthy();
 });
 
-test("the at-capacity notice is announced, not just displayed", async () => {
-	const h = make_harness();
-	await boot(h);
-
-	// The log itself is aria-live="off", so a bare div inside it reaches nobody. Hitting the
-	// window's growth ceiling is exactly the moment a member needs to be told.
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
-		window_update([message_doc(1_000, { rand: "m1", text: "capped" })], { hasMore: true, atCapacity: true }),
-	);
-
-	const notice = await screen.findByText("The live view stopped growing. Older messages load on request.");
-	expect(notice.getAttribute("role")).toBe("status");
-});
 
 test("a row's time carries a machine date, a hidden written date, and a visible clock time", async () => {
 	const h = make_harness();
@@ -1870,23 +2062,6 @@ test("a grouped continuation still renders its author and its time", async () =>
 	expect(second.querySelector(".message-head")!.classList.contains("visually-hidden")).toBe(true);
 });
 
-test("an incomplete messages window says the view may be stale, not that messages are missing", async () => {
-	const h = make_harness();
-	await boot(h);
-	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
-	messages.onUpdate(window_update([message_doc(1_000, { rand: "m1", text: "delivered once" })]));
-	await screen.findByText("delivered once");
-
-	// The store never drops a key, so a document that leaves the flatten is not missing from the
-	// view — it is frozen at the last value anybody heard about. Saying it could not be loaded
-	// would be affirmatively wrong about a row that is right there on the screen.
-	messages.onUpdate(window_update([], { incomplete: true }));
-	const notice = await screen.findByText("Older messages in view may be out of date.");
-	expect(notice.getAttribute("role")).toBe("alert");
-	expect(notice.textContent).not.toContain("could not be loaded");
-	expect(notice.textContent).not.toContain("missing");
-	expect(screen.getByText("delivered once")).toBeTruthy();
-});
 
 // #endregion log and messages
 
@@ -1910,7 +2085,6 @@ test("Enter sends, Shift+Enter does not, and the send invokes the backend under 
 	expect(call.input.attachments).toEqual([]);
 	expect(call.input.mentions).toEqual([]);
 	expect(typeof call.input.clientRequestId).toBe("string");
-	expect(h.raw.data.append).not.toHaveBeenCalled();
 });
 
 test("an in-flight send disables Send, shows the pending row, and the ack keeps the message", async () => {
@@ -2106,8 +2280,8 @@ test("a burst of remote arrivals coalesces into one counted announcement", async
 
 test("a delayed author lookup cannot announce after the member switches channels", async () => {
 	const h = make_harness();
-	const names = deferred<Record<string, string | null>>();
-	h.raw.members.resolve.mockReturnValueOnce(names.promise);
+	const names = deferred<{ members: Record<string, string | null> }>();
+	h.raw.doors.resolve_member_display.mockReturnValueOnce(names.promise);
 	const { container } = await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	messages.onUpdate(window_update([]));
@@ -2117,7 +2291,7 @@ test("a delayed author lookup cannot announce after the member switches channels
 	await waitFor(() => expect(announcer_text(container)).toContain("#random"));
 
 	await act(async () => {
-		names.resolve({ user_other: "Bob" });
+		names.resolve({ members: { user_other: "Bob" } });
 		await names.promise;
 		await Promise.resolve();
 	});
@@ -2127,10 +2301,10 @@ test("a delayed author lookup cannot announce after the member switches channels
 
 test("same-author arrivals wait for one lookup and only announce the newest message", async () => {
 	const h = make_harness();
-	const names = deferred<Record<string, string | null>>();
+	const names = deferred<{ members: Record<string, string | null> }>();
 	const startedAt = Date.now();
 	const now = vi.spyOn(Date, "now").mockReturnValue(startedAt);
-	h.raw.members.resolve.mockReturnValueOnce(names.promise);
+	h.raw.doors.resolve_member_display.mockReturnValueOnce(names.promise);
 	try {
 		const { container } = await boot(h);
 		const messages = h.find_window("messages", `${CH1_KEY}:`)!;
@@ -2146,10 +2320,10 @@ test("same-author arrivals wait for one lookup and only announce the newest mess
 			await Promise.resolve();
 		});
 		expect(announcer_text(container)).not.toContain("Former member");
-		expect(h.raw.members.resolve).toHaveBeenCalledTimes(1);
+		expect(h.raw.doors.resolve_member_display).toHaveBeenCalledTimes(1);
 
 		await act(async () => {
-			names.resolve({ user_other: "Bob" });
+			names.resolve({ members: { user_other: "Bob" } });
 			await names.promise;
 			await Promise.resolve();
 		});
@@ -2669,8 +2843,7 @@ test("reaction chips group by createdBy, expose aria-pressed, and toggle through
 	fireEvent.click(mineChip);
 	await waitFor(() => expect(invoke_calls(h, "reaction-toggle")).toHaveLength(1));
 	expect(invoke_calls(h, "reaction-toggle")[0]!.input).toEqual({ targetKey: doc.key, token: "heart", on: false });
-	expect(h.raw.data.putOwned).not.toHaveBeenCalled();
-	expect(h.raw.data.removeOwned).not.toHaveBeenCalled();
+	expect(h.raw.doors.user_put_owned_document).not.toHaveBeenCalled();
 
 	// Toggling a reaction I do not hold turns it on under my own id.
 	fireEvent.click(otherChip);
@@ -2854,7 +3027,6 @@ test("an incomplete companion list makes every row uncovered, however deep it re
 
 	await pick_reaction(newRow, "Heart");
 	await waitFor(() => expect(invoke_calls(h, "reaction-toggle")).toHaveLength(1));
-	expect(h.raw.data.removeOwned).not.toHaveBeenCalled();
 });
 
 test("an incomplete companion list is reported to the member", async () => {
@@ -3055,7 +3227,7 @@ test("a dead incomplete companion list does not keep retrying on the backoff tim
 		expect(list_calls(h, "reactions")).toHaveLength(1);
 
 		await act(async () => {
-			h.find_changes("reactions")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+			h.find_changes("reactions")!.onUpdate(null);
 		});
 		expect(within(row_of("new root")).getByText("Reactions unavailable")).toBeTruthy();
 
@@ -3146,7 +3318,7 @@ test("a dead incomplete companion list does not retry when the tab becomes visib
 		});
 		expect(h.find_changes("reactions")).toBeTruthy();
 		await act(async () => {
-			h.find_changes("reactions")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+			h.find_changes("reactions")!.onUpdate(null);
 		});
 		expect(within(row_of("new root")).getByText("Reactions unavailable")).toBeTruthy();
 		expect(screen.queryByText("Some reactions and replies in this range could not be loaded.")).toBeNull();
@@ -3232,7 +3404,7 @@ test("a companion list that finishes after the feed dies does not clear death", 
 	await screen.findByText("new root");
 	const row = row_of("new root");
 	await wait_for_feeds(h);
-	h.find_changes("reactions")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	h.find_changes("reactions")!.onUpdate(null);
 	expect(await within(row).findByText("Reactions unavailable")).toBeTruthy();
 
 	pendingReactions.resolve(http_page([heart], true));
@@ -3280,7 +3452,7 @@ test("a dead reactions feed makes the chips uncovered instead of freezing them",
 	reactions.onUpdate(watch_update([reaction_doc(doc.key, "heart", "user_other")]));
 	expect(await screen.findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
 
-	reactions.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	reactions.onUpdate(null);
 	expect(await screen.findByText("Reactions unavailable")).toBeTruthy();
 	expect(screen.queryByRole("button", { name: "Heart, 1 reaction" })).toBeNull();
 });
@@ -3309,7 +3481,7 @@ test("a failed reactions list hides a cached thread-root chip", async () => {
 	const threadRoot = within(panel).getByText("failed thread root").closest("[data-key]") as HTMLElement;
 	expect(within(threadRoot).getByText("Reactions unavailable")).toBeTruthy();
 	expect(within(threadRoot).queryByRole("button", { name: "Heart, 1 reaction" })).toBeNull();
-	expect(h.raw.data.putOwned).not.toHaveBeenCalled();
+	expect(h.raw.doors.user_put_owned_document).not.toHaveBeenCalled();
 });
 
 test("a dead reactions feed hides stale chips on the thread root and its reply", async () => {
@@ -3345,11 +3517,11 @@ test("a dead reactions feed hides stale chips on the thread root and its reply",
 	expect(await within(panel).findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
 	expect(await within(panel).findByRole("button", { name: "Party, 1 reaction" })).toBeTruthy();
 
-	h.find_changes("reactions")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	h.find_changes("reactions")!.onUpdate(null);
 	await waitFor(() => expect(within(panel).getAllByText("Reactions unavailable")).toHaveLength(2));
 	expect(within(panel).queryByRole("button", { name: "Heart, 1 reaction" })).toBeNull();
 	expect(within(panel).queryByRole("button", { name: "Party, 1 reaction" })).toBeNull();
-	expect(h.raw.data.putOwned).not.toHaveBeenCalled();
+	expect(h.raw.doors.user_put_owned_document).not.toHaveBeenCalled();
 });
 
 // #endregion reactions
@@ -3567,7 +3739,7 @@ test("a dead replies feed makes an exact count read unknown", async () => {
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
 	expect(await screen.findByRole("button", { name: /^1 reply/ })).toBeTruthy();
 	await wait_for_feeds(h);
-	h.find_changes("replies")!.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	h.find_changes("replies")!.onUpdate(null);
 	expect(await screen.findByRole("button", { name: "View thread" })).toBeTruthy();
 	expect(screen.queryByRole("button", { name: /^1 reply/ })).toBeNull();
 });
@@ -3743,7 +3915,7 @@ test("below 720px the thread head offers a back control, not a close control", a
 
 // Below capacity the window still has intervals to spend, so "load older" must stay reactive and
 // cost no HTTP page. The HTTP door is for the state after that, not a replacement for this one.
-test("below capacity Load older extends the window and issues no HTTP request", async () => {
+test("Load older asks the timeline for the next page and issues no HTTP request", async () => {
 	const h = make_harness();
 	await boot(h);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
@@ -3752,9 +3924,14 @@ test("below capacity Load older extends the window and issues no HTTP request", 
 	await screen.findByText("live one");
 	fireEvent.click(screen.getByRole("button", { name: "Load older" }));
 	expect(messages.loadOlderCalls).toBe(1);
+	expect(messages.lastLoadMore).toBe(100);
 	expect(list_calls(h, "messages")).toHaveLength(0);
+	// The button stays on screen but disabled while the page is on its way.
+	await waitFor(() =>
+		expect((screen.getByRole("button", { name: "Load older" }) as HTMLButtonElement).disabled).toBe(true),
+	);
 
-	// The extended window arrives as a normal update; nothing more below hides the button.
+	// The longer list arrives as a normal delivery; nothing older hides the button.
 	messages.onUpdate(
 		window_update([
 			message_doc(1_000, { rand: "m1", text: "live one" }),
@@ -3765,20 +3942,6 @@ test("below capacity Load older extends the window and issues no HTTP request", 
 	await waitFor(() => expect(screen.queryByRole("button", { name: "Load older" })).toBeNull());
 });
 
-test("at capacity the reactive Load older button hands over to the HTTP control", async () => {
-	const h = make_harness();
-	await boot(h);
-	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
-	messages.onUpdate(
-		window_update([message_doc(1_000, { rand: "m1", text: "live one" })], { hasMore: true, atCapacity: true }),
-	);
-
-	// The window has no interval left to spend, so its own control goes and the HTTP page takes
-	// over. History is still reachable — the door never closed, the plugin had just stopped using it.
-	await screen.findByText("live one");
-	expect(screen.queryByRole("button", { name: "Load older" })).toBeNull();
-	expect(screen.getByRole("button", { name: "Load older messages" })).toBeTruthy();
-});
 
 test("retained history survives a remote arrival: the messages window never resubscribes", async () => {
 	const h = make_harness();
@@ -3807,10 +3970,19 @@ test("retained history survives a remote arrival: the messages window never resu
 	);
 	await waitFor(() => expect(announcer_text(container)).toContain("Bob: fresh arrival"));
 	expect(screen.getByText("the older one")).toBeTruthy();
-	const messageWindowCount = h.raw.data.watchWindow.mock.calls.filter(
-		(call) => call[0].collection === "messages",
-	).length;
-	expect(messageWindowCount).toBe(1);
+	expect(h.windows.filter((sub) => sub.opts.collection === "messages")).toHaveLength(1);
+});
+
+test("a refused timeline shows the empty channel and no error", async () => {
+	const h = make_harness();
+	await boot(h);
+	// The paginated door answers an empty final page when the caller may not read the range.
+	// Nothing tells that apart from an empty channel, and nothing should: a member who lost a
+	// channel gets no placeholder about it.
+	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
+	await screen.findByText("No messages yet");
+	expect(screen.queryByRole("alert")).toBeNull();
+	expect(screen.queryByRole("button", { name: "Load older" })).toBeNull();
 });
 
 test("history below an invalid live-window frontier is not announced as a new message", async () => {
@@ -3834,7 +4006,7 @@ test("history below an invalid live-window frontier is not announced as a new me
 	await waitFor(() => expect(announcer_text(container)).toContain("Bob: valid arrival"));
 });
 
-test("an at-capacity arrival before the older tail does not clear its history fence", async () => {
+test("a newer arrival while an older page is still loading does not clear its history fence", async () => {
 	const h = make_harness();
 	const { container } = await boot(h);
 	const live = message_doc(1_000, { rand: "live", text: "live row" });
@@ -3843,124 +4015,33 @@ test("an at-capacity arrival before the older tail does not clear its history fe
 	await screen.findByText("live row");
 	fireEvent.click(screen.getByRole("button", { name: "Load older" }));
 
-	// A five-range window pushes its sixth tail before that tail has data. A newer delivery from an
-	// existing range can therefore report atCapacity first, and that newer row must still announce.
+	// The first page re-delivers with a new row before the older page lands. That newer row must
+	// still announce, and the older rows that follow it must not.
 	const newer = message_doc(1_500, { rand: "newer", text: "newer arrival" });
-	messages.onUpdate(window_update([newer, live], { hasMore: true, atCapacity: true }));
+	messages.onUpdate(window_update([newer, live], { hasMore: true, stillLoading: true }));
 	await waitFor(() => expect(announcer_text(container)).toContain("Bob: newer arrival"));
 	const arrivalAnnouncement = announcer_text(container);
 
 	const older = message_doc(500, { rand: "older", text: "older tail" });
-	messages.onUpdate(window_update([newer, live, older], { hasMore: true, atCapacity: true }));
+	messages.onUpdate(window_update([newer, live, older], { hasMore: true }));
 	await screen.findByText("older tail");
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(announcer_text(container)).toBe(arrivalAnnouncement);
 });
 
-/** Drives the window to capacity so the HTTP control is the only way further back. */
-async function boot_at_capacity(
-	h: ReturnType<typeof make_harness>,
-	newest = message_doc(1_000, { rand: "m1", text: "window newest" }),
-) {
+test("a row from an older page updates when the messages change feed delivers a newer revision", async () => {
+	const h = make_harness();
 	await boot(h);
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([newest], { hasMore: true, atCapacity: true }));
+	const newest = message_doc(1_000, { rand: "m1", text: "window newest" });
+	const older = message_doc(500, { rand: "old1", text: "older one" });
+	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
+	messages.onUpdate(window_update([newest], { hasMore: true }));
 	await screen.findByText("window newest");
-	await wait_for_companion_lists(h);
-	return newest;
-}
-
-test("at capacity the control pages older history over HTTP with a fencepost and no cursor", async () => {
-	const h = make_harness();
-	const newest = await boot_at_capacity(h);
-	const older = message_doc(500, { rand: "old1", text: "older one" });
-	const oldest = message_doc(400, { rand: "old2", text: "oldest one" });
-	h.raw.fetchJson.mockResolvedValueOnce(http_page([older, oldest], false));
-
-	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
-	await screen.findByText("older one");
-
-	// The route binds a cursor to the range it was issued for, so a page-1 cursor replayed against a
-	// changed range is refused instead of being reinterpreted inside it. A fencepost carries no such
-	// binding: it is the last key of the page, and the first press continues from the window's own
-	// oldest key.
-	const [path, init] = list_calls(h, "messages")[0]!;
-	expect(path).toBe("/api/v1/plugin-data/list");
-	expect(init?.body).toEqual({
-		collection: "messages",
-		keyPrefix: `${CH1_KEY}:`,
-		keyStartExclusive: newest.key,
-		limit: 100,
-	});
-	expect(init?.body).not.toHaveProperty("cursor");
-
-	// Page two continues after page one's last key, and the merged store gains keys with no repeat.
-	h.raw.fetchJson.mockResolvedValueOnce(http_page([message_doc(300, { rand: "old3", text: "third page one" })], false));
-	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
-	await screen.findByText("third page one");
-	expect(list_calls(h, "messages")[1]?.[1]?.body).toMatchObject({ keyStartExclusive: oldest.key });
-	expect(screen.getAllByText("older one").length).toBe(1);
-	expect(screen.getByText("window newest")).toBeTruthy();
-});
-
-test("foreign message values advance both history fences and still start the change feeds", async () => {
-	const h = make_harness();
-	await boot(h);
-	const invalidWindowDoc = {
-		...message_doc(1_000, { rand: "window-bad", text: "invalid window value" }),
-		value: { notAMessage: true },
-	};
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(
-		window_update([invalidWindowDoc], { hasMore: true, atCapacity: true }),
-	);
-	await wait_for_companion_lists(h);
-	await wait_for_feeds(h);
-	expect(h.find_changes("messages")!.opts.updatedSince).toBe(1_000);
-	expect(screen.queryByText("invalid window value")).toBeNull();
-
-	const invalidPage = Array.from({ length: 100 }, (_, index) => ({
-		...message_doc(900 - index, { rand: `page-bad-${index}`, text: `invalid page value ${index}` }),
-		value: { notAMessage: true },
-	}));
-	h.raw.fetchJson.mockResolvedValueOnce(http_page(invalidPage, false));
-	const control = screen.getByRole("button", { name: "Load older messages" });
-	fireEvent.click(control);
-	await waitFor(() => expect((control as HTMLButtonElement).disabled).toBe(false));
-	expect(screen.queryByText("invalid page value 0")).toBeNull();
-
-	h.raw.fetchJson.mockResolvedValueOnce(http_page([message_doc(500, { rand: "older-good", text: "older valid" })], true));
-	fireEvent.click(control);
-	await screen.findByText("older valid");
-	expect(list_calls(h, "messages")[0]?.[1]?.body).toMatchObject({ keyStartExclusive: invalidWindowDoc.key });
-	expect(list_calls(h, "messages")[1]?.[1]?.body).toMatchObject({
-		keyStartExclusive: invalidPage.at(-1)!.key,
-	});
-});
-
-test("an empty non-final history page shows Retry and keeps the same fencepost", async () => {
-	const h = make_harness();
-	const newest = await boot_at_capacity(h);
-	h.raw.fetchJson.mockResolvedValueOnce(http_page([], false));
-	const control = screen.getByRole("button", { name: "Load older messages" });
-	fireEvent.click(control);
-	await screen.findByText("Older messages returned an incomplete page. Please retry.");
-	expect((control as HTMLButtonElement).disabled).toBe(false);
-
-	h.raw.fetchJson.mockResolvedValueOnce(http_page([message_doc(500, { rand: "retry-good", text: "retry older" })], true));
-	fireEvent.click(control);
-	await screen.findByText("retry older");
-	expect(list_calls(h, "messages")).toHaveLength(2);
-	expect(list_calls(h, "messages")[0]?.[1]?.body).toMatchObject({ keyStartExclusive: newest.key });
-	expect(list_calls(h, "messages")[1]?.[1]?.body).toMatchObject({ keyStartExclusive: newest.key });
-});
-
-test("a frozen HTTP-loaded row updates when the messages change feed delivers a newer revision", async () => {
-	const h = make_harness();
-	await boot_at_capacity(h);
-	const older = message_doc(500, { rand: "old1", text: "older one" });
-	h.raw.fetchJson.mockResolvedValueOnce(http_page([older], true));
-	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
+	fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+	messages.onUpdate(window_update([newest, older]));
 	await screen.findByText("older one");
 	await wait_for_feeds(h);
+
 	h.find_changes("messages")!.onUpdate(
 		watch_update([
 			{
@@ -3974,6 +4055,12 @@ test("a frozen HTTP-loaded row updates when the messages change feed delivers a 
 	expect(await screen.findByText("edited older")).toBeTruthy();
 	expect(screen.queryByText("older one")).toBeNull();
 });
+
+
+
+
+
+
 
 test("a feed document that fails validation is dropped and is not re-read", async () => {
 	const h = make_harness();
@@ -4040,138 +4127,11 @@ test("a truncated change-feed page tied to the fence millisecond advances past t
 	await waitFor(() => expect(h.find_changes("messages")!.opts.updatedSince).toBe(1_001));
 });
 
-test("a truncated messages feed HTTP-lists the frozen window range", async () => {
-	const h = make_harness();
-	const newest = await boot_at_capacity(h);
-	await wait_for_feeds(h);
-	const messageListsBefore = list_calls(h, "messages").length;
-	h.find_changes("messages")!.onUpdate(
-		watch_update([{ ...newest, revision: 2, updatedAt: newest.updatedAt + 50 }], true),
-	);
-	await waitFor(() => expect(list_calls(h, "messages").length).toBe(messageListsBefore + 1));
-	expect(list_calls(h, "messages").at(-1)?.[1]?.body).toEqual({
-		collection: "messages",
-		keyPrefix: `${CH1_KEY}:`,
-		keyStartExclusive: newest.key,
-		limit: 100,
-	});
-});
 
-test("a page in flight disables the control, and rows below a healthy reactions frontier stay neutral", async () => {
-	const h = make_harness();
-	await boot(h);
-	const newest = message_doc(1_000, { rand: "m1", text: "window newest" });
-	const pendingMessagesPage = deferred<unknown>();
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
-		if (path !== "/api/v1/plugin-data/list") {
-			throw new Error("fetchJson not stubbed");
-		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
-		if (collection === "reactions") {
-			return http_page([reaction_doc(newest.key, "heart", "user_other")], false);
-		}
-		if (collection === "messages") {
-			return pendingMessagesPage.promise;
-		}
-		return http_page([], true);
-	});
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([newest], { hasMore: true, atCapacity: true }));
-	await screen.findByText("window newest");
-	await wait_for_companion_lists(h);
 
-	const control = screen.getByRole("button", { name: "Load older messages" });
-	const messageCallsBefore = list_calls(h, "messages").length;
-	fireEvent.click(control);
 
-	await waitFor(() => expect((control as HTMLButtonElement).disabled).toBe(true));
-	expect(screen.getAllByRole("status").some((element) => element.textContent === "Loading older messages…")).toBe(true);
-	fireEvent.click(control);
-	expect(list_calls(h, "messages")).toHaveLength(messageCallsBefore + 1);
 
-	pendingMessagesPage.resolve(http_page([message_doc(500, { rand: "old1", text: "fetched row" })], false));
-	await screen.findByText("fetched row");
-	expect(within(row_of("fetched row")).queryByText("Reactions unavailable")).toBeNull();
-});
 
-test("isDone replaces the control with static text and a further interaction issues no request", async () => {
-	const h = make_harness();
-	await boot_at_capacity(h);
-	h.raw.fetchJson.mockResolvedValueOnce(
-		http_page(
-			Array.from({ length: 100 }, (_, index) => message_doc(500 - index, { rand: `o${index}` })),
-			true,
-		),
-	);
-
-	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
-	await screen.findByText("You have reached the start of #general.");
-	expect(screen.queryByRole("button", { name: "Load older messages" })).toBeNull();
-
-	fireEvent.click(screen.getByText("You have reached the start of #general."));
-	expect(list_calls(h, "messages")).toHaveLength(1);
-});
-
-test("a 429 names a wait, retries nothing by itself, and returns to idle when the wait passes", async () => {
-	const h = make_harness();
-	await boot_at_capacity(h);
-	h.raw.fetchJson.mockRejectedValueOnce(
-		Object.assign(new Error("429"), {
-			status: 429,
-			responseText: JSON.stringify({ message: "Slow down", retryAfterMs: 30 }),
-		}),
-	);
-
-	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
-	const alert = await screen.findByRole("alert");
-	expect(alert.textContent).toContain("too quickly");
-	expect((screen.getByRole("button", { name: "Load older messages" }) as HTMLButtonElement).disabled).toBe(true);
-	expect(list_calls(h, "messages")).toHaveLength(1);
-
-	// The bucket refills at two tokens a second, so the throttle clears on its own. Staying dead
-	// for the life of the frame is the failure mode the wait exists to prevent — and the control
-	// must not re-request while it waits, because every request spends another token.
-	await waitFor(() =>
-		expect((screen.getByRole("button", { name: "Load older messages" }) as HTMLButtonElement).disabled).toBe(false),
-	);
-	expect(list_calls(h, "messages")).toHaveLength(1);
-});
-
-test("a non-429 failure reads differently and hands the control straight back", async () => {
-	const h = make_harness();
-	await boot_at_capacity(h);
-	h.raw.fetchJson.mockRejectedValueOnce(
-		Object.assign(new Error("/api/v1/plugin-data/list responded 403: forbidden"), {
-			status: 403,
-			responseText: "forbidden",
-		}),
-	);
-
-	// fetchJson throws on every non-ok response, so a 400, a 403 after a permission change and a
-	// 500 all reach here — branching only on 429 leaves them as unhandled rejections.
-	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
-	const alert = await screen.findByRole("alert");
-	expect(alert.textContent).toContain("403");
-	expect(alert.textContent).not.toContain("too quickly");
-	await waitFor(() =>
-		expect((screen.getByRole("button", { name: "Load older messages" }) as HTMLButtonElement).disabled).toBe(false),
-	);
-});
-
-test("an HTTP page does not drag the companion lists into paging history", async () => {
-	const h = make_harness();
-	const newest = await boot_at_capacity(h);
-	const reactionCalls = list_calls(h, "reactions").length;
-	const replyCalls = list_calls(h, "replies").length;
-
-	h.raw.fetchJson.mockResolvedValueOnce(http_page([message_doc(500, { rand: "old1", text: "deep row" })], false));
-	fireEvent.click(screen.getByRole("button", { name: "Load older messages" }));
-	await screen.findByText("deep row");
-
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([newest], { hasMore: true, atCapacity: true }));
-	await waitFor(() => expect(screen.getByText("deep row")).toBeTruthy());
-	expect(list_calls(h, "reactions")).toHaveLength(reactionCalls);
-	expect(list_calls(h, "replies")).toHaveLength(replyCalls);
-});
 
 // #endregion load older
 
@@ -4706,7 +4666,7 @@ test("a private channel leaves when the full scope list says the member was take
 
 	// A dead ranged read is not proof of departure. The full scope list is still live and still
 	// names this channel, so keep the row until that list changes.
-	h.find_watch("channels", PRIVATE_KEY)!.onUpdate(null, { reason: "unavailable", message: "x" });
+	h.find_watch("channels", PRIVATE_KEY)!.onUpdate(null);
 	expect(within(nav).getByText("#secret-plans (private)")).toBeTruthy();
 
 	// The full membership list is the departure signal. The ranged read may die for other reasons,
@@ -4717,516 +4677,14 @@ test("a private channel leaves when the full scope list says the member was take
 	expect(within(nav).getByText("#general")).toBeTruthy();
 });
 
-test("an unavailable private channel read restarts and applies its fresh channel and cursor", async () => {
-	const h = make_harness();
-	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const firstWatch = h.find_watch("channels", PRIVATE_KEY)!;
-	firstWatch.onUpdate(watch_update([channel_doc(PRIVATE_KEY, "secret-plans"), private_cursor_doc(PRIVATE_KEY, 5000)]));
-	const nav = screen.getByRole("navigation", { name: "Channels" });
-	const cached = await waitFor(() => within(nav).getByRole("button", { name: "#secret-plans (private)" }));
 
-	vi.useFakeTimers();
-	try {
-		firstWatch.onUpdate(null, { reason: "unavailable", message: "Connection lost" });
-		expect(firstWatch.unsubscribed).toBe(true);
-		expect(cached.isConnected).toBe(true);
 
-		await act(async () => {
-			await vi.advanceTimersByTimeAsync(249);
-		});
-		expect(h.find_watch("channels", PRIVATE_KEY)).toBeUndefined();
-		await act(async () => {
-			await vi.advanceTimersByTimeAsync(1);
-		});
-		const restarted = h.find_watch("channels", PRIVATE_KEY);
-		expect(restarted).toBeTruthy();
-		expect(restarted).not.toBe(firstWatch);
 
-		await act(async () => {
-			restarted!.onUpdate(
-				watch_update([
-					{ ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 },
-					private_cursor_doc(PRIVATE_KEY, 8000, 2),
-				]),
-			);
-			await Promise.resolve();
-		});
-		const renamed = within(nav).getByRole("button", { name: "#renamed (private)" });
-		expect(renamed.classList.contains("is-unread")).toBe(false);
-	} finally {
-		vi.useRealTimers();
-	}
-});
 
-test("a denied private channel read restarts when watchMine coalesces a fast remove and re-add", async () => {
-	const h = make_harness();
-	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const firstWatch = h.find_watch("channels", PRIVATE_KEY)!;
-	firstWatch.onUpdate(watch_update([channel_doc(PRIVATE_KEY, "secret-plans"), private_cursor_doc(PRIVATE_KEY, 5000)]));
-	const nav = screen.getByRole("navigation", { name: "Channels" });
-	await waitFor(() => expect(within(nav).getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy());
 
-	vi.useFakeTimers();
-	try {
-		// The ranged query sees the short removal, but the full list sees only the final re-add.
-		firstWatch.onUpdate(null, { reason: "denied", message: "Access changed" });
-		h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
-		expect(firstWatch.unsubscribed).toBe(true);
 
-		await act(async () => {
-			await vi.advanceTimersByTimeAsync(250);
-		});
-		const activePrivateWatches = h.watches.filter(
-			(sub) => !sub.unsubscribed && sub.opts.collection === "channels" && sub.opts.keyPrefix === PRIVATE_KEY,
-		);
-		expect(activePrivateWatches).toHaveLength(1);
-		expect(
-			h.watches.filter((sub) => sub.opts.collection === "channels" && sub.opts.keyPrefix === PRIVATE_KEY),
-		).toHaveLength(2);
 
-		await act(async () => {
-			activePrivateWatches[0]!.onUpdate(
-				watch_update([
-					{ ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 },
-					private_cursor_doc(PRIVATE_KEY, 8000, 2),
-				]),
-			);
-			await Promise.resolve();
-		});
-		expect(within(nav).getByRole("button", { name: "#renamed (private)" })).toBeTruthy();
-	} finally {
-		vi.useRealTimers();
-	}
-});
 
-test("an open private channel restarts its reads in place after a fast remove and re-add", async () => {
-	const h = make_harness();
-	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const rangedWatch = h.find_watch("channels", PRIVATE_KEY)!;
-	const rangedWatchCount = h.watches.length;
-	const firstWindow = await waitFor(() => {
-		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
-		expect(found).toBeTruthy();
-		return found!;
-	});
-	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "cached root" });
-	firstWindow.onUpdate(window_update([root]));
-	await wait_for_feeds(h, PRIVATE_KEY);
-	const firstFeeds = ["messages", "replies", "reactions"].map((collection) => h.find_changes(collection, PRIVATE_KEY)!);
-	const textarea = composer_box("Message #secret-plans");
-	type_in_composer(textarea, "keep this draft");
-	textarea.focus();
-
-	// The scoped reads see the short removal. Keep the mounted view and its draft until the full
-	// scope list delivers the re-added membership generation.
-	firstWindow.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
-	for (const feed of firstFeeds) {
-		feed.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
-	}
-	expect(textarea.isConnected).toBe(true);
-	expect(textarea.value).toBe("keep this draft");
-	expect(document.activeElement).toBe(textarea);
-
-	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
-	const replacementWindow = await waitFor(() => {
-		const active = h.windows.filter(
-			(sub) => !sub.unsubscribed && sub.opts.collection === "messages" && sub.opts.keyPrefix === `${PRIVATE_KEY}:`,
-		);
-		expect(active).toHaveLength(1);
-		expect(h.windows.filter((sub) => sub.opts.keyPrefix === `${PRIVATE_KEY}:`)).toHaveLength(2);
-		return active[0]!;
-	});
-	expect(replacementWindow).not.toBe(firstWindow);
-	expect(screen.getByText("cached root")).toBeTruthy();
-	expect(textarea.isConnected).toBe(true);
-	expect(textarea.value).toBe("keep this draft");
-	expect(document.activeElement).toBe(textarea);
-	expect(h.find_watch("channels", PRIVATE_KEY)).toBe(rangedWatch);
-	expect(h.watches).toHaveLength(rangedWatchCount);
-	await waitFor(() =>
-		expect(h.changes.filter((sub) => !sub.unsubscribed && sub.opts.scopeId === PRIVATE_KEY)).toHaveLength(0),
-	);
-
-	replacementWindow.onUpdate(window_update([root]));
-	await waitFor(() => {
-		const active = h.changes.filter((sub) => !sub.unsubscribed && sub.opts.scopeId === PRIVATE_KEY);
-		expect(active).toHaveLength(3);
-		expect(h.changes.filter((sub) => sub.opts.scopeId === PRIVATE_KEY)).toHaveLength(6);
-	});
-	const replacementMessages = h.find_changes("messages", PRIVATE_KEY)!;
-	const replacementReplies = h.find_changes("replies", PRIVATE_KEY)!;
-	const replacementReactions = h.find_changes("reactions", PRIVATE_KEY)!;
-	const editedRoot = {
-		...root,
-		value: { ...root.value, text: "fresh root", editedAt: 2_000 },
-		revision: 2,
-		updatedAt: 2_000,
-	};
-	const reply = {
-		...message_doc(3_000, { channelKey: PRIVATE_KEY, rand: "r001", text: "fresh reply" }),
-		collection: "replies",
-		key: `${root.key}:${inv(3_000)}:r001`,
-	};
-	replacementMessages.onUpdate(watch_update([editedRoot]));
-	replacementReplies.onUpdate(watch_update([reply]));
-	replacementReactions.onUpdate(watch_update([{ ...reaction_doc(root.key, "heart", "user_other"), updatedAt: 3_000 }]));
-
-	expect(await screen.findByText("fresh root")).toBeTruthy();
-	expect(await screen.findByRole("button", { name: /^1 reply/ })).toBeTruthy();
-	expect(await screen.findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
-	await waitFor(() => expect(screen.queryAllByRole("alert")).toHaveLength(0));
-	expect(textarea.isConnected).toBe(true);
-	expect(textarea.value).toBe("keep this draft");
-	expect(document.activeElement).toBe(textarea);
-});
-
-test("a private read generation scans companion gaps from the beginning", async () => {
-	const h = make_harness();
-	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "cached root" });
-	const newerRoot = message_doc(3_000, { channelKey: PRIVATE_KEY, rand: "newr", text: "new root" });
-	const oldReply = {
-		...message_doc(1_500, { channelKey: PRIVATE_KEY, rand: "r001", text: "old reply" }),
-		collection: "replies",
-		key: `${root.key}:${inv(1_500)}:r001`,
-	};
-	const gapReply = {
-		...message_doc(2_000, { channelKey: PRIVATE_KEY, rand: "r002", text: "gap reply" }),
-		collection: "replies",
-		key: `${root.key}:${inv(2_000)}:r002`,
-	};
-	const oldReaction = { ...reaction_doc(root.key, "party", "user_other"), createdAt: 1_500, updatedAt: 1_500 };
-	const gapReaction = { ...reaction_doc(root.key, "heart", "user_third"), createdAt: 2_000, updatedAt: 2_000 };
-	let reactionLists = 0;
-	let replyLists = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
-		if (path !== "/api/v1/plugin-data/list") {
-			throw new Error("fetchJson not stubbed");
-		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
-		if (collection === "reactions") {
-			reactionLists += 1;
-			return http_page(reactionLists === 1 ? [oldReaction] : [gapReaction, oldReaction], true);
-		}
-		if (collection === "replies") {
-			replyLists += 1;
-			return http_page(replyLists === 1 ? [oldReply] : [gapReply, oldReply], true);
-		}
-		return http_page([], true);
-	});
-
-	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([root]));
-	expect(await screen.findByRole("button", { name: "Party, 1 reaction" })).toBeTruthy();
-	expect(await screen.findByRole("button", { name: /^1 reply/ })).toBeTruthy();
-	expect(list_calls(h, "reactions")).toHaveLength(1);
-	expect(list_calls(h, "replies")).toHaveLength(1);
-
-	// The gap companion rows are older than the new root's feed fence. Only a fresh HTTP scan
-	// from the channel prefix can recover them after access returns.
-	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
-	const replacementWindow = await waitFor(() => {
-		const active = h.windows.filter(
-			(sub) => !sub.unsubscribed && sub.opts.collection === "messages" && sub.opts.keyPrefix === `${PRIVATE_KEY}:`,
-		);
-		expect(active).toHaveLength(1);
-		expect(h.windows.filter((sub) => sub.opts.keyPrefix === `${PRIVATE_KEY}:`)).toHaveLength(2);
-		return active[0]!;
-	});
-	replacementWindow.onUpdate(window_update([newerRoot, root]));
-
-	expect(await screen.findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
-	expect(await screen.findByRole("button", { name: /^2 replies/ })).toBeTruthy();
-	expect(list_calls(h, "reactions")).toHaveLength(2);
-	expect(list_calls(h, "replies")).toHaveLength(2);
-	for (const collection of ["reactions", "replies"] as const) {
-		const secondBody = list_calls(h, collection)[1]![1]?.body as { keyStartExclusive?: string };
-		expect(secondBody.keyStartExclusive).toBeUndefined();
-		const feed = h.find_changes(collection, PRIVATE_KEY)!;
-		expect(feed.opts.updatedSince).toBe(3_000);
-		expect(feed.opts.updatedSince).toBeGreaterThan(gapReaction.updatedAt);
-	}
-});
-
-test("a pending reactions refresh keeps cached groups without an unavailable warning", async () => {
-	const h = make_harness();
-	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "cached reactions" });
-	const heart = { ...reaction_doc(root.key, "heart", "user_other"), updatedAt: 1_000 };
-	const party = { ...reaction_doc(root.key, "party", "user_third"), updatedAt: 2_000 };
-	const refreshedReactions = deferred<unknown>();
-	let reactionLists = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
-		if (path !== "/api/v1/plugin-data/list") {
-			throw new Error("fetchJson not stubbed");
-		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
-		if (collection === "reactions") {
-			reactionLists += 1;
-			return reactionLists === 1 ? http_page([heart], true) : refreshedReactions.promise;
-		}
-		return http_page([], true);
-	});
-	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([root]));
-	expect(await screen.findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
-
-	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
-	const replacementWindow = await waitFor(() => {
-		const active = h.windows.filter(
-			(sub) => !sub.unsubscribed && sub.opts.collection === "messages" && sub.opts.keyPrefix === `${PRIVATE_KEY}:`,
-		);
-		expect(active).toHaveLength(1);
-		expect(h.windows.filter((sub) => sub.opts.keyPrefix === `${PRIVATE_KEY}:`)).toHaveLength(2);
-		return active[0]!;
-	});
-	replacementWindow.onUpdate(window_update([root]));
-	await waitFor(() => expect(list_calls(h, "reactions")).toHaveLength(2));
-	const row = row_of("cached reactions");
-	expect(within(row).getByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
-	expect(within(row).queryByText("Reactions unavailable")).toBeNull();
-
-	await act(async () => {
-		refreshedReactions.resolve(http_page([party, heart], true));
-		await Promise.resolve();
-	});
-	expect(await within(row).findByRole("button", { name: "Party, 1 reaction" })).toBeTruthy();
-	expect(within(row).queryByText("Reactions unavailable")).toBeNull();
-});
-
-test("late companion results from an old private read generation are ignored", async () => {
-	const h = make_harness();
-	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "cached root" });
-	const oldReactions = deferred<unknown>();
-	const oldReplies = deferred<unknown>();
-	const currentReactions = deferred<unknown>();
-	const currentReplies = deferred<unknown>();
-	let reactionLists = 0;
-	let replyLists = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
-		if (path !== "/api/v1/plugin-data/list") {
-			throw new Error("fetchJson not stubbed");
-		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
-		if (collection === "reactions") {
-			reactionLists += 1;
-			return reactionLists === 1 ? oldReactions.promise : currentReactions.promise;
-		}
-		if (collection === "replies") {
-			replyLists += 1;
-			return replyLists === 1 ? oldReplies.promise : currentReplies.promise;
-		}
-		return http_page([], true);
-	});
-
-	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([root]));
-	await waitFor(() => {
-		expect(list_calls(h, "reactions")).toHaveLength(1);
-		expect(list_calls(h, "replies")).toHaveLength(1);
-	});
-	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
-	const replacementWindow = await waitFor(() => {
-		const active = h.windows.filter(
-			(sub) => !sub.unsubscribed && sub.opts.collection === "messages" && sub.opts.keyPrefix === `${PRIVATE_KEY}:`,
-		);
-		expect(active).toHaveLength(1);
-		expect(h.windows.filter((sub) => sub.opts.keyPrefix === `${PRIVATE_KEY}:`)).toHaveLength(2);
-		return active[0]!;
-	});
-	replacementWindow.onUpdate(window_update([root]));
-	await waitFor(() => {
-		expect(list_calls(h, "reactions")).toHaveLength(2);
-		expect(list_calls(h, "replies")).toHaveLength(2);
-	});
-
-	const currentReaction = { ...reaction_doc(root.key, "heart", "user_other"), updatedAt: 2_000 };
-	const currentReply = {
-		...message_doc(2_000, { channelKey: PRIVATE_KEY, rand: "r002", text: "current reply" }),
-		collection: "replies",
-		key: `${root.key}:${inv(2_000)}:r002`,
-	};
-	await act(async () => {
-		currentReactions.resolve(http_page([currentReaction], true));
-		currentReplies.resolve(http_page([currentReply], true));
-		await Promise.resolve();
-	});
-	expect(await screen.findByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
-	expect(await screen.findByRole("button", { name: /^1 reply/ })).toBeTruthy();
-
-	vi.useFakeTimers();
-	try {
-		await act(async () => {
-			oldReactions.resolve(http_page([{ ...reaction_doc(root.key, "party", "user_third"), updatedAt: 1_500 }], false));
-			oldReplies.reject(new Error("old reply list failed"));
-			await Promise.resolve();
-			await Promise.resolve();
-			await vi.advanceTimersByTimeAsync(60_000);
-		});
-		expect(screen.queryByRole("button", { name: "Party, 1 reaction" })).toBeNull();
-		expect(screen.getByRole("button", { name: "Heart, 1 reaction" })).toBeTruthy();
-		expect(screen.getByRole("button", { name: /^1 reply/ })).toBeTruthy();
-		expect(screen.queryByText("Some reactions and replies in this range could not be loaded.")).toBeNull();
-		expect(list_calls(h, "reactions")).toHaveLength(2);
-		expect(list_calls(h, "replies")).toHaveLength(2);
-	} finally {
-		vi.useRealTimers();
-	}
-});
-
-test("an open private thread refreshes its exact reply list in place for a new read generation", async () => {
-	const h = make_harness();
-	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "thread root" });
-	const oldExact = deferred<unknown>();
-	const currentExact = deferred<unknown>();
-	let exactLists = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
-		if (path !== "/api/v1/plugin-data/list") {
-			throw new Error("fetchJson not stubbed");
-		}
-		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
-		if (body?.collection === "replies" && body.keyPrefix === `${root.key}:`) {
-			exactLists += 1;
-			return exactLists === 1 ? oldExact.promise : currentExact.promise;
-		}
-		return http_page([], true);
-	});
-	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([root]));
-	await screen.findByText("thread root");
-
-	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
-	const panel = await screen.findByRole("region", { name: "Thread" });
-	await waitFor(() => expect(exactLists).toBe(1));
-	const replyBox = within(panel).getByRole("combobox", { name: "Reply in thread" }) as HTMLTextAreaElement;
-	type_in_composer(replyBox, "keep this reply draft");
-	replyBox.focus();
-
-	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
-	await waitFor(() => expect(exactLists).toBe(2));
-	expect(screen.getByRole("region", { name: "Thread" })).toBe(panel);
-	expect(within(panel).getByRole("combobox", { name: "Reply in thread" })).toBe(replyBox);
-	expect(replyBox.value).toBe("keep this reply draft");
-	expect(document.activeElement).toBe(replyBox);
-
-	await act(async () => {
-		oldExact.reject(new Error("stale exact list failed"));
-		await Promise.resolve();
-	});
-	expect(within(panel).queryByText("stale exact list failed")).toBeNull();
-	expect(within(panel).getByText("Loading replies…")).toBeTruthy();
-
-	const freshReply = {
-		...message_doc(2_000, { channelKey: PRIVATE_KEY, rand: "r002", text: "fresh exact reply" }),
-		collection: "replies",
-		key: `${root.key}:${inv(2_000)}:r002`,
-	};
-	await act(async () => {
-		currentExact.resolve(http_page([freshReply], true));
-		await Promise.resolve();
-	});
-	expect(await within(panel).findByText("fresh exact reply")).toBeTruthy();
-	expect(within(panel).queryByText("Loading replies…")).toBeNull();
-	expect(within(panel).queryByRole("alert")).toBeNull();
-	expect(replyBox.hasAttribute("disabled")).toBe(false);
-	expect(replyBox.value).toBe("keep this reply draft");
-	expect(document.activeElement).toBe(replyBox);
-});
-
-test("a private thread keeps cached replies and focus while its exact list refreshes", async () => {
-	const h = make_harness();
-	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const root = message_doc(1_000, { channelKey: PRIVATE_KEY, rand: "root", text: "thread root" });
-	const cachedReply = {
-		...message_doc(2_000, { channelKey: PRIVATE_KEY, rand: "r002", text: "cached exact reply" }),
-		collection: "replies",
-		key: `${root.key}:${inv(2_000)}:r002`,
-	};
-	const refreshedExact = deferred<unknown>();
-	let exactLists = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
-		if (path !== "/api/v1/plugin-data/list") {
-			throw new Error("fetchJson not stubbed");
-		}
-		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
-		if (body?.collection === "replies" && body.keyPrefix === `${root.key}:`) {
-			exactLists += 1;
-			return exactLists === 1 ? http_page([cachedReply], true) : refreshedExact.promise;
-		}
-		return http_page([], true);
-	});
-	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([root]));
-	await screen.findByText("thread root");
-
-	fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
-	const panel = await screen.findByRole("region", { name: "Thread" });
-	const replyRow = row_of("cached exact reply");
-	const reactionButton = within(replyRow).getByRole("button", { name: "Add reaction" });
-	reactionButton.focus();
-	expect(document.activeElement).toBe(reactionButton);
-
-	h.send_scopes([{ ...private_scope(), membershipRevision: 2 }]);
-	await waitFor(() => expect(exactLists).toBe(2));
-	expect(within(panel).getByText("Loading replies…")).toBeTruthy();
-	expect(row_of("cached exact reply")).toBe(replyRow);
-	expect(within(replyRow).getByRole("button", { name: "Add reaction" })).toBe(reactionButton);
-	expect(document.activeElement).toBe(reactionButton);
-
-	await act(async () => {
-		refreshedExact.resolve(http_page([cachedReply], true));
-		await Promise.resolve();
-	});
-	await waitFor(() => expect(within(panel).queryByText("Loading replies…")).toBeNull());
-	expect(row_of("cached exact reply")).toBe(replyRow);
-	expect(document.activeElement).toBe(reactionButton);
-});
-
-test("a private channel read restarts when the full scope list recovers after its retry", async () => {
-	const h = make_harness();
-	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const firstWatch = h.find_watch("channels", PRIVATE_KEY)!;
-	firstWatch.onUpdate(watch_update([channel_doc(PRIVATE_KEY, "secret-plans"), private_cursor_doc(PRIVATE_KEY, 5000)]));
-	const nav = screen.getByRole("navigation", { name: "Channels" });
-	await waitFor(() => expect(within(nav).getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy());
-
-	vi.useFakeTimers();
-	try {
-		// The ranged retry is queued first. It fires while the full scope list is still dead.
-		firstWatch.onUpdate(null, { reason: "unavailable", message: "Connection lost" });
-		h.send_scope_death("unavailable");
-		await act(async () => {
-			await vi.advanceTimersByTimeAsync(250);
-		});
-		expect(h.find_watch("channels", PRIVATE_KEY)).toBeUndefined();
-		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(2);
-
-		await act(async () => {
-			h.send_scopes([private_scope()]);
-			await Promise.resolve();
-		});
-		const activePrivateWatches = h.watches.filter(
-			(sub) => !sub.unsubscribed && sub.opts.collection === "channels" && sub.opts.keyPrefix === PRIVATE_KEY,
-		);
-		expect(activePrivateWatches).toHaveLength(1);
-		const restarted = activePrivateWatches[0]!;
-		expect(restarted).not.toBe(firstWatch);
-		expect(
-			h.watches.filter((sub) => sub.opts.collection === "channels" && sub.opts.keyPrefix === PRIVATE_KEY),
-		).toHaveLength(2);
-
-		await act(async () => {
-			restarted.onUpdate(
-				watch_update([
-					{ ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 },
-					private_cursor_doc(PRIVATE_KEY, 8000, 2),
-				]),
-			);
-			await Promise.resolve();
-		});
-		const renamed = within(nav).getByRole("button", { name: "#renamed (private)" });
-		expect(renamed.classList.contains("is-unread")).toBe(false);
-	} finally {
-		vi.useRealTimers();
-	}
-});
 
 test("a two-person direct message renders through the same component and store path as a bigger private channel", async () => {
 	const h = make_harness();
@@ -5308,7 +4766,7 @@ test("creating a private channel sends its whole setup through one atomic scope 
 
 	await waitFor(() => expect(h.calls.length).toBe(before + 1));
 	const made = h.calls.slice(before);
-	expect(made.map((call) => call.op)).toEqual(["scopes.createWithDocument"]);
+	expect(made.map((call) => call.op)).toEqual(["scopes.create_with_document"]);
 	expect(made[0].args.collections).toEqual(["channels", "messages", "replies", "reactions"]);
 	expect(made[0].args.keyPrefix).toBe(made[0].args.scopeId);
 	expect(String(made[0].args.keyPrefix)).toMatch(/^p\//);
@@ -5319,13 +4777,12 @@ test("creating a private channel sends its whole setup through one atomic scope 
 		value: { name: "secret-plans", archivedAt: null },
 	});
 	expect(h.raw.scopes.create).not.toHaveBeenCalled();
-	expect(h.raw.scopes.setPrincipal).not.toHaveBeenCalled();
-	expect(h.raw.data.put).not.toHaveBeenCalled();
+	expect(h.raw.scopes.set_principal).not.toHaveBeenCalled();
 });
 
 test("a definite private-create refusal leaves the dialog open and unlocks its fields", async () => {
 	const h = make_harness();
-	h.raw.scopes.createWithDocument.mockResolvedValueOnce({
+	h.raw.scopes.create_with_document.mockResolvedValueOnce({
 		_nay: { name: "storage_full", message: "No document slots remain" },
 	});
 	await boot(h);
@@ -5338,27 +4795,26 @@ test("a definite private-create refusal leaves the dialog open and unlocks its f
 	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
 
 	expect((await within(dialog).findByRole("alert")).textContent).toContain("No document slots remain");
-	expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(1);
+	expect(h.raw.scopes.create_with_document).toHaveBeenCalledTimes(1);
 	expect((within(dialog).getByLabelText("Channel name") as HTMLInputElement).disabled).toBe(false);
 	expect((within(dialog).getByLabelText("Topic (optional)") as HTMLInputElement).disabled).toBe(false);
 	expect((within(dialog).getByLabelText("Private channel") as HTMLInputElement).disabled).toBe(false);
 	expect((within(dialog).getByLabelText("Bob") as HTMLInputElement).disabled).toBe(false);
 	expect(within(dialog).getByRole("button", { name: "Create" })).toBeTruthy();
 	expect(h.raw.scopes.create).not.toHaveBeenCalled();
-	expect(h.raw.scopes.setPrincipal).not.toHaveBeenCalled();
+	expect(h.raw.scopes.set_principal).not.toHaveBeenCalled();
 	expect(h.raw.scopes.delete).not.toHaveBeenCalled();
-	expect(h.raw.data.put).not.toHaveBeenCalled();
 });
 
 test("a private exact retry conflict accepts a renamed exact read only after current principal proof", async () => {
 	const h = make_harness();
 	const pendingCreate = deferred<ScopeChangeResult>();
 	const exactRead = deferred<unknown>();
-	const exactPrincipals = deferred<BonoboUiScopePrincipalListResult>();
-	h.raw.scopes.createWithDocument
+	const exactPrincipals = deferred<chat_ScopePrincipal[] | null>();
+	h.raw.scopes.create_with_document
 		.mockReturnValueOnce(pendingCreate.promise)
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
-	h.raw.scopes.listPrincipals.mockReturnValueOnce(exactPrincipals.promise);
+	h.raw.doors.watch_scope_principals.mockReturnValueOnce(exactPrincipals.promise);
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
 			return exactRead.promise;
@@ -5401,18 +4857,17 @@ test("a private exact retry conflict accepts a renamed exact read only after cur
 	expect(privacy.disabled).toBe(true);
 	expect(bob.disabled).toBe(true);
 	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
-	const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+	const first = h.raw.scopes.create_with_document.mock.calls[0]![0];
 	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
-	await waitFor(() => expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(h.raw.scopes.create_with_document).toHaveBeenCalledTimes(2));
 
-	const retry = h.raw.scopes.createWithDocument.mock.calls[1]![0];
+	const retry = h.raw.scopes.create_with_document.mock.calls[1]![0];
 	expect(retry).toEqual(first);
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
 	expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]?.body).toEqual({
 		collection: "channels",
 		key: first.scopeId,
 	});
-	expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
 	expect(screen.getByRole("dialog")).toBe(dialog);
 	expect(name.disabled).toBe(true);
 	expect((within(dialog).getByRole("button", { name: "Checking…" }) as HTMLButtonElement).disabled).toBe(true);
@@ -5422,9 +4877,9 @@ test("a private exact retry conflict accepts a renamed exact read only after cur
 	h.send_scopes([]);
 	expect(screen.getByRole("dialog")).toBe(dialog);
 	exactRead.resolve({ document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } });
-	await waitFor(() => expect(h.raw.scopes.listPrincipals).toHaveBeenCalledWith({ scopeId: first.scopeId }));
+	await waitFor(() => expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledWith({ scopeId: first.scopeId }));
 	expect(screen.getByRole("dialog")).toBe(dialog);
-	exactPrincipals.resolve({ _yay: [{ userId: "user_me", level: "manage" }] });
+	exactPrincipals.resolve([{ userId: "user_me", level: "manage" }]);
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
 	// The exact read selected the original key. The normal scope and ranged watches can catch up later.
@@ -5442,10 +4897,10 @@ test("a private exact retry conflict accepts a renamed exact read only after cur
 test("a null private create proof keeps the same key uncertain and locked", async () => {
 	const h = make_harness();
 	const exactRead = deferred<unknown>();
-	h.raw.scopes.createWithDocument
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+	h.raw.scopes.create_with_document
+		.mockRejectedValueOnce(new Error("Connection lost"))
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } })
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost again" } });
+		.mockRejectedValueOnce(new Error("Connection lost again"));
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
 			return exactRead.promise;
@@ -5465,18 +4920,17 @@ test("a null private create proof keeps the same key uncertain and locked", asyn
 	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
 	await within(dialog).findByText("Connection lost");
 	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
-	await waitFor(() => expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(h.raw.scopes.create_with_document).toHaveBeenCalledTimes(2));
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
 	expect((within(dialog).getByLabelText("Channel name") as HTMLInputElement).disabled).toBe(true);
 
-	const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+	const first = h.raw.scopes.create_with_document.mock.calls[0]![0];
 	// Cached presence is also not proof that the original create still exists now.
 	h.send_scopes([private_scope([], first.scopeId)]);
 	expect(within(dialog).getByRole("button", { name: "Checking…" })).toBeTruthy();
 	exactRead.resolve({ document: null });
 	await waitFor(() => expect(within(dialog).getByRole("alert").textContent).toContain("cannot confirm whether"));
-	expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
-	expect(h.raw.scopes.listPrincipals).not.toHaveBeenCalled();
+	expect(h.raw.doors.watch_scope_principals).not.toHaveBeenCalled();
 	expect(name.disabled).toBe(true);
 	expect((within(dialog).getByLabelText("Private channel") as HTMLInputElement).disabled).toBe(true);
 	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
@@ -5486,14 +4940,14 @@ test("a null private create proof keeps the same key uncertain and locked", asyn
 			await vi.advanceTimersByTimeAsync(10_000);
 		});
 		expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
-		expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(2);
+		expect(h.raw.scopes.create_with_document).toHaveBeenCalledTimes(2);
 	} finally {
 		vi.useRealTimers();
 	}
 	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
 
-	await waitFor(() => expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(3));
-	expect(h.raw.scopes.createWithDocument.mock.calls[2]![0]).toEqual(first);
+	await waitFor(() => expect(h.raw.scopes.create_with_document).toHaveBeenCalledTimes(3));
+	expect(h.raw.scopes.create_with_document.mock.calls[2]![0]).toEqual(first);
 	expect((await within(dialog).findByRole("alert")).textContent).toContain("Connection lost again");
 	expect(name.disabled).toBe(true);
 	expect(screen.getByRole("dialog")).toBe(dialog);
@@ -5501,13 +4955,13 @@ test("a null private create proof keeps the same key uncertain and locked", asyn
 
 test("an owner-readable private channel with an exact-null principal list keeps the same create key locked", async () => {
 	const h = make_harness();
-	h.raw.scopes.createWithDocument
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+	h.raw.scopes.create_with_document
+		.mockRejectedValueOnce(new Error("Connection lost"))
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } })
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost again" } });
+		.mockRejectedValueOnce(new Error("Connection lost again"));
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
-			const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+			const first = h.raw.scopes.create_with_document.mock.calls[0]![0];
 			return { document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } };
 		}
 		if (path === "/api/v1/plugin-data/list") {
@@ -5515,7 +4969,7 @@ test("an owner-readable private channel with an exact-null principal list keeps 
 		}
 		throw new Error("fetchJson not stubbed");
 	});
-	h.raw.scopes.listPrincipals.mockResolvedValueOnce({ _yay: null });
+	h.raw.doors.watch_scope_principals.mockResolvedValueOnce(null);
 	await boot(h);
 
 	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
@@ -5525,13 +4979,13 @@ test("an owner-readable private channel with an exact-null principal list keeps 
 	fireEvent.click(within(dialog).getByLabelText("Private channel"));
 	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
 	await within(dialog).findByText("Connection lost");
-	const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+	const first = h.raw.scopes.create_with_document.mock.calls[0]![0];
 	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
 
 	await waitFor(() =>
 		expect(within(dialog).getByRole("alert").textContent).toContain("not in its current access list"),
 	);
-	expect(h.raw.scopes.listPrincipals).toHaveBeenCalledWith({ scopeId: first.scopeId });
+	expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledWith({ scopeId: first.scopeId });
 	expect(name.disabled).toBe(true);
 	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
 	vi.useFakeTimers();
@@ -5540,22 +4994,22 @@ test("an owner-readable private channel with an exact-null principal list keeps 
 			await vi.advanceTimersByTimeAsync(10_000);
 		});
 		expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
-		expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(1);
+		expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledTimes(1);
 	} finally {
 		vi.useRealTimers();
 	}
 	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
-	await waitFor(() => expect(h.raw.scopes.createWithDocument).toHaveBeenCalledTimes(3));
-	expect(h.raw.scopes.createWithDocument.mock.calls[2]![0]).toEqual(first);
+	await waitFor(() => expect(h.raw.scopes.create_with_document).toHaveBeenCalledTimes(3));
+	expect(h.raw.scopes.create_with_document.mock.calls[2]![0]).toEqual(first);
 	expect(screen.getByRole("dialog")).toBe(dialog);
 });
 
 test("private create exact-read failures retry with exponential backoff capped at four seconds", async () => {
 	const h = make_harness();
 	let readAttempts = 0;
-	h.raw.scopes.listPrincipals.mockResolvedValue({ _yay: [{ userId: "user_me", level: "manage" }] });
-	h.raw.scopes.createWithDocument
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+	h.raw.doors.watch_scope_principals.mockResolvedValue([{ userId: "user_me", level: "manage" }]);
+	h.raw.scopes.create_with_document
+		.mockRejectedValueOnce(new Error("Connection lost"))
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
@@ -5569,7 +5023,7 @@ test("private create exact-read failures retry with exponential backoff capped a
 			if (readAttempts === 3) {
 				return { document: channel_doc(CH1_KEY, "wrong channel") };
 			}
-			const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+			const first = h.raw.scopes.create_with_document.mock.calls[0]![0];
 			return { document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } };
 		}
 		if (path === "/api/v1/plugin-data/list") {
@@ -5614,12 +5068,12 @@ test("private create exact-read failures retry with exponential backoff capped a
 
 test("private create unavailable and malformed principal reads retry until an exact list includes this member", async () => {
 	const h = make_harness();
-	h.raw.scopes.createWithDocument
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+	h.raw.scopes.create_with_document
+		.mockRejectedValueOnce(new Error("Connection lost"))
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
-			const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+			const first = h.raw.scopes.create_with_document.mock.calls[0]![0];
 			return { document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } };
 		}
 		if (path === "/api/v1/plugin-data/list") {
@@ -5627,10 +5081,10 @@ test("private create unavailable and malformed principal reads retry until an ex
 		}
 		throw new Error("fetchJson not stubbed");
 	});
-	h.raw.scopes.listPrincipals
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
-		.mockResolvedValueOnce({ _yay: "not a principal list" } as unknown as BonoboUiScopePrincipalListResult)
-		.mockResolvedValueOnce({ _yay: [{ userId: "user_me", level: "manage" }] });
+	h.raw.doors.watch_scope_principals
+		.mockRejectedValueOnce(new Error("Connection lost"))
+		.mockResolvedValueOnce("not a principal list" as unknown as chat_ScopePrincipal[])
+		.mockResolvedValueOnce([{ userId: "user_me", level: "manage" }]);
 	await boot(h);
 
 	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
@@ -5648,19 +5102,19 @@ test("private create unavailable and malformed principal reads retry until an ex
 			await Promise.resolve();
 			await Promise.resolve();
 		});
-		expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(1);
+		expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledTimes(1);
 		expect(screen.getByRole("dialog")).toBe(dialog);
 
 		await act(async () => {
 			await vi.advanceTimersByTimeAsync(250);
 		});
-		expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(2);
+		expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledTimes(2);
 		expect(screen.getByRole("dialog")).toBe(dialog);
 
 		await act(async () => {
 			await vi.advanceTimersByTimeAsync(500);
 		});
-		expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(3);
+		expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledTimes(3);
 		expect(screen.queryByRole("dialog")).toBeNull();
 	} finally {
 		vi.useRealTimers();
@@ -5669,8 +5123,8 @@ test("private create unavailable and malformed principal reads retry until an ex
 
 test("cancelling private create reconciliation clears its retry timer", async () => {
 	const h = make_harness();
-	h.raw.scopes.createWithDocument
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+	h.raw.scopes.create_with_document
+		.mockRejectedValueOnce(new Error("Connection lost"))
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
@@ -5711,8 +5165,8 @@ test("cancelling private create reconciliation clears its retry timer", async ()
 test("a late private create exact read cannot settle a new dialog after Cancel", async () => {
 	const h = make_harness();
 	const exactRead = deferred<unknown>();
-	h.raw.scopes.createWithDocument
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+	h.raw.scopes.create_with_document
+		.mockRejectedValueOnce(new Error("Connection lost"))
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
@@ -5733,7 +5187,7 @@ test("a late private create exact read cannot settle a new dialog after Cancel",
 	await within(dialog).findByText("Connection lost");
 	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
-	const first = h.raw.scopes.createWithDocument.mock.calls[0]![0];
+	const first = h.raw.scopes.create_with_document.mock.calls[0]![0];
 	fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
@@ -5772,7 +5226,7 @@ test("the people dialog shows who is in a private channel and can take somebody 
 	// The shrink path. Without it a private channel would be append-only: you could add a colleague
 	// and would have no door to take it back.
 	await waitFor(() => expect(dialog.querySelector(".current-people")?.textContent).not.toContain("Bob"));
-	expect(h.calls.some((call) => call.op === "scopes.removePrincipal" && call.args.userId === "user_other")).toBe(true);
+	expect(h.calls.some((call) => call.op === "scopes.remove_principal" && call.args.userId === "user_other")).toBe(true);
 });
 
 test("an unavailable add reloads and shows a committed member before ending the busy state", async () => {
@@ -5783,21 +5237,17 @@ test("an unavailable add reloads and shows a committed member before ending the 
 	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
 	const dialog = await screen.findByRole("dialog");
 	const bob = await within(dialog).findByLabelText("Bob");
-	const reload = deferred<BonoboUiScopePrincipalListResult>();
-	h.raw.scopes.setPrincipal.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "Connection lost after send" },
-	});
-	h.raw.scopes.listPrincipals.mockReturnValueOnce(reload.promise);
+	const reload = deferred<chat_ScopePrincipal[] | null>();
+	h.raw.scopes.set_principal.mockRejectedValueOnce(new Error("Connection lost after send"));
+	h.raw.doors.watch_scope_principals.mockReturnValueOnce(reload.promise);
 
 	fireEvent.click(bob);
-	await waitFor(() => expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledTimes(2));
 	expect((within(dialog).getByRole("button", { name: "Close" }) as HTMLButtonElement).disabled).toBe(true);
-	reload.resolve({
-		_yay: [
-			{ userId: "user_me", level: "manage" },
-			{ userId: "user_other", level: "member" },
-		],
-	});
+	reload.resolve([
+		{ userId: "user_me", level: "manage" },
+		{ userId: "user_other", level: "member" },
+	]);
 
 	await waitFor(() => expect(dialog.querySelector(".current-people")?.textContent).toContain("Bob"));
 	expect((await within(dialog).findByRole("alert")).textContent).toBe(
@@ -5819,16 +5269,14 @@ test("an unavailable remove reloads and hides a committed removal before ending 
 	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
 	const dialog = await screen.findByRole("dialog");
 	const remove = await within(dialog).findByRole("button", { name: "Remove" });
-	const reload = deferred<BonoboUiScopePrincipalListResult>();
-	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "Connection lost after send" },
-	});
-	h.raw.scopes.listPrincipals.mockReturnValueOnce(reload.promise);
+	const reload = deferred<chat_ScopePrincipal[] | null>();
+	h.raw.scopes.remove_principal.mockRejectedValueOnce(new Error("Connection lost after send"));
+	h.raw.doors.watch_scope_principals.mockReturnValueOnce(reload.promise);
 
 	fireEvent.click(remove);
-	await waitFor(() => expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledTimes(2));
 	expect((within(dialog).getByRole("button", { name: "Close" }) as HTMLButtonElement).disabled).toBe(true);
-	reload.resolve({ _yay: [{ userId: "user_me", level: "manage" }] });
+	reload.resolve([{ userId: "user_me", level: "manage" }]);
 
 	await waitFor(() => expect(dialog.querySelector(".current-people")?.textContent).not.toContain("Bob"));
 	expect((await within(dialog).findByRole("alert")).textContent).toBe(
@@ -5842,9 +5290,7 @@ test("an unavailable remove reloads and hides a committed removal before ending 
 test("an unavailable people read shows Retry and does not look like exact lost access", async () => {
 	const h = make_harness();
 	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_me", level: "manage" }]);
-	h.raw.scopes.listPrincipals.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "Failed to read who can access this" },
-	});
+	h.raw.doors.watch_scope_principals.mockRejectedValueOnce(new Error("Failed to read who can access this"));
 	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 
 	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
@@ -5856,12 +5302,12 @@ test("an unavailable people read shows Retry and does not look like exact lost a
 	expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Close" }));
 	fireEvent.click(retry);
 	await waitFor(() => expect(dialog.querySelector(".current-people")?.textContent).toContain("Me"));
-	expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(2);
+	expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledTimes(2);
 });
 
 test("an exact-null people read shows the no-longer-readable state without Retry", async () => {
 	const h = make_harness();
-	h.raw.scopes.listPrincipals.mockResolvedValueOnce({ _yay: null });
+	h.raw.doors.watch_scope_principals.mockResolvedValueOnce(null);
 	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 
 	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
@@ -5874,7 +5320,7 @@ test("an exact-null people read shows the no-longer-readable state without Retry
 test("a definite people refusal keeps the current list and does not reload", async () => {
 	const h = make_harness();
 	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_me", level: "manage" }]);
-	h.raw.scopes.setPrincipal.mockResolvedValueOnce({ _nay: { name: "denied", message: "Not allowed" } });
+	h.raw.scopes.set_principal.mockResolvedValueOnce({ _nay: { name: "denied", message: "Not allowed" } });
 	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 
 	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
@@ -5882,7 +5328,7 @@ test("a definite people refusal keeps the current list and does not reload", asy
 	fireEvent.click(await within(dialog).findByLabelText("Bob"));
 
 	expect((await within(dialog).findByRole("alert")).textContent).toBe("Not allowed");
-	expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(1);
+	expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledTimes(1);
 	expect(dialog.querySelector(".current-people")?.textContent).not.toContain("Bob");
 });
 
@@ -5893,7 +5339,7 @@ test("Escape cannot dismiss the people dialog while a membership change is pendi
 		{ userId: "user_other", level: "member" },
 	]);
 	const pendingRemove = deferred<ScopeChangeResult>();
-	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingRemove.promise);
+	h.raw.scopes.remove_principal.mockReturnValueOnce(pendingRemove.promise);
 	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 
 	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
@@ -5915,7 +5361,7 @@ test("a pending people change blocks a second picker change and keeps Escape loc
 	const h = make_harness();
 	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_me", level: "manage" }]);
 	const pendingAdd = deferred<ScopeChangeResult>();
-	h.raw.scopes.setPrincipal.mockReturnValueOnce(pendingAdd.promise);
+	h.raw.scopes.set_principal.mockReturnValueOnce(pendingAdd.promise);
 	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 
 	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
@@ -5925,7 +5371,7 @@ test("a pending people change blocks a second picker change and keeps Escape loc
 	fireEvent.click(bob);
 	await waitFor(() => expect((cleo as HTMLInputElement).disabled).toBe(true));
 	fireEvent.click(cleo);
-	expect(h.raw.scopes.setPrincipal).toHaveBeenCalledTimes(1);
+	expect(h.raw.scopes.set_principal).toHaveBeenCalledTimes(1);
 	fireEvent.keyDown(dialog, { key: "Escape" });
 	expect(screen.getByRole("dialog")).toBe(dialog);
 
@@ -6045,12 +5491,12 @@ test("Leave freezes its count, starts on Cancel, and sends the reviewed count", 
 		},
 	]);
 	expect(within(dialog).getByRole("button", { name: "Leave channel" })).toBeTruthy();
-	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
+	h.raw.scopes.remove_principal.mockResolvedValueOnce({
 		_nay: { name: "conflict", message: "Principal count changed" },
 	});
 	fireEvent.click(within(dialog).getByRole("button", { name: "Leave channel" }));
 	await waitFor(() =>
-		expect(h.raw.scopes.removePrincipal).toHaveBeenLastCalledWith({
+		expect(h.raw.scopes.remove_principal).toHaveBeenLastCalledWith({
 			scopeId: PRIVATE_KEY,
 			userId: "user_me",
 			expectedPrincipalCount: 2,
@@ -6126,7 +5572,7 @@ test.each([
 	expect((await within(dialog).findByText(testCase.body)).textContent).toBe(testCase.body);
 
 	if (testCase.action === "Leave") {
-		h.raw.scopes.removePrincipal.mockResolvedValueOnce({ _nay: { message: "Try again" } });
+		h.raw.scopes.remove_principal.mockResolvedValueOnce({ _nay: { message: "Try again" } });
 	} else {
 		h.raw.scopes.delete.mockResolvedValueOnce({ _nay: { message: "Try again" } });
 	}
@@ -6134,7 +5580,7 @@ test.each([
 	await waitFor(() => {
 		const call =
 			testCase.action === "Leave"
-				? h.raw.scopes.removePrincipal.mock.calls.at(-1)?.[0]
+				? h.raw.scopes.remove_principal.mock.calls.at(-1)?.[0]
 				: h.raw.scopes.delete.mock.calls.at(-1)?.[0];
 		expect(call).toBeTruthy();
 		expect(call).not.toHaveProperty("expectedPrincipalCount");
@@ -6147,9 +5593,7 @@ test("an unavailable principal count keeps Delete disabled until Retry gets an e
 		{ userId: "user_me", level: "manage" },
 		{ userId: "user_other", level: "member" },
 	]);
-	h.raw.scopes.listPrincipals.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "Failed to read who can access this" },
-	});
+	h.raw.doors.watch_scope_principals.mockRejectedValueOnce(new Error("Failed to read who can access this"));
 	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 
 	fireEvent.click(await open_channel_menu_item("secret-plans", "Delete #secret-plans for everyone"));
@@ -6191,11 +5635,11 @@ test.each([
 		{ userId: "user_other", level: "member" },
 	]);
 	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	const scopeResult = { _nay: { name: "unavailable", message: "Connection lost after send" } } as const;
+	const lostAnswer = new Error("Connection lost after send");
 	if (testCase.action === "Leave") {
-		h.raw.scopes.removePrincipal.mockResolvedValueOnce(scopeResult);
+		h.raw.scopes.remove_principal.mockRejectedValueOnce(lostAnswer);
 	} else {
-		h.raw.scopes.delete.mockResolvedValueOnce(scopeResult);
+		h.raw.scopes.delete.mockRejectedValueOnce(lostAnswer);
 	}
 
 	const menuName = testCase.action === "Leave" ? "Leave #secret-plans" : "Delete #secret-plans for everyone";
@@ -6246,9 +5690,7 @@ test("an owner Leave settles from the exact principal list when one member remai
 		{ userId: "user_me", level: "manage" },
 		{ userId: "user_other", level: "member" },
 	]);
-	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "Connection lost after send" },
-	});
+	h.raw.scopes.remove_principal.mockRejectedValueOnce(new Error("Connection lost after send"));
 	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
 	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
@@ -6257,10 +5699,10 @@ test("an owner Leave settles from the exact principal list when one member remai
 
 	// The owner can still read the channel after leaving. The live principal list is the membership proof.
 	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_other", level: "manage" }]);
-	h.raw.scopes.listPrincipals.mockResolvedValueOnce({ _yay: null });
+	h.raw.doors.watch_scope_principals.mockResolvedValueOnce(null);
 	exactRead.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-	expect(h.raw.scopes.listPrincipals).toHaveBeenCalledWith({ scopeId: PRIVATE_KEY });
+	expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledWith({ scopeId: PRIVATE_KEY });
 	await waitFor(() => expect(announcer_text(utils.container)).toContain("Left #secret-plans"));
 	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
 });
@@ -6285,9 +5727,7 @@ test("a re-add candidate delivered before a late exact-null Leave result waits f
 		{ userId: "user_me", level: "manage" },
 		{ userId: "user_other", level: "member" },
 	]);
-	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "Connection lost after send" },
-	});
+	h.raw.scopes.remove_principal.mockRejectedValueOnce(new Error("Connection lost after send"));
 	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	h.send_scopes([{ ...private_scope([]), membershipRevision: 7 }]);
 	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
@@ -6316,7 +5756,7 @@ test("a re-add candidate delivered before a late exact-null Leave result waits f
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(4));
 	readdRead.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
 	await waitFor(() => expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy());
-	expect(h.raw.scopes.listPrincipals).toHaveBeenLastCalledWith({ scopeId: PRIVATE_KEY });
+	expect(h.raw.doors.watch_scope_principals).toHaveBeenLastCalledWith({ scopeId: PRIVATE_KEY });
 	expect(announcer_text(utils.container)).toContain("Left #secret-plans");
 });
 
@@ -6346,7 +5786,7 @@ test.each([
 		{ userId: "user_other", level: "member" },
 	]);
 	if (testCase.action === "Leave") {
-		h.raw.scopes.removePrincipal.mockImplementationOnce(() => exitResult.promise);
+		h.raw.scopes.remove_principal.mockImplementationOnce(() => exitResult.promise);
 	} else {
 		h.raw.scopes.delete.mockImplementationOnce(() => exitResult.promise);
 	}
@@ -6359,7 +5799,7 @@ test.each([
 	// Another principal's level changes at revision 11 before this member's departure commits at 12.
 	// That count-neutral revision is not proof that this member was added back.
 	h.send_scopes([{ ...private_scope([]), membershipRevision: 11 }]);
-	exitResult.resolve({ _nay: { name: "unavailable", message: "Connection lost after commit" } });
+	exitResult.reject(new Error("Connection lost after commit"));
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
 	reads[0]!.resolve({ document: null });
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
@@ -6375,9 +5815,9 @@ test.each([
 	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_other", level: "manage" }]);
 	h.send_scopes([{ ...private_scope([]), membershipRevision: 12 }]);
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(3));
-	h.raw.scopes.listPrincipals.mockResolvedValueOnce({ _yay: null });
+	h.raw.doors.watch_scope_principals.mockResolvedValueOnce(null);
 	reads[2]!.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
-	await waitFor(() => expect(h.raw.scopes.listPrincipals).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledTimes(2));
 	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
 
 	// A real re-add is restored only after both exact reads now include this member.
@@ -6391,10 +5831,7 @@ test.each([
 	await waitFor(() => expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy());
 });
 
-test.each([
-	{ kind: "returned unavailable", rejects: false },
-	{ kind: "rejected promise", rejects: true },
-])("an exact readable channel unlocks Leave after a $kind", async (testCase) => {
+test("an exact readable channel unlocks Leave after a rejected change", async () => {
 	const h = make_harness();
 	const exactRead = deferred<unknown>();
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
@@ -6410,13 +5847,7 @@ test.each([
 		{ userId: "user_me", level: "manage" },
 		{ userId: "user_other", level: "member" },
 	]);
-	if (testCase.rejects) {
-		h.raw.scopes.removePrincipal.mockRejectedValueOnce(new Error("Connection lost after send"));
-	} else {
-		h.raw.scopes.removePrincipal.mockResolvedValueOnce({
-			_nay: { name: "unavailable", message: "Connection lost after send" },
-		});
-	}
+	h.raw.scopes.remove_principal.mockRejectedValueOnce(new Error("Connection lost after send"));
 	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
 	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
@@ -6424,7 +5855,6 @@ test.each([
 	await within(dialog).findByRole("alert");
 
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
-	expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
 	expect(within(dialog).getByRole("button", { name: "Checking…" })).toBeTruthy();
 	h.send_scopes([
 		{
@@ -6469,9 +5899,7 @@ test("uncertain Delete exact-read failures back off to four seconds", async () =
 		{ userId: "user_me", level: "manage" },
 		{ userId: "user_other", level: "member" },
 	]);
-	h.raw.scopes.delete.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "Connection lost after send" },
-	});
+	h.raw.scopes.delete.mockRejectedValueOnce(new Error("Connection lost after send"));
 	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	fireEvent.click(await open_channel_menu_item("secret-plans", "Delete #secret-plans for everyone"));
 	const dialog = await screen.findByRole("dialog", { name: "Delete #secret-plans for everyone?" });
@@ -6526,9 +5954,7 @@ test("Cancel ignores a late uncertain Leave exact read", async () => {
 		{ userId: "user_me", level: "manage" },
 		{ userId: "user_other", level: "member" },
 	]);
-	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "Connection lost after send" },
-	});
+	h.raw.scopes.remove_principal.mockRejectedValueOnce(new Error("Connection lost after send"));
 	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
 	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
@@ -6548,110 +5974,23 @@ test("Cancel ignores a late uncertain Leave exact read", async () => {
 	expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
 });
 
-test("an unavailable scope-watch death after a confirmed Leave result restarts and settles", async () => {
+
+
+test("a refused scope list keeps the private channels it already showed", async () => {
 	const h = make_harness();
-	h.scopePrincipals.set(PRIVATE_KEY, [
-		{ userId: "user_me", level: "manage" },
-		{ userId: "user_other", level: "member" },
-	]);
-	h.raw.scopes.removePrincipal.mockResolvedValueOnce({
-		_yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 },
+	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
+	const nav = screen.getByRole("navigation", { name: "Channels" });
+	await waitFor(() => expect(within(nav).getByText("#secret-plans (private)")).toBeTruthy());
+
+	// Null is not a departure: the door answers it for a lapsed session too. The list stays as it
+	// was until the door answers again, and the read itself stays open for that answer.
+	h.send_scope_death();
+	await act(async () => {
+		await Promise.resolve();
 	});
-	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
-	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
-	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
-	fireEvent.click(await within(dialog).findByRole("button", { name: "Leave channel" }));
-	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Leaving…" })).toBeTruthy());
-	await waitFor(() => expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1));
-
-	vi.useFakeTimers();
-	try {
-		await act(async () => {
-			h.send_scope_death("unavailable");
-			await Promise.resolve();
-		});
-		await act(async () => {
-			await vi.advanceTimersByTimeAsync(249);
-		});
-		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
-		await act(async () => {
-			await vi.advanceTimersByTimeAsync(1);
-		});
-		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(2);
-
-		await act(async () => {
-			h.send_scopes([]);
-			await Promise.resolve();
-		});
-		await act(async () => {
-			await vi.advanceTimersByTimeAsync(20);
-		});
-		expect(screen.queryByRole("dialog")).toBeNull();
-		expect(screen.queryByText("#secret-plans (private)")).toBeNull();
-		expect(announcer_text(utils.container)).toContain("Left #secret-plans");
-	} finally {
-		vi.useRealTimers();
-	}
+	expect(within(nav).getByText("#secret-plans (private)")).toBeTruthy();
+	expect(h.find_scopes()).toBeTruthy();
 });
-
-test("scope-watch unavailable retries back off to four seconds and reset after a live delivery", async () => {
-	const h = make_harness();
-	await boot_sidebar(h, [channel_doc(CH1_KEY, "general")]);
-	expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
-
-	vi.useFakeTimers();
-	try {
-		let expectedCalls = 1;
-		for (const delayMs of [250, 500, 1000, 2000, 4000, 4000]) {
-			h.send_scope_death("unavailable");
-			await act(async () => {
-				await vi.advanceTimersByTimeAsync(delayMs - 1);
-			});
-			expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(expectedCalls);
-			await act(async () => {
-				await vi.advanceTimersByTimeAsync(1);
-			});
-			expectedCalls += 1;
-			expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(expectedCalls);
-		}
-
-		await act(async () => {
-			h.send_scopes([]);
-			await Promise.resolve();
-		});
-		h.send_scope_death("unavailable");
-		await act(async () => {
-			await vi.advanceTimersByTimeAsync(249);
-		});
-		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(expectedCalls);
-		await act(async () => {
-			await vi.advanceTimersByTimeAsync(1);
-		});
-		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(expectedCalls + 1);
-	} finally {
-		vi.useRealTimers();
-	}
-});
-
-test.each(["denied", "session_expired", "capacity", "invalid"])(
-	"scope-watch %s death does not restart inside the frame",
-	async (reason) => {
-		const h = make_harness();
-		await boot_sidebar(h, [channel_doc(CH1_KEY, "general")]);
-		expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
-
-		vi.useFakeTimers();
-		try {
-			h.send_scope_death(reason);
-			await act(async () => {
-				await vi.advanceTimersByTimeAsync(10_000);
-			});
-			expect(h.raw.scopes.watchMine).toHaveBeenCalledTimes(1);
-		} finally {
-			vi.useRealTimers();
-		}
-	},
-);
 
 test("a successful Leave announces the server's deleted result and repairs focus after the row leaves", async () => {
 	const h = make_harness();
@@ -6660,7 +5999,7 @@ test("a successful Leave announces the server's deleted result and repairs focus
 		{ userId: "user_other", level: "member" },
 	]);
 	const pendingLeave = deferred<ScopeChangeResult>();
-	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
 	const dialog = await screen.findByRole("dialog");
@@ -6685,7 +6024,7 @@ test("unrelated and older target scope updates keep a successful Leave pending",
 		{ userId: "user_other", level: "member" },
 	]);
 	const pendingLeave = deferred<ScopeChangeResult>();
-	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	fireEvent.click(await open_channel_menu_item("secret-plans", "Leave #secret-plans"));
 	const dialog = await screen.findByRole("dialog", { name: "Leave #secret-plans?" });
@@ -6753,7 +6092,7 @@ test("a coalesced newer scope revision wins over an older successful Leave", asy
 		{ userId: "user_other", level: "member" },
 	]);
 	const pendingLeave = deferred<ScopeChangeResult>();
-	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 	const utils = await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	const messageWindow = await waitFor(() => {
 		const found = h.find_window("messages", `${PRIVATE_KEY}:`);
@@ -6813,7 +6152,7 @@ test("a coalesced newer scope revision wins over an older successful Leave", asy
 		await act(async () => {
 			await vi.advanceTimersByTimeAsync(2_500);
 		});
-		const cursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+		const cursorWrites = (h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][])
 			.map(([opts]) => opts)
 			.filter((opts) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`);
 		expect(cursorWrites).toHaveLength(1);
@@ -6830,7 +6169,7 @@ test("a background channel re-add focuses that channel's action trigger", async 
 		{ userId: "user_other", level: "member" },
 	]);
 	const pendingLeave = deferred<ScopeChangeResult>();
-	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 	const utils = await boot_sidebar(
 		h,
 		[channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")],
@@ -6870,7 +6209,7 @@ test("a background channel re-add after a narrow resize focuses the open thread"
 		{ userId: "user_other", level: "member" },
 	]);
 	const pendingLeave = deferred<ScopeChangeResult>();
-	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 	set_viewport_narrow(false);
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	const root = message_doc(5_000, { channelKey: CH1_KEY, rand: "thread", text: "public thread root" });
@@ -6918,7 +6257,7 @@ test("a background channel re-add after a narrow resize falls back when the thre
 		{ userId: "user_other", level: "member" },
 	]);
 	const pendingLeave = deferred<ScopeChangeResult>();
-	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 	set_viewport_narrow(false);
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	await open_missing_general_thread_from_threads(h);
@@ -6992,7 +6331,7 @@ test("a background Leave resized to narrow focuses the open thread without a lat
 		{ userId: "user_other", level: "member" },
 	]);
 	const pendingLeave = deferred<ScopeChangeResult>();
-	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 	set_viewport_narrow(false);
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	const root = message_doc(5_000, { channelKey: CH1_KEY, rand: "thread", text: "public thread root" });
@@ -7031,7 +6370,7 @@ test("a background Leave resized to narrow falls back when the thread root is mi
 		{ userId: "user_other", level: "member" },
 	]);
 	const pendingLeave = deferred<ScopeChangeResult>();
-	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 	set_viewport_narrow(false);
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	await open_missing_general_thread_from_threads(h);
@@ -7104,7 +6443,7 @@ test.each([
 		);
 		const pendingChange = deferred<ScopeChangeResult>();
 		if (action === "Leave") {
-			h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingChange.promise);
+			h.raw.scopes.remove_principal.mockReturnValueOnce(pendingChange.promise);
 		} else {
 			h.raw.scopes.delete.mockReturnValueOnce(pendingChange.promise);
 		}
@@ -7142,7 +6481,7 @@ test.each([
 				await vi.advanceTimersByTimeAsync(5_000);
 			});
 			const privateCursorWrites = () =>
-				(h.raw.data.putOwned.mock.calls as [PutOpts][]).filter(
+				(h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][]).filter(
 					([opts]) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`,
 				);
 			expect(privateCursorWrites()).toHaveLength(0);
@@ -7170,12 +6509,9 @@ test.each([
 	},
 );
 
-test.each([
-	{ action: "Leave" as const, mode: "unavailable" as const },
-	{ action: "Leave" as const, mode: "throw" as const },
-	{ action: "Delete" as const, mode: "unavailable" as const },
-	{ action: "Delete" as const, mode: "throw" as const },
-])("an exact null after a watch-first $action and $mode settles safely", async ({ action, mode }) => {
+test.each([{ action: "Leave" as const }, { action: "Delete" as const }])(
+	"an exact null after a watch-first $action and a rejected change settles safely",
+	async ({ action }) => {
 	const h = make_harness();
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
@@ -7198,7 +6534,7 @@ test.each([
 	});
 	const pendingChange = deferred<ScopeChangeResult>();
 	if (action === "Leave") {
-		h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingChange.promise);
+		h.raw.scopes.remove_principal.mockReturnValueOnce(pendingChange.promise);
 	} else {
 		h.raw.scopes.delete.mockReturnValueOnce(pendingChange.promise);
 	}
@@ -7229,11 +6565,7 @@ test.each([
 			await Promise.resolve();
 		});
 
-		if (mode === "unavailable") {
-			pendingChange.resolve({ _nay: { name: "unavailable", message: "Try again" } });
-		} else {
-			pendingChange.reject(new Error("Network failed"));
-		}
+		pendingChange.reject(new Error("Network failed"));
 		await act(async () => {
 			await Promise.resolve();
 			await Promise.resolve();
@@ -7250,7 +6582,7 @@ test.each([
 		);
 		expect(announcement).not.toContain("Deleted #secret-plans");
 		expect(document.activeElement).toBe(screen.getByRole("navigation", { name: "Channels" }));
-		const privateCursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][]).filter(
+		const privateCursorWrites = (h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][]).filter(
 			([opts]) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`,
 		);
 		expect(privateCursorWrites).toHaveLength(0);
@@ -7272,7 +6604,7 @@ test("a late exit refusal after unmount does not restart a private cursor timer"
 		return found!;
 	});
 	const pendingLeave = deferred<ScopeChangeResult>();
-	h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+	h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 	const leaveItem = await open_channel_menu_item("secret-plans", "Leave #secret-plans");
 
 	vi.useFakeTimers();
@@ -7291,13 +6623,13 @@ test("a late exit refusal after unmount does not restart a private cursor timer"
 		fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Leave channel" }));
 		utils.unmount();
 
-		pendingLeave.resolve({ _nay: { name: "unavailable", message: "Try again" } });
+		pendingLeave.reject(new Error("Try again"));
 		await act(async () => {
 			await Promise.resolve();
 			await Promise.resolve();
 			await vi.advanceTimersByTimeAsync(5_000);
 		});
-		const privateCursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][]).filter(
+		const privateCursorWrites = (h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][]).filter(
 			([opts]) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`,
 		);
 		expect(privateCursorWrites).toHaveLength(0);
@@ -7331,7 +6663,7 @@ test("remote scope loss cancels a pending selected-channel mark-read", async () 
 		await act(async () => {
 			await vi.advanceTimersByTimeAsync(5_000);
 		});
-		const privateCursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][]).filter(
+		const privateCursorWrites = (h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][]).filter(
 			([opts]) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`,
 		);
 		expect(privateCursorWrites).toHaveLength(0);
@@ -7340,9 +6672,9 @@ test("remote scope loss cancels a pending selected-channel mark-read", async () 
 	}
 });
 
-test.each(["unavailable", "throw"] as const)(
-	"a %s resumes two channel timers without replacing either key",
-	async (mode) => {
+test(
+	"a rejected Leave resumes two channel timers without replacing either key",
+	async () => {
 		const h = make_harness();
 		const secondPrivateKey = "p/20000000-0000-4000-8000-000000000000";
 		h.raw.fetchJson.mockImplementation(async (path: string) => {
@@ -7395,7 +6727,7 @@ test.each(["unavailable", "throw"] as const)(
 			fireEvent.click(screen.getByRole("button", { name: "Actions for #secret-a" }));
 			const leaveItem = screen.getByRole("menuitem", { name: "Leave #secret-a" });
 			const pendingLeave = deferred<ScopeChangeResult>();
-			h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+			h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 			fireEvent.click(leaveItem);
 			await act(async () => {
 				await Promise.resolve();
@@ -7404,11 +6736,7 @@ test.each(["unavailable", "throw"] as const)(
 			const dialog = screen.getByRole("dialog");
 			fireEvent.click(within(dialog).getByRole("button", { name: "Leave channel" }));
 
-			if (mode === "unavailable") {
-				pendingLeave.resolve({ _nay: { name: "unavailable", message: "Try again" } });
-			} else {
-				pendingLeave.reject(new Error("Network failed"));
-			}
+			pendingLeave.reject(new Error("Network failed"));
 			await act(async () => {
 				await Promise.resolve();
 				await Promise.resolve();
@@ -7426,7 +6754,7 @@ test.each(["unavailable", "throw"] as const)(
 			dialog.focus();
 			fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
 			expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Leave channel" }));
-			const cursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+			const cursorWrites = (h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][])
 				.map(([opts]) => opts)
 				.filter((opts) => opts.collection === "channels" && opts.key.endsWith(":read"));
 			expect(Object.fromEntries(cursorWrites.map((opts) => [opts.key, opts.value]))).toEqual({
@@ -7439,9 +6767,9 @@ test.each(["unavailable", "throw"] as const)(
 	},
 );
 
-test.each(["unavailable", "throw"] as const)(
-	"a %s resumes only the guarded channel's newest buffered mark-read after StrictMode replays effects",
-	async (mode) => {
+test(
+	"a rejected Leave resumes only the guarded channel's newest buffered mark-read after StrictMode replays effects",
+	async () => {
 		const h = make_harness();
 		h.raw.fetchJson.mockImplementation(async (path: string) => {
 			if (path === "/api/v1/plugin-data/read") {
@@ -7464,7 +6792,7 @@ test.each(["unavailable", "throw"] as const)(
 		});
 		const leaveItem = await open_channel_menu_item("secret-plans", "Leave #secret-plans");
 		const pendingLeave = deferred<ScopeChangeResult>();
-		h.raw.scopes.removePrincipal.mockReturnValueOnce(pendingLeave.promise);
+		h.raw.scopes.remove_principal.mockReturnValueOnce(pendingLeave.promise);
 
 		vi.useFakeTimers();
 		try {
@@ -7489,11 +6817,7 @@ test.each(["unavailable", "throw"] as const)(
 				await Promise.resolve();
 			});
 
-			if (mode === "unavailable") {
-				pendingLeave.resolve({ _nay: { name: "unavailable", message: "Try again" } });
-			} else {
-				pendingLeave.reject(new Error("Network failed"));
-			}
+			pendingLeave.reject(new Error("Network failed"));
 			await act(async () => {
 				await Promise.resolve();
 				await Promise.resolve();
@@ -7510,7 +6834,7 @@ test.each(["unavailable", "throw"] as const)(
 			await act(async () => {
 				await vi.advanceTimersByTimeAsync(2_500);
 			});
-			const cursorWrites = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+			const cursorWrites = (h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][])
 				.map(([opts]) => opts)
 				.filter((opts) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`);
 			expect(cursorWrites).toHaveLength(1);
@@ -7530,20 +6854,10 @@ test("the public cursor watch ignores foreign prefix docs and non-owned exact do
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 	const randomRow = () => within(nav).getByRole("button", { name: /^#random/ });
-	// The cursors read is a direct call on the frame's Convex client with the typed door
-	// reference, so it spends no SDK subscription slot. The success and error callbacks are both
-	// given: a failed query clears the cursor map like a refused read does.
-	expect(h.raw.convex.onUpdate).toHaveBeenCalledWith(
-		h.raw.api.plugins_data.watch_documents,
-		{ collection: "cursors", keyPrefix: "me:user_me", limit: 1 },
-		expect.any(Function),
-		expect.any(Function),
-	);
-	expect(h.raw.data.watch).not.toHaveBeenCalledWith(
-		expect.objectContaining({ collection: "cursors" }),
-		expect.any(Function),
-	);
+	// The cursors read is one `watch_documents` query on this member's own prefix. A failed
+	// query clears the cursor map like a refused read does.
 	const cursors = h.find_watch("cursors", "me:user_me")!;
+	expect(cursors.opts).toEqual({ collection: "cursors", keyPrefix: "me:user_me", limit: 1 });
 
 	h.find_recent("messages")!.onUpdate(
 		watch_update([message_doc(2_000, { channelKey: CH2_KEY, createdBy: "user_other" })]),
@@ -7676,7 +6990,7 @@ test("opening a public channel uses the observed message time when the device cl
 
 		fireEvent.click(row());
 		const write = await waitFor(() => {
-			const found = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+			const found = (h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][])
 				.map(([opts]) => opts)
 				.find((opts) => opts.collection === "cursors");
 			expect(found).toBeTruthy();
@@ -7697,9 +7011,9 @@ test("unavailable public cursor writes retry the same revision and keep concurre
 	);
 	h.find_watch("cursors", "me:user_me")!.onUpdate(watch_update([cursor_doc({}, 3)]));
 	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
-	h.raw.data.putOwned
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+	h.raw.doors.user_put_owned_document
+		.mockRejectedValueOnce(new Error("Connection lost"))
+		.mockRejectedValueOnce(new Error("Connection lost"))
 		.mockResolvedValueOnce({ _yay: { key: "me:user_me", revision: 4 } });
 
 	vi.useFakeTimers();
@@ -7714,15 +7028,15 @@ test("unavailable public cursor writes retry the same revision and keep concurre
 			await Promise.resolve();
 			await Promise.resolve();
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
-		const first = h.raw.data.putOwned.mock.calls[0]![0] as PutOpts;
-		const second = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2);
+		const first = h.raw.doors.user_put_owned_document.mock.calls[0]![0] as PutOpts;
+		const second = h.raw.doors.user_put_owned_document.mock.calls[1]![0] as PutOpts;
 
 		await act(async () => {
 			await vi.advanceTimersByTimeAsync(250);
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
-		const retry = h.raw.data.putOwned.mock.calls[2]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(3);
+		const retry = h.raw.doors.user_put_owned_document.mock.calls[2]![0] as PutOpts;
 		const firstChannels = first.value.channels as Record<string, number>;
 		const secondChannels = second.value.channels as Record<string, number>;
 		expect(retry.expectedRevision).toBe(3);
@@ -7743,10 +7057,10 @@ test("a compacted unavailable cursor retry keeps a new channel's wanted maximum"
 	const channels = h.find_watch("channels")!;
 	const recent = h.find_recent("messages")!;
 	const staleCursors = Object.fromEntries(Array.from({ length: 300 }, (_, index) => [`stale-${index}`, index]));
-	h.raw.data.putOwned
+	h.raw.doors.user_put_owned_document
 		.mockResolvedValueOnce({ _nay: { name: "storage_full", message: "Cursor map is too large" } })
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
-		.mockResolvedValueOnce({ _nay: { name: "unavailable", message: "Connection lost" } })
+		.mockRejectedValueOnce(new Error("Connection lost"))
+		.mockRejectedValueOnce(new Error("Connection lost"))
 		.mockResolvedValueOnce({ _yay: { key: "me:user_me", revision: 4 } });
 	recent.onUpdate(watch_update([message_doc(200, { channelKey: CH2_KEY })]));
 	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 100, ...staleCursors }, 3)]));
@@ -7759,8 +7073,8 @@ test("a compacted unavailable cursor retry keeps a new channel's wanted maximum"
 			await Promise.resolve();
 			await Promise.resolve();
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
-		const firstWanted = h.raw.data.putOwned.mock.calls[0]![0].value.channels as Record<string, number>;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2);
+		const firstWanted = h.raw.doors.user_put_owned_document.mock.calls[0]![0].value.channels as Record<string, number>;
 
 		// The compacted call is waiting to retry. Add a channel now, then queue its mark into the
 		// same flight. The timer must read this render's channel keys, not the older callback's list.
@@ -7785,14 +7099,14 @@ test("a compacted unavailable cursor retry keeps a new channel's wanted maximum"
 			await Promise.resolve();
 			await Promise.resolve();
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
-		const projectWanted = h.raw.data.putOwned.mock.calls[2]![0].value.channels as Record<string, number>;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(3);
+		const projectWanted = h.raw.doors.user_put_owned_document.mock.calls[2]![0].value.channels as Record<string, number>;
 
 		await act(async () => {
 			await vi.advanceTimersByTimeAsync(250);
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(4);
-		const retryChannels = h.raw.data.putOwned.mock.calls[3]![0].value.channels as Record<string, number>;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(4);
+		const retryChannels = h.raw.doors.user_put_owned_document.mock.calls[3]![0].value.channels as Record<string, number>;
 		expect(retryChannels[CH2_KEY]).toBe(firstWanted[CH2_KEY]);
 		expect(retryChannels[CH3_KEY]).toBe(projectWanted[CH3_KEY]);
 		expect(Object.keys(retryChannels).some((key) => key.startsWith("stale-"))).toBe(false);
@@ -7808,7 +7122,7 @@ test("a definite public cursor refusal does not start a retry loop", async () =>
 	h.find_recent("messages")!.onUpdate(watch_update([message_doc(200, { channelKey: CH2_KEY })]));
 	h.find_watch("cursors", "me:user_me")!.onUpdate(watch_update([cursor_doc({}, 3)]));
 	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
-	h.raw.data.putOwned.mockResolvedValueOnce({ _nay: { name: "denied", message: "Write refused" } });
+	h.raw.doors.user_put_owned_document.mockResolvedValueOnce({ _nay: { name: "denied", message: "Write refused" } });
 
 	vi.useFakeTimers();
 	try {
@@ -7817,7 +7131,7 @@ test("a definite public cursor refusal does not start a retry loop", async () =>
 			await Promise.resolve();
 			await vi.advanceTimersByTimeAsync(10_000);
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(1);
 	} finally {
 		vi.useRealTimers();
 	}
@@ -7902,10 +7216,10 @@ test("a conflicted cursor write retries once and carries BOTH cursors — the wi
 	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
 
 	// Another tab of the same member wins the race: the first write answers a conflict.
-	h.raw.data.putOwned.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Revision mismatch" } });
+	h.raw.doors.user_put_owned_document.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Revision mismatch" } });
 	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
-	const first = h.raw.data.putOwned.mock.calls[0]![0] as PutOpts;
+	await waitFor(() => expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(1));
+	const first = h.raw.doors.user_put_owned_document.mock.calls[0]![0] as PutOpts;
 	expect(first.collection).toBe("cursors");
 	expect(first.expectedRevision).toBe(3);
 
@@ -7917,8 +7231,8 @@ test("a conflicted cursor write retries once and carries BOTH cursors — the wi
 	// map carries BOTH cursors — the winner's newer entry and the one this click wanted. A plain
 	// overwrite in either direction would move somebody's read state backwards.
 	const retry = await waitFor(() => {
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
-		return h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2);
+		return h.raw.doors.user_put_owned_document.mock.calls[1]![0] as PutOpts;
 	});
 	expect(retry.expectedRevision).toBe(7);
 	const retryChannels = retry.value.channels as Record<string, number>;
@@ -7932,7 +7246,7 @@ test("a newer cursor watch wins over an older successful write", async () => {
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 	const cursors = h.find_watch("cursors", "me:user_me")!;
 	const oldSuccess = deferred<WriteResult>();
-	h.raw.data.putOwned
+	h.raw.doors.user_put_owned_document
 		.mockReturnValueOnce(oldSuccess.promise)
 		.mockImplementationOnce(async (opts) =>
 			opts.expectedRevision === 7
@@ -7944,8 +7258,8 @@ test("a newer cursor watch wins over an older successful write", async () => {
 	cursors.onUpdate(watch_update([cursor_doc({ [CH3_KEY]: 500 }, 3)]));
 	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
 	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
-	const first = h.raw.data.putOwned.mock.calls[0]![0] as PutOpts;
+	await waitFor(() => expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(1));
+	const first = h.raw.doors.user_put_owned_document.mock.calls[0]![0] as PutOpts;
 	expect(first.expectedRevision).toBe(3);
 
 	// A different page advances the same map before this older success arrives. Keep the newer
@@ -7967,15 +7281,15 @@ test("a newer cursor watch wins over an older successful write", async () => {
 	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#general/ }).className).toContain("is-unread"));
 	fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
 	const next = await waitFor(() => {
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
-		return h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2);
+		return h.raw.doors.user_put_owned_document.mock.calls[1]![0] as PutOpts;
 	});
 	expect(next.expectedRevision).toBe(7);
 	const nextChannels = next.value.channels as Record<string, number>;
 	expect(nextChannels[CH3_KEY]).toBe(900);
 	expect(nextChannels[CH2_KEY]).toBe(firstChannels[CH2_KEY]);
 	expect(nextChannels[CH1_KEY]).toBeGreaterThanOrEqual(300);
-	expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+	expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2);
 });
 
 test("concurrent public cursor conflicts keep every pending channel at its newest cursor", async () => {
@@ -7985,7 +7299,7 @@ test("concurrent public cursor conflicts keep every pending channel at its newes
 	const cursors = h.find_watch("cursors", "me:user_me")!;
 	const firstConflict = deferred<WriteResult>();
 	const secondConflict = deferred<WriteResult>();
-	h.raw.data.putOwned.mockReturnValueOnce(firstConflict.promise).mockReturnValueOnce(secondConflict.promise);
+	h.raw.doors.user_put_owned_document.mockReturnValueOnce(firstConflict.promise).mockReturnValueOnce(secondConflict.promise);
 
 	// Both rows are unread. The stored #general cursor also makes the first wanted map overlap the
 	// second one, so the retry must keep both channel keys and the larger #general value.
@@ -8002,9 +7316,9 @@ test("concurrent public cursor conflicts keep every pending channel at its newes
 	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
 	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#general/ }).className).toContain("is-unread"));
 	fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2));
-	const first = h.raw.data.putOwned.mock.calls[0]![0] as PutOpts;
-	const second = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+	await waitFor(() => expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2));
+	const first = h.raw.doors.user_put_owned_document.mock.calls[0]![0] as PutOpts;
+	const second = h.raw.doors.user_put_owned_document.mock.calls[1]![0] as PutOpts;
 	expect(first.expectedRevision).toBe(3);
 	expect(second.expectedRevision).toBe(3);
 	const firstChannels = first.value.channels as Record<string, number>;
@@ -8018,14 +7332,14 @@ test("concurrent public cursor conflicts keep every pending channel at its newes
 		await Promise.resolve();
 		await Promise.resolve();
 	});
-	expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
+	expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2);
 
 	// One winner delivery releases one retry. Its map must include both pending writes, with the
 	// largest value for each channel, plus the winner's unrelated channel.
 	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 150, [CH3_KEY]: 900 }, 7)]));
 	const retry = await waitFor(() => {
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
-		return h.raw.data.putOwned.mock.calls[2]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(3);
+		return h.raw.doors.user_put_owned_document.mock.calls[2]![0] as PutOpts;
 	});
 	expect(retry.expectedRevision).toBe(7);
 	expect(retry.value.channels).toEqual({
@@ -8043,7 +7357,7 @@ test("watch-first public cursor conflicts keep all wants through another conflic
 	const firstConflict = deferred<WriteResult>();
 	const secondConflict = deferred<WriteResult>();
 	const retryConflict = deferred<WriteResult>();
-	h.raw.data.putOwned
+	h.raw.doors.user_put_owned_document
 		.mockReturnValueOnce(firstConflict.promise)
 		.mockReturnValueOnce(secondConflict.promise)
 		.mockReturnValueOnce(retryConflict.promise)
@@ -8060,9 +7374,9 @@ test("watch-first public cursor conflicts keep all wants through another conflic
 	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
 	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#general/ }).className).toContain("is-unread"));
 	fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2));
-	const first = h.raw.data.putOwned.mock.calls[0]![0] as PutOpts;
-	const second = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+	await waitFor(() => expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2));
+	const first = h.raw.doors.user_put_owned_document.mock.calls[0]![0] as PutOpts;
+	const second = h.raw.doors.user_put_owned_document.mock.calls[1]![0] as PutOpts;
 	const firstChannels = first.value.channels as Record<string, number>;
 	const secondChannels = second.value.channels as Record<string, number>;
 	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 150, [CH3_KEY]: 900 }, 7)]));
@@ -8073,8 +7387,8 @@ test("watch-first public cursor conflicts keep all wants through another conflic
 		await Promise.resolve();
 	});
 	const firstRetry = await waitFor(() => {
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
-		return h.raw.data.putOwned.mock.calls[2]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(3);
+		return h.raw.doors.user_put_owned_document.mock.calls[2]![0] as PutOpts;
 	});
 	expect(firstRetry.expectedRevision).toBe(7);
 	expect(firstRetry.value.channels).toEqual({
@@ -8092,8 +7406,8 @@ test("watch-first public cursor conflicts keep all wants through another conflic
 		await Promise.resolve();
 	});
 	const finalRetry = await waitFor(() => {
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(4);
-		return h.raw.data.putOwned.mock.calls[3]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(4);
+		return h.raw.doors.user_put_owned_document.mock.calls[3]![0] as PutOpts;
 	});
 	expect(finalRetry.expectedRevision).toBe(8);
 	expect(finalRetry.value.channels).toEqual({
@@ -8113,7 +7427,7 @@ test("a conflicted public cursor retry compacts after storage_full without losin
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 	const cursors = h.find_watch("cursors", "me:user_me")!;
 	const retryCapacity = deferred<WriteResult>();
-	h.raw.data.putOwned
+	h.raw.doors.user_put_owned_document
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Revision mismatch" } })
 		.mockReturnValueOnce(retryCapacity.promise)
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "Revision mismatch" } })
@@ -8129,16 +7443,16 @@ test("a conflicted public cursor retry compacts after storage_full without losin
 	// The first mark conflicts. Its winner is still near the value limit, so the queued retry is
 	// allowed to reach the server and fail with storage_full.
 	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1));
-	const firstWanted = h.raw.data.putOwned.mock.calls[0]![0].value.channels as Record<string, number>;
+	await waitFor(() => expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(1));
+	const firstWanted = h.raw.doors.user_put_owned_document.mock.calls[0]![0].value.channels as Record<string, number>;
 	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 150, [CH3_KEY]: 900, ...staleCursors }, 7)]));
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2));
 
 	// Queue another channel while that oversized retry is open. Cleanup must carry both wanted
 	// maxima, keep the winner's live channel, and remove only stale channel keys.
 	fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3));
-	const secondWanted = h.raw.data.putOwned.mock.calls[2]![0].value.channels as Record<string, number>;
+	await waitFor(() => expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(3));
+	const secondWanted = h.raw.doors.user_put_owned_document.mock.calls[2]![0].value.channels as Record<string, number>;
 	await act(async () => {
 		retryCapacity.resolve({ _nay: { name: "storage_full", message: "Cursor map is too large" } });
 		await Promise.resolve();
@@ -8146,8 +7460,8 @@ test("a conflicted public cursor retry compacts after storage_full without losin
 	});
 
 	const compactedRetry = await waitFor(() => {
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(4);
-		return h.raw.data.putOwned.mock.calls[3]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(4);
+		return h.raw.doors.user_put_owned_document.mock.calls[3]![0] as PutOpts;
 	});
 	expect(compactedRetry.expectedRevision).toBe(7);
 	expect(compactedRetry.value.channels).toEqual({
@@ -8165,7 +7479,7 @@ test("concurrent capacity cleanup keeps both channel marks after a conflict", as
 	const firstCapacity = deferred<WriteResult>();
 	const secondCapacity = deferred<WriteResult>();
 	const compactedConflict = deferred<WriteResult>();
-	h.raw.data.putOwned
+	h.raw.doors.user_put_owned_document
 		.mockReturnValueOnce(firstCapacity.promise)
 		.mockReturnValueOnce(secondCapacity.promise)
 		.mockReturnValueOnce(compactedConflict.promise)
@@ -8182,20 +7496,20 @@ test("concurrent capacity cleanup keeps both channel marks after a conflict", as
 	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
 	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#general/ }).className).toContain("is-unread"));
 	fireEvent.click(within(nav).getByRole("button", { name: /^#general/ }));
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2));
-	const firstWanted = h.raw.data.putOwned.mock.calls[0]![0].value.channels as Record<string, number>;
-	const secondWanted = h.raw.data.putOwned.mock.calls[1]![0].value.channels as Record<string, number>;
+	await waitFor(() => expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2));
+	const firstWanted = h.raw.doors.user_put_owned_document.mock.calls[0]![0].value.channels as Record<string, number>;
+	const secondWanted = h.raw.doors.user_put_owned_document.mock.calls[1]![0].value.channels as Record<string, number>;
 
 	// Both first writes hit the size ceiling. One single-flight cleanup holds both wanted maps.
 	firstCapacity.resolve({ _nay: { name: "storage_full", message: "Cursor map is too large" } });
-	await waitFor(() => expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3));
+	await waitFor(() => expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(3));
 	secondCapacity.resolve({ _nay: { name: "storage_full", message: "Cursor map is too large" } });
 	await act(async () => {
 		await Promise.resolve();
 		await Promise.resolve();
 	});
-	expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
-	const firstClean = h.raw.data.putOwned.mock.calls[2]![0] as PutOpts;
+	expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(3);
+	const firstClean = h.raw.doors.user_put_owned_document.mock.calls[2]![0] as PutOpts;
 	expect(firstClean.expectedRevision).toBe(3);
 	expect(firstClean.value.channels).toEqual({ [CH1_KEY]: firstWanted[CH1_KEY], [CH2_KEY]: firstWanted[CH2_KEY] });
 
@@ -8206,11 +7520,11 @@ test("concurrent capacity cleanup keeps both channel marks after a conflict", as
 		await Promise.resolve();
 		await Promise.resolve();
 	});
-	expect(h.raw.data.putOwned).toHaveBeenCalledTimes(3);
+	expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(3);
 	cursors.onUpdate(watch_update([cursor_doc({ [CH1_KEY]: 150 }, 4)]));
 	const finalRetry = await waitFor(() => {
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(4);
-		return h.raw.data.putOwned.mock.calls[3]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(4);
+		return h.raw.doors.user_put_owned_document.mock.calls[3]![0] as PutOpts;
 	});
 	expect(finalRetry.expectedRevision).toBe(4);
 	expect(finalRetry.value.channels).toEqual({
@@ -8241,13 +7555,13 @@ test("a private channel's cursor is written inside its scope range, and the publ
 	await waitFor(() => expect(within(nav).getByRole("button", { name: /^#random/ }).className).toContain("is-unread"));
 	fireEvent.click(within(nav).getByRole("button", { name: /^#random/ }));
 	await waitFor(() =>
-		expect((h.raw.data.putOwned.mock.calls as [PutOpts][]).some(([opts]) => opts.collection === "cursors")).toBe(true),
+		expect((h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][]).some(([opts]) => opts.collection === "cursors")).toBe(true),
 	);
 
 	// Now open the private channel.
 	fireEvent.click(privateRow());
 	const writes = await waitFor(() => {
-		const all = (h.raw.data.putOwned.mock.calls as [PutOpts][]).map(([opts]) => opts);
+		const all = (h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][]).map(([opts]) => opts);
 		expect(all.some((opts) => opts.collection === "channels")).toBe(true);
 		return all;
 	});
@@ -8272,7 +7586,7 @@ test("two private mark-reads use the returned revision and keep the newest times
 		return found!;
 	});
 	const firstWrite = deferred<WriteResult>();
-	h.raw.data.putOwned.mockReturnValueOnce(firstWrite.promise);
+	h.raw.doors.user_put_owned_document.mockReturnValueOnce(firstWrite.promise);
 
 	vi.useFakeTimers();
 	try {
@@ -8286,7 +7600,7 @@ test("two private mark-reads use the returned revision and keep the newest times
 		await act(async () => {
 			await vi.advanceTimersByTimeAsync(2_500);
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(1);
 
 		await act(async () => {
 			messageWindow.onUpdate(
@@ -8299,15 +7613,15 @@ test("two private mark-reads use the returned revision and keep the newest times
 			await vi.advanceTimersByTimeAsync(2_500);
 		});
 		// The second mark waits. It must not reuse revision 0 while the first write is open.
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(1);
 
 		await act(async () => {
 			firstWrite.resolve({ _yay: { key: `${PRIVATE_KEY}:read`, revision: 11 } });
 			await Promise.resolve();
 			await Promise.resolve();
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
-		const second = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2);
+		const second = h.raw.doors.user_put_owned_document.mock.calls[1]![0] as PutOpts;
 		expect(second.expectedRevision).toBe(11);
 		expect(second.value).toEqual({ at: 7_000, activity: { messages: 0, replies: 0 } });
 	} finally {
@@ -8315,9 +7629,9 @@ test("two private mark-reads use the returned revision and keep the newest times
 	}
 });
 
-test.each(["unavailable", "throw"] as const)(
-	"a private cursor %s retries without a watch and keeps the newest timestamp",
-	async (mode) => {
+test(
+	"a rejected private cursor write retries without a watch and keeps the newest timestamp",
+	async () => {
 		const h = make_harness();
 		await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 		const messageWindow = await waitFor(() => {
@@ -8326,7 +7640,7 @@ test.each(["unavailable", "throw"] as const)(
 			return found!;
 		});
 		const firstWrite = deferred<WriteResult>();
-		h.raw.data.putOwned
+		h.raw.doors.user_put_owned_document
 			.mockReturnValueOnce(firstWrite.promise)
 			.mockResolvedValueOnce({ _yay: { key: `${PRIVATE_KEY}:read`, revision: 1 } });
 
@@ -8344,20 +7658,16 @@ test.each(["unavailable", "throw"] as const)(
 					await vi.advanceTimersByTimeAsync(2_500);
 				});
 			}
-			expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+			expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(1);
 
 			await act(async () => {
-				if (mode === "unavailable") {
-					firstWrite.resolve({ _nay: { name: "unavailable", message: "Connection lost" } });
-				} else {
-					firstWrite.reject(new Error("Connection lost"));
-				}
+				firstWrite.reject(new Error("Connection lost"));
 				await Promise.resolve();
 				await Promise.resolve();
 				await vi.advanceTimersByTimeAsync(250);
 			});
-			expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
-			const retry = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+			expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2);
+			const retry = h.raw.doors.user_put_owned_document.mock.calls[1]![0] as PutOpts;
 			expect(retry.expectedRevision).toBe(0);
 			expect(retry.value).toEqual({ at: 7_000, activity: { messages: 0, replies: 0 } });
 		} finally {
@@ -8370,7 +7680,7 @@ test("a conflicted private mark-read merges both sequence components from the sc
 	const h = make_harness();
 	await boot_sidebar(h, [channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
 	const firstWrite = deferred<WriteResult>();
-	h.raw.data.putOwned.mockReturnValueOnce(firstWrite.promise);
+	h.raw.doors.user_put_owned_document.mockReturnValueOnce(firstWrite.promise);
 
 	vi.useFakeTimers();
 	try {
@@ -8387,14 +7697,14 @@ test("a conflicted private mark-read merges both sequence components from the sc
 		await act(async () => {
 			await vi.advanceTimersByTimeAsync(2_500);
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(1);
 
 		await act(async () => {
 			firstWrite.resolve({ _nay: { name: "conflict", message: "Document changed" } });
 			await Promise.resolve();
 			await Promise.resolve();
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(1);
 
 		await act(async () => {
 			h.find_watch("channels", PRIVATE_KEY)!.onUpdate(
@@ -8406,8 +7716,8 @@ test("a conflicted private mark-read merges both sequence components from the sc
 			await Promise.resolve();
 			await Promise.resolve();
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
-		const retry = h.raw.data.putOwned.mock.calls[1]![0] as PutOpts;
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2);
+		const retry = h.raw.doors.user_put_owned_document.mock.calls[1]![0] as PutOpts;
 		expect(retry.expectedRevision).toBe(11);
 		expect(retry.value).toEqual({ at: 7_000, activity: { messages: 5, replies: 3 } });
 	} finally {
@@ -8425,7 +7735,7 @@ test("a conflicted private mark-read refreshes after its ninth-scope watch close
 	// navigation returns the watch budget to the stable first eight.
 	const earlierKeys = Array.from({ length: 8 }, (_, index) => `p/00000000-0000-4000-8000-00000000000${index}`);
 	const firstWrite = deferred<WriteResult>();
-	h.raw.data.putOwned
+	h.raw.doors.user_put_owned_document
 		.mockReturnValueOnce(firstWrite.promise)
 		.mockResolvedValueOnce({ _yay: { key: `${PRIVATE_KEY}:read`, revision: 22 } });
 	let readAttempts = 0;
@@ -8467,7 +7777,7 @@ test("a conflicted private mark-read refreshes after its ninth-scope watch close
 			selectedWatch!.onUpdate(watch_update([channel_doc(PRIVATE_KEY, "secret-plans")]));
 			await vi.advanceTimersByTimeAsync(2_000);
 		});
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(1);
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(1);
 
 		await act(async () => {
 			fireEvent.click(within(nav).getByRole("button", { name: "#general" }));
@@ -8500,8 +7810,8 @@ test("a conflicted private mark-read refreshes after its ninth-scope watch close
 			await vi.advanceTimersByTimeAsync(1);
 		});
 
-		expect(h.raw.data.putOwned).toHaveBeenCalledTimes(2);
-		expect(h.raw.data.putOwned.mock.calls[1]![0]).toEqual({
+		expect(h.raw.doors.user_put_owned_document).toHaveBeenCalledTimes(2);
+		expect(h.raw.doors.user_put_owned_document.mock.calls[1]![0]).toEqual({
 			collection: "channels",
 			key: `${PRIVATE_KEY}:read`,
 			value: { at: 7_000, activity: { messages: 1, replies: 4 } },
@@ -8540,7 +7850,7 @@ test("a legacy private cursor upgrades by CAS and cannot hide durable sequence a
 	// durable sequence becomes covered.
 	fireEvent.click(privateRow());
 	const upgrade = await waitFor(() => {
-		const found = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+		const found = (h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][])
 			.map(([opts]) => opts)
 			.find((opts) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`);
 		expect(found).toBeTruthy();
@@ -8646,7 +7956,7 @@ test("terminal Unreads, Activity, and Threads feeds tell the member to reload", 
 	const h = make_harness();
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general")]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
-	h.find_recent("messages")!.onUpdate(null, { reason: "unavailable" } satisfies WatchDeathInfo);
+	h.find_recent("messages")!.onUpdate(null);
 
 	for (const name of ["Unreads", "Activity"] as const) {
 		fireEvent.click(within(nav).getByRole("button", { name }));
@@ -8660,7 +7970,7 @@ test("terminal Unreads, Activity, and Threads feeds tell the member to reload", 
 		expect(found).toBeTruthy();
 		return found!;
 	});
-	repliesFeed.onUpdate(null, { reason: "denied" } satisfies WatchDeathInfo);
+	repliesFeed.onUpdate(null);
 	const threads = await screen.findByRole("region", { name: "Threads" });
 	expect(within(threads).getByRole("alert").textContent).toMatch(/reload/iu);
 });
@@ -8697,10 +8007,10 @@ test("the composer's @-menu stores the member's id, and Enter picks before it se
 
 	// Typing "@" asks for the roster (lazily — nothing was fetched on mount) and opens the menu
 	// without this member in it.
-	expect(h.raw.members.list).not.toHaveBeenCalled();
+	expect(h.raw.doors.list_members).not.toHaveBeenCalled();
 	type_in_composer(textarea, "Hi @");
-	await waitFor(() => expect(h.raw.members.list).toHaveBeenCalledTimes(1));
-	expect(h.raw.members.list.mock.calls[0]![0]).toEqual({ limit: 100 });
+	await waitFor(() => expect(h.raw.doors.list_members).toHaveBeenCalledTimes(1));
+	expect(h.raw.doors.list_members.mock.calls[0]![0]).toEqual({ limit: 100 });
 	const options = await screen.findAllByRole("option");
 	expect(options.map((option) => option.textContent)).toEqual(["Bob", "Cleo"]);
 
@@ -8765,15 +8075,13 @@ test("moving the caret with an arrow key closes the @-menu, so Enter sends inste
 
 test("a roster refusal is not cached for later composers", async () => {
 	const h = make_harness();
-	h.raw.members.list.mockResolvedValueOnce({
-		_nay: { name: "unavailable", message: "The member list is unavailable right now" },
-	});
+	h.raw.doors.list_members.mockRejectedValueOnce(new Error("The member list is unavailable right now"));
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const textarea = composer_box("Message #general");
 
 	// The first "@" hits the transient refusal and shows the generic copy.
 	type_in_composer(textarea, "@");
-	await waitFor(() => expect(h.raw.members.list).toHaveBeenCalledTimes(1));
+	await waitFor(() => expect(h.raw.doors.list_members).toHaveBeenCalledTimes(1));
 	const menu = await screen.findByRole("listbox", { name: "Mention somebody" });
 	expect(within(menu).getByRole("status").textContent).toBe(chat_mention_roster_refusal_copy("unavailable"));
 
@@ -8782,33 +8090,27 @@ test("a roster refusal is not cached for later composers", async () => {
 	fireEvent.click(screen.getByRole("button", { name: "#random" }));
 	const reopened = composer_box("Message #random");
 	type_in_composer(reopened, "@");
-	await waitFor(() => expect(h.raw.members.list).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(h.raw.doors.list_members).toHaveBeenCalledTimes(2));
 	expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual(["Bob", "Cleo"]);
 });
 
 test("a later roster-page refusal shows no partial roster and retries from page one", async () => {
 	const h = make_harness();
-	h.raw.members.list
+	h.raw.doors.list_members
+		.mockResolvedValueOnce({ members: [{ userId: "user_a", displayName: "Ada" }], cursor: "page_2" })
+		.mockRejectedValueOnce(new Error("The member list is unavailable right now"))
 		.mockResolvedValueOnce({
-			_yay: { members: [{ userId: "user_a", displayName: "Ada" }], cursor: "page_2" },
-		})
-		.mockResolvedValueOnce({
-			_nay: { name: "unavailable", message: "The member list is unavailable right now" },
-		})
-		.mockResolvedValueOnce({
-			_yay: {
-				members: [
-					{ userId: "user_a", displayName: "Ada" },
-					{ userId: "user_b", displayName: "Bea" },
-				],
-				cursor: null,
-			},
+			members: [
+				{ userId: "user_a", displayName: "Ada" },
+				{ userId: "user_b", displayName: "Bea" },
+			],
+			cursor: null,
 		});
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const textarea = composer_box("Message #general");
 
 	type_in_composer(textarea, "@");
-	await waitFor(() => expect(h.raw.members.list).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(h.raw.doors.list_members).toHaveBeenCalledTimes(2));
 	const menu = await screen.findByRole("listbox", { name: "Mention somebody" });
 	await waitFor(() =>
 		expect(within(menu).getByRole("status").textContent).toBe(chat_mention_roster_refusal_copy("unavailable")),
@@ -8820,7 +8122,7 @@ test("a later roster-page refusal shows no partial roster and retries from page 
 	const reopened = composer_box("Message #random");
 	type_in_composer(reopened, "@");
 	expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual(["Ada", "Bea"]);
-	expect(h.raw.members.list.mock.calls.map((call) => call[0])).toEqual([
+	expect(h.raw.doors.list_members.mock.calls.map((call) => call[0])).toEqual([
 		{ limit: 100 },
 		{ limit: 100, cursor: "page_2" },
 		{ limit: 100 },
@@ -8829,14 +8131,12 @@ test("a later roster-page refusal shows no partial roster and retries from page 
 
 test("the @-menu shows a short explanation when the roster is not_consented, and the send carries no mentions", async () => {
 	const h = make_harness();
-	h.raw.members.list.mockResolvedValueOnce({
-		_nay: { name: "not_consented", message: "This workspace has not granted this plugin the member list" },
-	});
+	h.raw.doors.list_members.mockResolvedValueOnce({ refusal: "not_consented" });
 	await boot(h);
 	const textarea = composer_box("Message #general");
 
 	type_in_composer(textarea, "ping @B");
-	await waitFor(() => expect(h.raw.members.list).toHaveBeenCalledTimes(1));
+	await waitFor(() => expect(h.raw.doors.list_members).toHaveBeenCalledTimes(1));
 	const menu = await screen.findByRole("listbox", { name: "Mention somebody" });
 	expect(within(menu).queryAllByRole("option")).toHaveLength(0);
 	expect(within(menu).getByRole("status").textContent).toBe(chat_mention_roster_refusal_copy("not_consented"));
@@ -8854,14 +8154,12 @@ test("the @-menu shows a short explanation when the roster is not_consented, and
 
 test("a member with no display name is offered under the anonymous fallback, and send stores their id", async () => {
 	const h = make_harness();
-	h.raw.members.list.mockResolvedValueOnce({
-		_yay: {
-			members: [
-				{ userId: "user_me", displayName: "Me" },
-				{ userId: "user_anon", displayName: null },
-			],
-			cursor: null,
-		},
+	h.raw.doors.list_members.mockResolvedValueOnce({
+		members: [
+			{ userId: "user_me", displayName: "Me" },
+			{ userId: "user_anon", displayName: null },
+		],
+		cursor: null,
 	});
 	await boot(h);
 	const textarea = composer_box("Message #general");
@@ -8881,20 +8179,16 @@ test("a member with no display name is offered under the anonymous fallback, and
 
 test("the roster is paged once per session and not fetched again on later @ keystrokes", async () => {
 	const h = make_harness();
-	h.raw.members.list
-		.mockResolvedValueOnce({
-			_yay: { members: [{ userId: "user_a", displayName: "Ada" }], cursor: "page_2" },
-		})
-		.mockResolvedValueOnce({
-			_yay: { members: [{ userId: "user_b", displayName: "Bea" }], cursor: null },
-		});
+	h.raw.doors.list_members
+		.mockResolvedValueOnce({ members: [{ userId: "user_a", displayName: "Ada" }], cursor: "page_2" })
+		.mockResolvedValueOnce({ members: [{ userId: "user_b", displayName: "Bea" }], cursor: null });
 	await boot(h);
 	const textarea = composer_box("Message #general");
 
 	type_in_composer(textarea, "@");
 	const options = await screen.findAllByRole("option");
 	expect(options.map((option) => option.textContent)).toEqual(["Ada", "Bea"]);
-	expect(h.raw.members.list.mock.calls.map((call) => call[0])).toEqual([
+	expect(h.raw.doors.list_members.mock.calls.map((call) => call[0])).toEqual([
 		{ limit: 100 },
 		{ limit: 100, cursor: "page_2" },
 	]);
@@ -8902,7 +8196,7 @@ test("the roster is paged once per session and not fetched again on later @ keys
 	fireEvent.keyDown(textarea, { key: "Escape" });
 	type_in_composer(textarea, "later @");
 	await screen.findAllByRole("option");
-	expect(h.raw.members.list).toHaveBeenCalledTimes(2);
+	expect(h.raw.doors.list_members).toHaveBeenCalledTimes(2);
 });
 
 test("a mention renders as a span, and a mention of this member takes the amber emphasis", async () => {
@@ -8972,7 +8266,6 @@ test("durable private message activity updates unread without replacing its rang
 	await waitFor(() => expect(privateRow.className).toContain("is-unread"));
 	expect(h.find_watch("channels", PRIVATE_KEY)).toBe(privateWatch);
 	expect(h.watches).toHaveLength(watchCount);
-	expect(h.raw.data.put).not.toHaveBeenCalled();
 
 	fireEvent.click(within(nav).getByRole("button", { name: /^Unreads/ }));
 	const unreads = await screen.findByRole("region", { name: "Unreads" });
@@ -9046,7 +8339,6 @@ test("private message and reply sequences advance independently", async () => {
 		]),
 	]);
 	await waitFor(() => expect(privateRow().className).toContain("is-unread"));
-	expect(h.raw.data.put).not.toHaveBeenCalled();
 });
 
 test("same-time own then other private activity is not hidden after the cursor covers the own append", async () => {
@@ -9089,14 +8381,13 @@ test.each([
 
 			fireEvent.click(privateRow());
 			const cursorWrite = await waitFor(() => {
-				const found = (h.raw.data.putOwned.mock.calls as [PutOpts][])
+				const found = (h.raw.doors.user_put_owned_document.mock.calls as [PutOpts][])
 					.map(([opts]) => opts)
 					.find((opts) => opts.collection === "channels" && opts.key === `${PRIVATE_KEY}:read`);
 				expect(found).toBeTruthy();
 				return found!;
 			});
 			expect(cursorWrite.value).toEqual({ at: replyAt, activity: { messages: 0, replies: 1 } });
-			expect(h.raw.data.put).not.toHaveBeenCalled();
 		} finally {
 			now.mockRestore();
 		}
@@ -9129,8 +8420,6 @@ test("a private send with a lost response remains unread after the sender reload
 		expect(within(nav).getByRole("button", { name: /^#secret-plans/ }).className).toContain("is-unread"),
 	);
 	expect(request.input.clientRequestId).toMatch(/^[0-9a-f-]{36}$/);
-	expect(first.raw.data.put).not.toHaveBeenCalled();
-	expect(second.raw.data.put).not.toHaveBeenCalled();
 });
 
 test("activity from a removed sender remains unread for a member after reload", async () => {
@@ -9176,20 +8465,19 @@ test("an unavailable private send replays one request while navigation and Leave
 	expect((await within(dialog).findByRole("alert")).textContent).toBe(
 		"Wait for pending message changes to finish before leaving this channel or thread.",
 	);
-	expect(h.raw.scopes.removePrincipal).not.toHaveBeenCalled();
+	expect(h.raw.scopes.remove_principal).not.toHaveBeenCalled();
 
 	await waitFor(() => expect(invoke_calls(h, "message-send")).toHaveLength(2), { timeout: 2_500 });
 	expect(invoke_calls(h, "message-send")[1]!.input).toEqual(firstSend.input);
 	expect(unreads.hasAttribute("disabled")).toBe(true);
 	fireEvent.click(leave);
-	expect(h.raw.scopes.removePrincipal).not.toHaveBeenCalled();
+	expect(h.raw.scopes.remove_principal).not.toHaveBeenCalled();
 
 	await act(async () => {
 		replay.resolve(invoke_ok({ messageKey: `${PRIVATE_KEY}:${inv(50_000)}:sent` }));
 		await Promise.resolve();
 		await Promise.resolve();
 	});
-	expect(h.raw.data.put).not.toHaveBeenCalled();
 	expect(unreads.hasAttribute("disabled")).toBe(false);
 	expect(screen.queryByText("Sending…")).toBeNull();
 	expect(screen.getAllByText("uncertain private message")).toHaveLength(1);
@@ -9239,7 +8527,6 @@ test("an unavailable private reply replays one request and unlocks its thread af
 		await Promise.resolve();
 		await Promise.resolve();
 	});
-	expect(h.raw.data.put).not.toHaveBeenCalled();
 	expect(close.hasAttribute("disabled")).toBe(false);
 	expect(switchThread.hasAttribute("disabled")).toBe(false);
 	expect(within(panel).getAllByText("uncertain private reply")).toHaveLength(1);
@@ -9257,8 +8544,8 @@ test("Leave waits for a delayed send, then removes the member without a channel 
 		events.push("invoke");
 		return send.promise;
 	});
-	h.raw.scopes.removePrincipal.mockImplementationOnce(async () => {
-		events.push("scopes.removePrincipal");
+	h.raw.scopes.remove_principal.mockImplementationOnce(async () => {
+		events.push("scopes.remove_principal");
 		return { _yay: { scopeId: PRIVATE_KEY, deleted: false, membershipRevision: 2 } };
 	});
 	const { textarea } = await open_private_composer(h);
@@ -9273,7 +8560,7 @@ test("Leave waits for a delayed send, then removes the member without a channel 
 	expect((await within(dialog).findByRole("alert")).textContent).toBe(
 		"Wait for pending message changes to finish before leaving this channel or thread.",
 	);
-	expect(h.raw.scopes.removePrincipal).not.toHaveBeenCalled();
+	expect(h.raw.scopes.remove_principal).not.toHaveBeenCalled();
 
 	await act(async () => {
 		send.resolve(invoke_ok({ messageKey: `${PRIVATE_KEY}:${inv(50_000)}:sent` }));
@@ -9281,11 +8568,9 @@ test("Leave waits for a delayed send, then removes the member without a channel 
 		await Promise.resolve();
 	});
 	await waitFor(() => expect(screen.queryByText("Sending…")).toBeNull());
-	expect(h.raw.data.put).not.toHaveBeenCalled();
 
 	fireEvent.click(leave);
-	await waitFor(() => expect(h.raw.scopes.removePrincipal).toHaveBeenCalledTimes(1));
-	expect(events).toEqual(["invoke", "scopes.removePrincipal"]);
-	expect(h.raw.data.put).not.toHaveBeenCalled();
+	await waitFor(() => expect(h.raw.scopes.remove_principal).toHaveBeenCalledTimes(1));
+	expect(events).toEqual(["invoke", "scopes.remove_principal"]);
 });
 // #endregion unreads, views, mentions
