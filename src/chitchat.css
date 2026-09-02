@@ -3,19 +3,20 @@
 /*
  * The palette, in two blocks that must stay the same length.
  *
- * Ten of these read a host token first. The host resolves its own palette and sends finished colour
- * values over the theme channel, and `app.tsx` writes each one into a `--bonobo-*` property, so on
- * those ten roles Chitchat wears the app's own colours instead of guessing at them. The literal
- * after the comma is the fallback, and it is what an older host with no theme channel gets.
+ * Ten of these read an app colour scale first. The host sends its numbered scales over the theme
+ * channel under their real names, and the SDK writes each one onto the document element, so on those
+ * ten roles Chitchat wears the app's own colours instead of guessing at them — the same
+ * `var(--color-base-1-01)` the app uses. The literal after the comma is the fallback, and it is what
+ * a host that sends no theme gets.
  *
- * The other nineteen are Chitchat's own. The host sends fourteen roles and this page paints more
- * things than that, so the shades between them — the sunken sidebar, the log behind the messages,
- * the tinted primary button, the archived-channel amber — are chosen here. Every text-on-background
- * pair in the light block was measured before it was written; the lowest is 4.84:1 (subtle text on
- * the sidebar) and the rest are above 5:1, so all of them clear AA at normal weight.
+ * The other nineteen are Chitchat's own: the shades between the app's steps — the sunken sidebar,
+ * the log behind the messages, the tinted primary button, the archived-channel amber — are chosen
+ * here. Every text-on-background pair in the light block was measured before it was written; the
+ * lowest is 4.84:1 (subtle text on the sidebar) and the rest are above 5:1, so all of them clear AA
+ * at normal weight.
  *
- * `app.tsx` puts `theme-light` on the document element. Without it the dark block stands, which is
- * what the plugin shipped before the theme channel existed.
+ * The SDK puts the app's own `light` or `dark` class on the document element. Without `light` the
+ * dark block stands, which is what the plugin shipped before the theme channel existed.
  */
 :root {
 	/* Tells the browser which way to paint the parts this file cannot reach: scrollbars first, plus
@@ -25,25 +26,25 @@
 	   to, and a new palette block needs its own. */
 	color-scheme: dark;
 
-	--cc-surface: var(--bonobo-surface, #0b0b0e);
+	--cc-surface: var(--color-base-1-01, #0b0b0e);
 	--cc-surface-sunken: #0e0e12;
 	--cc-surface-log: #131318;
-	--cc-surface-raised: var(--bonobo-surface-raised, #16161a);
+	--cc-surface-raised: var(--color-base-1-03, #16161a);
 	--cc-surface-field: #121216;
 	--cc-surface-control: #1a1a1f;
-	--cc-surface-hover: var(--bonobo-surface-hover, #232329);
+	--cc-surface-hover: var(--color-base-1-06, #232329);
 
-	--cc-border: var(--bonobo-border, #1d1d22);
-	--cc-border-strong: var(--bonobo-border-strong, #2c2c33);
+	--cc-border: var(--color-base-1-08, #1d1d22);
+	--cc-border-strong: var(--color-base-1-11, #2c2c33);
 	--cc-border-hover: #3a3a42;
 
-	--cc-text: var(--bonobo-text, #ececef);
+	--cc-text: var(--color-fg-12, #ececef);
 	--cc-text-strong: #cfcfd6;
-	--cc-text-muted: var(--bonobo-text-muted, #9a9aa3);
-	--cc-text-subtle: var(--bonobo-text-subtle, #8b8b94);
+	--cc-text-muted: var(--color-fg-09, #9a9aa3);
+	--cc-text-subtle: var(--color-fg-07, #8b8b94);
 	--cc-text-thread-summary: #b1aca2;
 
-	--cc-accent: var(--bonobo-accent, #8ab4ff);
+	--cc-accent: var(--color-accent-05, #8ab4ff);
 	--cc-accent-surface: #24304a;
 	--cc-accent-surface-hover: #2b3a59;
 	/* The selected channel row only. It is a stronger blue than the tinted primary button, because
@@ -52,7 +53,7 @@
 	--cc-accent-border: #3a4c74;
 	--cc-accent-border-strong: #5b79b4;
 
-	--cc-danger-text: var(--bonobo-danger, #ff8f8f);
+	--cc-danger-text: var(--color-red-09, #ff8f8f);
 	--cc-danger-text-strong: #ff9f9f;
 	--cc-danger-border: #5a2c33;
 	--cc-warning-text: #c9a44a;
@@ -69,28 +70,28 @@
 	--cc-shadow-panel: rgba(0, 0, 0, 0.7);
 }
 
-:root.theme-light {
+:root.light {
 	color-scheme: light;
 
-	--cc-surface: var(--bonobo-surface, #ffffff);
+	--cc-surface: var(--color-base-1-01, #ffffff);
 	--cc-surface-sunken: #f5f5f7;
 	--cc-surface-log: #fafafb;
-	--cc-surface-raised: var(--bonobo-surface-raised, #ffffff);
+	--cc-surface-raised: var(--color-base-1-03, #ffffff);
 	--cc-surface-field: #ffffff;
 	--cc-surface-control: #f0f0f3;
-	--cc-surface-hover: var(--bonobo-surface-hover, #e8e8ec);
+	--cc-surface-hover: var(--color-base-1-06, #e8e8ec);
 
-	--cc-border: var(--bonobo-border, #e2e2e7);
-	--cc-border-strong: var(--bonobo-border-strong, #c9c9d1);
+	--cc-border: var(--color-base-1-08, #e2e2e7);
+	--cc-border-strong: var(--color-base-1-11, #c9c9d1);
 	--cc-border-hover: #b0b0ba;
 
-	--cc-text: var(--bonobo-text, #1b1b20);
+	--cc-text: var(--color-fg-12, #1b1b20);
 	--cc-text-strong: #0e0e12;
-	--cc-text-muted: var(--bonobo-text-muted, #5c5c66);
-	--cc-text-subtle: var(--bonobo-text-subtle, #6b6b75);
+	--cc-text-muted: var(--color-fg-09, #5c5c66);
+	--cc-text-subtle: var(--color-fg-07, #6b6b75);
 	--cc-text-thread-summary: #5e5a52;
 
-	--cc-accent: var(--bonobo-accent, #1f5bd0);
+	--cc-accent: var(--color-accent-05, #1f5bd0);
 	--cc-accent-surface: #dbe6fb;
 	--cc-accent-surface-hover: #c7d8f7;
 	/* Same job on light: clearly the chosen row, still dark text on it. Measured 8.6:1. */
@@ -98,7 +99,7 @@
 	--cc-accent-border: #a9c3f0;
 	--cc-accent-border-strong: #5b79b4;
 
-	--cc-danger-text: var(--bonobo-danger, #b3261e);
+	--cc-danger-text: var(--color-red-09, #b3261e);
 	--cc-danger-text-strong: #8c1d18;
 	--cc-danger-border: #f0b4b0;
 	--cc-warning-text: #7a5a10;

@@ -227,7 +227,6 @@ function make_harness() {
 	const recents: RecentSub[] = [];
 	const windows: WindowSub[] = [];
 	const changes: ChangesSub[] = [];
-	const themeListeners: ((theme: BonoboUiTheme) => void)[] = [];
 	const names: Record<string, string | null> = { user_me: "Me", user_other: "Bob", user_third: "Cleo" };
 	const scopeMembershipRevisions = new Map<string, number>();
 	const next_scope_membership_revision = (scopeId: string) => {
@@ -448,18 +447,9 @@ function make_harness() {
 			}),
 		},
 		theme: {
-			// Start with no theme, the shape an older host produces, so every test that says nothing
-			// about the theme exercises the fallback path.
+			// The SDK applies the host theme to the document itself; the page never reads it.
 			current: vi.fn<() => BonoboUiTheme | null>(() => null),
-			subscribe: vi.fn((onChange: (theme: BonoboUiTheme) => void) => {
-				themeListeners.push(onChange);
-				return () => {
-					const index = themeListeners.indexOf(onChange);
-					if (index >= 0) {
-						themeListeners.splice(index, 1);
-					}
-				};
-			}),
+			subscribe: vi.fn(() => () => {}),
 		},
 	};
 	// The key prefix is matched exactly, `undefined` included: the page now opens a second channels
@@ -488,12 +478,6 @@ function make_harness() {
 			(sub) => !sub.unsubscribed && sub.opts.collection === collection && sub.opts.scopeId === scopeId,
 		);
 		return matches[matches.length - 1];
-	};
-	/** Delivers a theme the way the host does after the member switches the app's theme. */
-	const send_theme = (theme: BonoboUiTheme) => {
-		for (const listener of [...themeListeners]) {
-			listener(theme);
-		}
 	};
 	/** Delivers the scope list the way the server does after somebody changes who is in a range. */
 	const send_scopes = (scopes: ScopeFixture[]) => {
@@ -532,7 +516,6 @@ function make_harness() {
 		find_recent,
 		find_window,
 		find_changes,
-		send_theme,
 		send_scopes,
 		send_scope_death,
 		calls,
@@ -4474,64 +4457,6 @@ test("the picker lists workspace files and a picked file rides the next send", a
 });
 
 // #endregion attachments
-
-// #region theme
-
-/** A whole theme, because the host always sends every role and the page writes all of them. */
-function theme_of(mode: "light" | "dark", overrides: Partial<Record<string, string>> = {}): BonoboUiTheme {
-	const base = {
-		surface: "#101014",
-		surfaceRaised: "#16161a",
-		surfaceOverlay: "#1b1b20",
-		surfaceHover: "#232329",
-		border: "#1d1d22",
-		borderStrong: "#2c2c33",
-		text: "#ececef",
-		textMuted: "#9a9aa3",
-		textSubtle: "#8b8b94",
-		accent: "#8ab4ff",
-		accentHover: "#a8c8ff",
-		selection: "#24304a",
-		success: "#8fd39a",
-		danger: "#ff8f8f",
-	};
-	return { mode, tokens: { ...base, ...overrides } } as BonoboUiTheme;
-}
-
-test("the host's theme paints the page, and a later switch follows it", async () => {
-	const h = make_harness();
-	render(<App client={h.client} />);
-
-	// An older host sends no theme. Nothing is stamped, and the stylesheet's own dark block stands.
-	expect(document.documentElement.classList.contains("theme-light")).toBe(false);
-	expect(document.documentElement.style.getPropertyValue("--bonobo-surface")).toBe("");
-
-	h.send_theme(theme_of("light", { surface: "#ffffff", text: "#1b1b20", surfaceRaised: "#fbfbfd" }));
-	await waitFor(() => expect(document.documentElement.classList.contains("theme-light")).toBe(true));
-	// The host resolved these values itself, so the page wears the app's colours rather than a guess.
-	expect(document.documentElement.style.getPropertyValue("--bonobo-surface")).toBe("#ffffff");
-	expect(document.documentElement.style.getPropertyValue("--bonobo-text")).toBe("#1b1b20");
-	// camelCase roles reach CSS in the spelling the stylesheet reads.
-	expect(document.documentElement.style.getPropertyValue("--bonobo-surface-raised")).toBe("#fbfbfd");
-
-	// Switching back has to take the class off again, or the light palette keeps painting a dark app.
-	h.send_theme(theme_of("dark", { surface: "#101014" }));
-	await waitFor(() => expect(document.documentElement.classList.contains("theme-light")).toBe(false));
-	expect(document.documentElement.style.getPropertyValue("--bonobo-surface")).toBe("#101014");
-});
-
-test("a theme the host already sent is applied at startup, without waiting for a switch", async () => {
-	const h = make_harness();
-	h.raw.theme.current.mockReturnValue(theme_of("light", { surface: "#ffffff" }));
-	render(<App client={h.client} />);
-
-	// The host sends the theme inside the init message, so a page that only subscribed would start
-	// dark and flip to light on the member's first unrelated theme change.
-	await waitFor(() => expect(document.documentElement.classList.contains("theme-light")).toBe(true));
-	expect(document.documentElement.style.getPropertyValue("--bonobo-surface")).toBe("#ffffff");
-});
-
-// #endregion theme
 
 // #region private channels
 

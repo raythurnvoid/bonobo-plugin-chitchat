@@ -452,7 +452,7 @@ describe("chitchat.css theme", () => {
 
 	test("the light block declares exactly the properties the dark block does", () => {
 		const dark = palette_names(rule_body(":root"));
-		const light = palette_names(rule_body(":root\\.theme-light"));
+		const light = palette_names(rule_body(":root\\.light"));
 
 		// A property the light block forgets falls back to its dark value, so one missed line puts a
 		// near-black surface or unreadable text inside an otherwise light page. Nothing renders in
@@ -467,7 +467,7 @@ describe("chitchat.css theme", () => {
 		// middle of the dark message list. The frame is its own document, so the host app's own
 		// declaration never reaches it.
 		expect(rule_body(":root")).toContain("color-scheme: dark");
-		expect(rule_body(":root\\.theme-light")).toContain("color-scheme: light");
+		expect(rule_body(":root\\.light")).toContain("color-scheme: light");
 	});
 
 	test("no rule outside the palette writes a colour of its own", () => {
@@ -477,25 +477,28 @@ describe("chitchat.css theme", () => {
 		expect(rules.match(/#[0-9a-fA-F]{3,8}|rgba?\(/gu)).toBeNull();
 	});
 
-	test("the ten roles the host resolves read the host first and fall back to a literal", () => {
-		// The host sends finished colour values, so on these roles Chitchat wears the app's own
-		// palette instead of guessing at it. The literal after the comma is what an older host with
-		// no theme channel gets, and it must be there or those roles paint nothing at all.
-		for (const block of [rule_body(":root"), rule_body(":root\\.theme-light")]) {
-			for (const [property, token] of [
-				["--cc-surface", "surface"],
-				["--cc-surface-raised", "surface-raised"],
-				["--cc-surface-hover", "surface-hover"],
-				["--cc-border", "border"],
-				["--cc-border-strong", "border-strong"],
-				["--cc-text", "text"],
-				["--cc-text-muted", "text-muted"],
-				["--cc-text-subtle", "text-subtle"],
-				["--cc-accent", "accent"],
-				["--cc-danger-text", "danger"],
+	test("the ten app-scale roles read the app's variable first and fall back to a literal", () => {
+		// The SDK writes the app's numbered scales onto the document under their real names, so on
+		// these roles Chitchat wears the app's own palette instead of guessing at it — the same
+		// `var(--color-base-1-01)` the app itself uses. The literal after the comma is what a host
+		// that sends no theme gets, and it must be there or those roles paint nothing at all.
+		for (const block of [rule_body(":root"), rule_body(":root\\.light")]) {
+			for (const [property, scale] of [
+				["--cc-surface", "--color-base-1-01"],
+				["--cc-surface-raised", "--color-base-1-03"],
+				["--cc-surface-hover", "--color-base-1-06"],
+				["--cc-border", "--color-base-1-08"],
+				["--cc-border-strong", "--color-base-1-11"],
+				["--cc-text", "--color-fg-12"],
+				["--cc-text-muted", "--color-fg-09"],
+				["--cc-text-subtle", "--color-fg-07"],
+				["--cc-accent", "--color-accent-05"],
+				["--cc-danger-text", "--color-red-09"],
 			] as const) {
-				expect([property, block.includes(`${property}: var(--bonobo-${token}, #`)]).toEqual([property, true]);
+				expect([property, block.includes(`${property}: var(${scale}, #`)]).toEqual([property, true]);
 			}
 		}
+		// Nothing in the file still reads the old host role names.
+		expect(css).not.toContain("--bonobo-");
 	});
 });

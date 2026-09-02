@@ -5,7 +5,6 @@ import type {
 	BonoboUiScopePrincipal,
 	BonoboUiScopePrincipalListResult,
 	BonoboUiScopeResult,
-	BonoboUiTheme,
 } from "bonobo-plugin-sdk/frontend";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
@@ -1102,11 +1101,6 @@ function channels_death_message(reason: string | undefined): string {
 	return "Chitchat stopped reading its data. Reload the page to try again.";
 }
 
-/** `surfaceRaised` becomes `--bonobo-surface-raised`, the spelling the stylesheet reads. */
-function theme_property_name(token: string) {
-	return `--bonobo-${token.replace(/[A-Z]/gu, (letter) => `-${letter.toLowerCase()}`)}`;
-}
-
 /**
  * How many private scopes this page watches. Worst-case slot spend with a channel open:
  * channels 1 + scope list 1 + N scope reads + cursors 1 + recent feed 1 + one messages window
@@ -2198,27 +2192,6 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 			}
 		}
 	}, [isNarrow, threadRootKey]);
-
-	// The host resolves its own palette and sends finished colour values, so this page never guesses
-	// at them. Write each role into its `--bonobo-*` property and put the mode on the document
-	// element, which is where `chitchat.css` reads both. The frame is a separate document and never
-	// sees the app's own theme class change, so the subscription is the only way to hear a switch.
-	// A host that sends no theme leaves the properties unset and the stylesheet's dark block standing.
-	useEffect(() => {
-		const apply_theme = (theme: BonoboUiTheme) => {
-			const root = document.documentElement;
-			root.classList.toggle("theme-light", theme.mode === "light");
-			for (const [token, value] of Object.entries(theme.tokens)) {
-				root.style.setProperty(theme_property_name(token), value);
-			}
-		};
-
-		const current = client.theme.current();
-		if (current !== null) {
-			apply_theme(current);
-		}
-		return client.theme.subscribe(apply_theme);
-	}, [client]);
 
 	// The public channels watch is the page's primary subscription: when the host kills it the
 	// member lost access, and the whole page switches to the permission-lost state.
