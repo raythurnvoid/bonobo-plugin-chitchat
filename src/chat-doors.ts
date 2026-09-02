@@ -1,4 +1,4 @@
-import type { BonoboUiFrontendClient } from "bonobo-plugin-sdk/frontend";
+import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
 import type { FunctionReturnType } from "convex/server";
 
 /**
@@ -7,7 +7,7 @@ import type { FunctionReturnType } from "convex/server";
  * mapping two callers share.
  */
 
-type Doors = BonoboUiFrontendClient["api"]["plugins_data"];
+type Doors = BonoboClient["api"]["plugins_data"];
 
 /** A workspace member as the pickers and the @-menu name them. */
 export type chat_Member = { userId: string; displayName: string | null };
@@ -30,7 +30,7 @@ export type chat_MemberListResult =
  * can fix would never be seen.
  */
 export function chat_list_members(
-	client: BonoboUiFrontendClient,
+	client: BonoboClient,
 	args: { limit: number; cursor?: string },
 ): Promise<chat_MemberListResult> {
 	return client.convex.query(client.api.plugins_data.list_members, args).then(

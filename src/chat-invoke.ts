@@ -1,4 +1,4 @@
-import type { BonoboUiFrontendClient } from "bonobo-plugin-sdk/frontend";
+import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
 import { chat_get_error_message, type chat_BackendEndpointId } from "./chat-data";
 
 /**
@@ -34,7 +34,7 @@ function wait(ms: number) {
 }
 
 export async function chat_invoke_backend(
-	client: BonoboUiFrontendClient,
+	client: BonoboClient,
 	endpoint: chat_BackendEndpointId,
 	input: unknown,
 ): Promise<chat_InvokeResult> {

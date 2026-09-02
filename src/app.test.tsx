@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { BonoboUiFrontendClient, BonoboUiTheme } from "bonobo-plugin-sdk/frontend";
+import type { BonoboClient, BonoboTheme } from "bonobo-plugin-sdk/frontend";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App, ChatErrorBoundary } from "./app";
@@ -683,7 +683,7 @@ function make_harness() {
 		scopes,
 		theme: {
 			// The SDK applies the host theme to the document itself; the page never reads it.
-			current: vi.fn<() => BonoboUiTheme | null>(() => null),
+			current: vi.fn<() => BonoboTheme | null>(() => null),
 			subscribe: vi.fn(() => () => {}),
 		},
 	};
@@ -739,7 +739,7 @@ function make_harness() {
 		sub.onUpdate(null);
 	};
 	return {
-		client: client as unknown as BonoboUiFrontendClient,
+		client: client as unknown as BonoboClient,
 		raw: client,
 		get watches() {
 			return subs_of("watch_documents") as unknown as WatchSub[];

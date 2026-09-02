@@ -1,4 +1,4 @@
-import type { BonoboUiFrontendClient } from "bonobo-plugin-sdk/frontend";
+import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
 import { usePaginatedQuery, useQuery } from "convex/react";
 import type { CSSProperties, ChangeEvent, KeyboardEvent, PointerEvent } from "react";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -89,7 +89,7 @@ type ActiveSend = {
  * key instead of writing the message twice.
  */
 function use_send_queue(opts: {
-	client: BonoboUiFrontendClient;
+	client: BonoboClient;
 	collection: "messages" | "replies";
 	keyPrefix: string;
 	userId: string;
@@ -310,7 +310,7 @@ type AttachmentResolution = { kind: "ready"; url: string } | { kind: "error"; me
  * URLs are never stored in the message doc: every resolve asks the server again, so it rechecks
  * this member's permission on each file.
  */
-function MessageAttachments(props: { client: BonoboUiFrontendClient; attachments: chat_Attachment[] }) {
+function MessageAttachments(props: { client: BonoboClient; attachments: chat_Attachment[] }) {
 	const [resolved, setResolved] = useState(new Map<string, AttachmentResolution>());
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
@@ -424,7 +424,7 @@ function MessageAttachments(props: { client: BonoboUiFrontendClient; attachments
 }
 
 function AttachmentPickerDialog(props: {
-	client: BonoboUiFrontendClient;
+	client: BonoboClient;
 	onPick: (attachment: chat_Attachment) => void;
 	onClose: () => void;
 }) {
@@ -536,7 +536,7 @@ function AttachmentPickerDialog(props: {
 // #region composer
 
 type Composer_Props = {
-	client: BonoboUiFrontendClient;
+	client: BonoboClient;
 	label: string;
 	busy: boolean;
 	/**
@@ -562,14 +562,14 @@ const MENTION_ROSTER_MAX_PAGES = 10;
 
 type MentionRoster = { status: "ready"; members: chat_Member[] } | { status: "refused"; name: string };
 
-const mention_roster_cache = new WeakMap<BonoboUiFrontendClient, MentionRoster>();
-const mention_roster_inflight = new WeakMap<BonoboUiFrontendClient, Promise<MentionRoster>>();
+const mention_roster_cache = new WeakMap<BonoboClient, MentionRoster>();
+const mention_roster_inflight = new WeakMap<BonoboClient, Promise<MentionRoster>>();
 
 /**
  * Loads the workspace roster once per client for the life of the page. The first "@" starts
  * it; later keystrokes and the thread composer reuse the same answer.
  */
-function load_mention_roster(client: BonoboUiFrontendClient): Promise<MentionRoster> {
+function load_mention_roster(client: BonoboClient): Promise<MentionRoster> {
 	const cached = mention_roster_cache.get(client);
 	if (cached !== undefined) {
 		return Promise.resolve(cached);
@@ -592,7 +592,7 @@ function load_mention_roster(client: BonoboUiFrontendClient): Promise<MentionRos
 	return pending;
 }
 
-async function fetch_mention_roster(client: BonoboUiFrontendClient): Promise<MentionRoster> {
+async function fetch_mention_roster(client: BonoboClient): Promise<MentionRoster> {
 	const members: chat_Member[] = [];
 	let cursor: string | undefined;
 	for (let page = 0; page < MENTION_ROSTER_MAX_PAGES; page += 1) {
@@ -1134,7 +1134,7 @@ function render_message_text(value: chat_MessageValue, memberNames: chat_MemberN
 }
 
 type MessageRow_Props = {
-	client: BonoboUiFrontendClient;
+	client: BonoboClient;
 	collection: "messages" | "replies";
 	doc: chat_Doc<chat_MessageValue>;
 	isOwn: boolean;
@@ -1724,7 +1724,7 @@ function PendingRow(props: { pending: PendingSend; onRetry: () => void }) {
  * view says what stopped updating instead of all of them sharing one vague sentence. A door answers
  * null for a lapsed session and for lost access alike; only the clock tells them apart.
  */
-function watch_death_message(client: BonoboUiFrontendClient, subject: string) {
+function watch_death_message(client: BonoboClient, subject: string) {
 	if (Date.now() >= client.session.expiresAt()) {
 		return `This Chitchat session expired, so ${subject} stopped updating. Reload the page to continue.`;
 	}
@@ -1734,7 +1734,7 @@ function watch_death_message(client: BonoboUiFrontendClient, subject: string) {
 }
 
 type ThreadPanel_Props = {
-	client: BonoboUiFrontendClient;
+	client: BonoboClient;
 	userId: string;
 	root: chat_Doc<chat_MessageValue>;
 	replies: chat_Doc<chat_MessageValue>[];
@@ -1929,7 +1929,7 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 // #region channel view
 
 type ChannelView_Props = {
-	client: BonoboUiFrontendClient;
+	client: BonoboClient;
 	userId: string;
 	channel: chat_Doc<chat_ChannelValue>;
 	memberNames: chat_MemberNamesApi;
@@ -2060,7 +2060,7 @@ function docs_in_prefix(docs: unknown[], prefix: string) {
 }
 
 function list_plugin_documents(
-	client: BonoboUiFrontendClient,
+	client: BonoboClient,
 	body: { collection: string; keyPrefix: string; keyStartExclusive?: string; limit: number },
 ) {
 	return client.fetchJson("/api/v1/plugin-data/list", { body }).then((raw: unknown) => {

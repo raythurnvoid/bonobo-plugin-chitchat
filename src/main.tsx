@@ -1,4 +1,4 @@
-import { bonobo_ui_connect } from "bonobo-plugin-sdk/frontend";
+import { bonobo_connect } from "bonobo-plugin-sdk/frontend";
 import { ConvexProvider } from "convex/react";
 import { createRoot } from "react-dom/client";
 import { App, ChatErrorBoundary } from "./app";
@@ -24,7 +24,7 @@ if (!container) {
 const root = createRoot(container);
 root.render(<BootScreen message="Connecting…" />);
 
-bonobo_ui_connect().then(
+bonobo_connect().then(
 	(client) => {
 		// The context is a union; Chitchat is only embedded as a page.
 		if (client.context.kind === "page") {

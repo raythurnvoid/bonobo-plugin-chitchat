@@ -1,4 +1,4 @@
-import type { BonoboUiFrontendClient, BonoboUserId } from "bonobo-plugin-sdk/frontend";
+import type { BonoboClient, BonoboUserId } from "bonobo-plugin-sdk/frontend";
 import { useQueries, useQuery } from "convex/react";
 import type { FunctionArgs, FunctionReturnType } from "convex/server";
 import {
@@ -53,7 +53,7 @@ import { ChannelView, type chat_MemberNamesApi } from "./channel-view";
 import { ChannelRowMenu } from "./channel-row-menu";
 import { Dialog } from "./dialog";
 
-type PluginDoors = BonoboUiFrontendClient["api"]["plugins_data"];
+type PluginDoors = BonoboClient["api"]["plugins_data"];
 
 /** One change to who can read a private range, as the `user_manage_scope` door takes it. */
 type ScopeAction = FunctionArgs<PluginDoors["user_manage_scope"]>["action"];
@@ -80,7 +80,7 @@ type DocumentsRead = FunctionReturnType<PluginDoors["watch_documents"]>;
  */
 const MEMBER_NAME_MAX_AGE_MS = 5 * 60 * 1000;
 
-function use_member_names(client: BonoboUiFrontendClient): chat_MemberNamesApi {
+function use_member_names(client: BonoboClient): chat_MemberNamesApi {
 	const namesRef = useRef(new Map<string, string | null>());
 	const resolvedAtRef = useRef(new Map<string, number>());
 	const inflightRef = useRef(new Map<string, Promise<void>>());
@@ -161,7 +161,7 @@ type Roster = { members: chat_Member[]; error: string | null; truncated: boolean
  * One page only. A picker is a small list a person reads, so paging further would grow the dialog
  * past what anybody scrolls; the dialog says so instead of pretending the list is complete.
  */
-function use_roster(client: BonoboUiFrontendClient): Roster | null {
+function use_roster(client: BonoboClient): Roster | null {
 	const [roster, setRoster] = useState<Roster | null>(null);
 
 	useEffect(() => {
@@ -196,7 +196,7 @@ function use_roster(client: BonoboUiFrontendClient): Roster | null {
  * checkbox that cannot be unticked is a control that does nothing.
  */
 function MemberPicker(props: {
-	client: BonoboUiFrontendClient;
+	client: BonoboClient;
 	selfUserId: string;
 	selected: string[];
 	disabled?: boolean;
@@ -259,7 +259,7 @@ function ChannelNameDialog(props: {
 	 * The privacy controls, or null when the dialog may not offer them. Renaming never may: the
 	 * channel's key decides whether it is private and a key never changes.
 	 */
-	privacy: { client: BonoboUiFrontendClient; selfUserId: string } | null;
+	privacy: { client: BonoboClient; selfUserId: string } | null;
 	busy: boolean;
 	waiting: boolean;
 	fieldsLocked: boolean;
@@ -404,7 +404,7 @@ function ChannelNameDialog(props: {
  * `manage` may have changed it since, and after a reload the page knows nothing at all.
  */
 function ChannelPeopleDialog(props: {
-	client: BonoboUiFrontendClient;
+	client: BonoboClient;
 	channel: chat_Doc<chat_ChannelValue>;
 	selfUserId: string;
 	memberNames: chat_MemberNamesApi;
@@ -660,7 +660,7 @@ function ArchiveChannelDialog(props: {
 }
 
 function ExitChannelDialog(props: {
-	client: BonoboUiFrontendClient;
+	client: BonoboClient;
 	channel: chat_Doc<chat_ChannelValue>;
 	action: "leave" | "delete";
 	busy: boolean;
@@ -991,7 +991,7 @@ function ActivityView(props: {
 }
 
 function ThreadsView(props: {
-	client: BonoboUiFrontendClient;
+	client: BonoboClient;
 	channels: chat_Doc<chat_ChannelValue>[];
 	memberNames: chat_MemberNamesApi;
 	onOpenThread: (channel: chat_Doc<chat_ChannelValue>, rootKey: string) => void;
@@ -1101,7 +1101,7 @@ function ThreadsView(props: {
  * interchangeable: a member whose plugin was uninstalled cannot fix anything by signing in again,
  * and a member whose session ran out only has to reload.
  */
-function channels_death_message(client: BonoboUiFrontendClient): string {
+function channels_death_message(client: BonoboClient): string {
 	if (Date.now() >= client.session.expiresAt()) {
 		return "This Chitchat session expired. Reload the page to continue.";
 	}
@@ -1117,7 +1117,7 @@ function channels_death_message(client: BonoboUiFrontendClient): string {
  * the read itself failed, and the member still has to reload: a plugin frame cannot mint a new
  * session by itself.
  */
-type ChatErrorBoundary_Props = { client: BonoboUiFrontendClient; children: ReactNode };
+type ChatErrorBoundary_Props = { client: BonoboClient; children: ReactNode };
 
 export class ChatErrorBoundary extends Component<ChatErrorBoundary_Props, { failed: boolean }> {
 	state = { failed: false };
@@ -1366,7 +1366,7 @@ function cancel_readd_reconciliation(reconciliation: PendingReaddReconciliation)
 	}
 }
 
-export function App(props: { client: BonoboUiFrontendClient }) {
+export function App(props: { client: BonoboClient }) {
 	const { client } = props;
 	const userId = client.context.userId;
 	const memberNames = use_member_names(client);
