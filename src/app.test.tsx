@@ -265,6 +265,18 @@ function make_harness() {
 			}
 			throw new Error("fetchJson not stubbed");
 		}),
+		// The cursors read is a direct call on the frame's Convex client with the typed door
+		// reference. It lands in the same watch list, so `find_watch("cursors", …)` answers for it.
+		api: { plugins_data: { watch_documents: { door: "watch_documents" } } },
+		convex: {
+			onUpdate: vi.fn((query: unknown, args: WatchSub["opts"], onUpdate: WatchSub["onUpdate"]) => {
+				const sub: WatchSub = { opts: args, onUpdate, unsubscribed: false };
+				watches.push(sub);
+				return () => {
+					sub.unsubscribed = true;
+				};
+			}),
+		},
 		data: {
 			watch: vi.fn((opts: WatchSub["opts"], onUpdate: WatchSub["onUpdate"]) => {
 				const sub: WatchSub = { opts, onUpdate, unsubscribed: false };
@@ -7514,6 +7526,19 @@ test("the public cursor watch ignores foreign prefix docs and non-owned exact do
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 	const randomRow = () => within(nav).getByRole("button", { name: /^#random/ });
+	// The cursors read is a direct call on the frame's Convex client with the typed door
+	// reference, so it spends no SDK subscription slot. The success and error callbacks are both
+	// given: a failed query clears the cursor map like a refused read does.
+	expect(h.raw.convex.onUpdate).toHaveBeenCalledWith(
+		h.raw.api.plugins_data.watch_documents,
+		{ collection: "cursors", keyPrefix: "me:user_me", limit: 1 },
+		expect.any(Function),
+		expect.any(Function),
+	);
+	expect(h.raw.data.watch).not.toHaveBeenCalledWith(
+		expect.objectContaining({ collection: "cursors" }),
+		expect.any(Function),
+	);
 	const cursors = h.find_watch("cursors", "me:user_me")!;
 
 	h.find_recent("messages")!.onUpdate(

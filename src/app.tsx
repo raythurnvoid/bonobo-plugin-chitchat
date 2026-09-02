@@ -2390,14 +2390,16 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 		};
 	}, [client, run_private_cursor_write, scopeWatchRecoveryGeneration, watchedScopes, userId]);
 
-	// The member's public read cursors, one map doc. This watch is also the conflict-retry read:
-	// the SDK has no one-shot read, so the winner of a lost compare-and-set arrives here and the
-	// retry effect below merges over it.
+	// The member's public read cursors, one map doc. This read runs on the frame's own Convex
+	// client with the typed door reference instead of `data.watch`, so it spends none of the
+	// SDK's 16 subscription slots. It is also the conflict-retry read: the SDK has no one-shot
+	// read, so the winner of a lost compare-and-set arrives here and the retry effect below
+	// merges over it.
 	useEffect(() => {
 		const storedKey = chat_cursor_stored_key(userId);
-		const unsubscribe = client.data.watch({ collection: "cursors", keyPrefix: storedKey, limit: 1 }, (update) => {
-			// A dead cursors watch does not take the page down: with no cursor map everything
-			// recent shows unread, which is the honest degraded answer.
+		const apply = (update: { docs: unknown[] } | null) => {
+			// A refused or failed cursors read does not take the page down: with no cursor map
+			// everything recent shows unread, which is the honest degraded answer.
 			if (update === null) {
 				setCursorDoc(null);
 				cursorDocRef.current = null;
@@ -2412,8 +2414,13 @@ export function App(props: { client: BonoboUiFrontendClient }) {
 					) ?? null;
 			setCursorDoc(doc);
 			cursorDocRef.current = doc;
-		});
-		return unsubscribe;
+		};
+		return client.convex.onUpdate(
+			client.api.plugins_data.watch_documents,
+			{ collection: "cursors", keyPrefix: storedKey, limit: 1 },
+			apply,
+			() => apply(null),
+		);
 	}, [client, userId]);
 
 	// The newest 100 public messages, one bounded descending read. This single feed answers

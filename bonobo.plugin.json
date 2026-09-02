@@ -2,7 +2,7 @@
 	"schemaVersion": 1,
 	"name": "chitchat",
 	"displayName": "Chitchat",
-	"version": "0.6.3",
+	"version": "0.6.4",
 	"description": "Team chat for the workspace: channels, one-level threads, reactions, workspace-file attachments, unread and mention badges, and Unreads, Threads, and Activity views. Messages live in the plugin's own document store, and a backend projects each channel into read-only Markdown transcript files.",
 	"compatibility": {
 		"bonoboPluginRuntime": "1"
@@ -61,8 +61,8 @@
 		},
 		{
 			"path": "dist/frontend/assets/index.js",
-			"sha256": "sha256:48acbb3c1b5adb9662d3e3c1b6f1434c6a574fb15aa3c1b84b9c3caa438195c0",
-			"bytes": 815065,
+			"sha256": "sha256:011618f4f427c1cf6a8c151326968a5982bd94ef3d3adf37ec924cb15310bbb4",
+			"bytes": 814948,
 			"contentType": "application/javascript"
 		},
 		{
