@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { BonoboEnv } from "bonobo-plugin-sdk";
+import type { BonoboHttpApi, BonoboHttpApiPath } from "bonobo-plugin-sdk/http-api";
 import {
 	chat_attachment_schema,
 	chat_BACKEND_ENDPOINTS,
@@ -129,7 +130,12 @@ function relay_refusal(answer: chatbe_HostAnswer) {
 
 // #region door calls
 
-async function door<T>(ctx: Ctx, path: string, body: unknown, schema: z.ZodType<T>): Promise<T | Response> {
+async function door<P extends BonoboHttpApiPath, T>(
+	ctx: Ctx,
+	path: P,
+	body: BonoboHttpApi[P]["POST"]["body"],
+	schema: z.ZodType<T>,
+): Promise<T | Response> {
 	const answer = await ctx.host.post(path, body);
 	if (answer.status !== 200) {
 		return relay_refusal(answer);

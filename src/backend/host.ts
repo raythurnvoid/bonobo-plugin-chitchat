@@ -1,4 +1,5 @@
 import type { BonoboEnv } from "bonobo-plugin-sdk";
+import type { BonoboHttpApi, BonoboHttpApiPath } from "bonobo-plugin-sdk/http-api";
 
 /**
  * One host API answer. Refusals are values, not exceptions: the door's status and body come back
@@ -10,8 +11,15 @@ export type chatbe_HostAnswer = {
 	body: unknown;
 };
 
+/**
+ * The route and its body are typed from the app's own table. A path the host does not serve is a
+ * compile error, and so is a body field the route does not accept.
+ *
+ * The answer stays `unknown`. It comes from outside this worker, so every caller runs it through a
+ * zod schema.
+ */
 export type chatbe_Host = {
-	post(path: string, body: unknown): Promise<chatbe_HostAnswer>;
+	post<P extends BonoboHttpApiPath>(path: P, body: BonoboHttpApi[P]["POST"]["body"]): Promise<chatbe_HostAnswer>;
 };
 
 export function chatbe_create_host(env: BonoboEnv): chatbe_Host {

@@ -1,3 +1,4 @@
+import type { BonoboHttpApi, BonoboHttpApiPath } from "bonobo-plugin-sdk/http-api";
 import type { GenericId } from "convex/values";
 import { z } from "zod";
 
@@ -423,9 +424,9 @@ export const chat_private_cursor_value_schema = z.union([
 // #region document validation
 
 /**
- * The BonoboPublicDoc envelope every read surface returns (plain watch and window
+ * The stored-document envelope every read surface returns (plain watch and window
  * updates alike). The store is a generic multi-writer surface, so every doc is runtime
- * validated before the page uses it; a doc that fails is dropped and counted.
+ * validated before the page uses it. A doc that fails is dropped and counted.
  */
 const public_doc_schema = z.object({
 	collection: z.string(),
@@ -742,6 +743,66 @@ export const chat_download_urls_response_schema = z.object({
 	errors: z.array(z.object({ fileNodeId: z.string(), message: z.string() })),
 	truncated: z.boolean(),
 });
+
+/*
+The app generates its own route table into `bonobo-plugin-sdk/http-api`, so the four parsers above
+can be checked against it while the plugin compiles. Each check asks whether what the route answers
+is still assignable to what the parser accepts, and names the route when it is not.
+
+What it catches: a route that renames or drops a field a parser reads, makes one optional, widens a
+type past what the parser allows, or disappears from the table.
+
+What it does not catch, so do not read more into a green run:
+
+- Narrowing. `string | null` becoming `string` stays assignable, so it passes. The check is
+  assignability, and assignability only runs one way.
+- Anything zod decides at runtime. `.min()`, `.refine()`, and `z.strictObject` are invisible here. A
+  parser can pass this check and still reject every real answer.
+- The document `value` field. The app declares it as an index signature of `any`, and `any` is
+  assignable to and from everything.
+- A route body that collapses to `never`, because `never` is assignable to anything. That is a
+  generator bug, not app drift, and the SDK's own test pins it at the source.
+
+`z.input`, not `z.infer`. `z.infer` is what a parser produces, and the question here is what it
+accepts. The two differ the moment a schema grows a `.transform()`, which this file already uses
+elsewhere.
+
+The check is deliberately not `satisfies z.ZodType<AppBody>`. That asks the opposite question and
+would demand every parser name every field the route sends. These parsers skip fields on purpose:
+the file list parser ignores `status` and `size`. Passing it would mean widening a parser that is
+already right.
+
+The `//` after each `=` keeps the checked type on the next line, so a failure points at the check
+and not at the whole alias.
+*/
+
+type Expect<Condition extends true> = Condition;
+
+type AppResponseBody<P extends BonoboHttpApiPath> = BonoboHttpApi[P]["POST"]["response"][200]["body"];
+
+type _PluginDataReadParses = //
+	Expect<
+		AppResponseBody<"/api/v1/plugin-data/read"> extends z.input<typeof chat_plugin_data_read_response_schema>
+			? true
+			: false
+	>;
+
+type _PluginDataListParses = //
+	Expect<
+		AppResponseBody<"/api/v1/plugin-data/list"> extends z.input<typeof chat_plugin_data_list_response_schema>
+			? true
+			: false
+	>;
+
+type _FilesListParses = //
+	Expect<AppResponseBody<"/api/v1/files/list"> extends z.input<typeof chat_files_list_response_schema> ? true : false>;
+
+type _DownloadUrlsParses = //
+	Expect<
+		AppResponseBody<"/api/v1/files/download-urls"> extends z.input<typeof chat_download_urls_response_schema>
+			? true
+			: false
+	>;
 
 // #endregion HTTP response schemas
 

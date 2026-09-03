@@ -4770,9 +4770,9 @@ union([
 	})),
 ]);
 /**
- * The BonoboPublicDoc envelope every read surface returns (plain watch and window
+ * The stored-document envelope every read surface returns (plain watch and window
  * updates alike). The store is a generic multi-writer surface, so every doc is runtime
- * validated before the page uses it; a doc that fails is dropped and counted.
+ * validated before the page uses it. A doc that fails is dropped and counted.
  */
 var public_doc_schema = object({
 	collection: string(),
