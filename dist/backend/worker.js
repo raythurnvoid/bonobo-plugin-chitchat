@@ -3050,6 +3050,17 @@ function _array(Class, element, params) {
 	});
 }
 // @__NO_SIDE_EFFECTS__
+function _custom(Class, fn, _params) {
+	const norm = normalizeParams(_params);
+	norm.abort ?? (norm.abort = true);
+	return new Class({
+		type: "custom",
+		check: "custom",
+		fn,
+		...norm,
+	});
+}
+// @__NO_SIDE_EFFECTS__
 function _refine(Class, fn, _params) {
 	return new Class({
 		type: "custom",
@@ -4577,6 +4588,9 @@ var ZodCustom = /*@__PURE__*/ $constructor("ZodCustom", (inst, def) => {
 	ZodType.init(inst, def);
 	inst._zod.processJSONSchema = (ctx, json, params) => customProcessor(inst, ctx, json, params);
 });
+function custom(fn, _params) {
+	return /* @__PURE__ */ _custom(ZodCustom, fn ?? (() => true), _params);
+}
 function refine(fn, _params = {}) {
 	return /* @__PURE__ */ _refine(ZodCustom, fn, _params);
 }
@@ -4674,6 +4688,12 @@ var chat_attachment_schema = object({
 	fileNodeId: string().min(1),
 	name: string().min(1),
 });
+/**
+ * A `users` table id inside a stored document, as the doors type it. The store hands ids back as
+ * plain JSON strings, so the parse brands them here once, and a parsed id then reaches a door
+ * with no cast at the call site.
+ */
+var chat_user_id_schema = custom((value) => typeof value === "string");
 var chat_message_value_schema = object({
 	text: string(),
 	attachments: array(chat_attachment_schema),
@@ -4684,7 +4704,7 @@ var chat_message_value_schema = object({
 	 * in the text at send time are stored. Optional: messages written before mentions existed
 	 * carry none, and a required field would drop them all at validation.
 	 */
-	mentions: array(string()).optional(),
+	mentions: array(chat_user_id_schema).optional(),
 });
 /**
  * The backend invoke endpoints, shared between the manifest, the worker router, and the page's
@@ -4759,8 +4779,8 @@ var public_doc_schema = object({
 	key: string().min(1).max(128),
 	value: record(string(), unknown()),
 	revision: number(),
-	createdBy: string().min(1),
-	updatedBy: string(),
+	createdBy: chat_user_id_schema.refine((id) => id.length > 0),
+	updatedBy: chat_user_id_schema,
 	ownership: union([literal("shared"), literal("owned")]),
 	createdAt: number(),
 	updatedAt: number(),
@@ -5641,7 +5661,7 @@ var send_input_schema = object({
 	channelKey: string().min(1).max(128),
 	text: string().min(1),
 	attachments: array(chat_attachment_schema).max(20).default([]),
-	mentions: array(string()).max(50).default([]),
+	mentions: array(chat_user_id_schema).max(50).default([]),
 	/** The sender's own display name, snapshotted onto the message for transcript rendering. */
 	authorName: string().nullable().default(null),
 	clientRequestId: string().min(1).max(64),
@@ -5708,7 +5728,7 @@ var reply_input_schema = object({
 	rootMessageKey: string().min(1).max(200),
 	text: string().min(1),
 	attachments: array(chat_attachment_schema).max(20).default([]),
-	mentions: array(string()).max(50).default([]),
+	mentions: array(chat_user_id_schema).max(50).default([]),
 	authorName: string().nullable().default(null),
 	clientRequestId: string().min(1).max(64),
 });
@@ -5785,7 +5805,7 @@ async function handle_reply_send(ctx, input) {
 var edit_input_schema = object({
 	messageKey: string().min(1).max(200),
 	text: string().min(1),
-	mentions: array(string()).max(50).default([]),
+	mentions: array(chat_user_id_schema).max(50).default([]),
 });
 var delete_input_schema = object({ messageKey: string().min(1).max(200) });
 async function load_own_message(ctx, messageKey) {

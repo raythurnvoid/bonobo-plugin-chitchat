@@ -295,6 +295,16 @@ describe("document validation", () => {
 		expect(chat_validate_message_doc(null)).toBeNull();
 	});
 
+	test("keeps the user ids the store stamps, and drops an empty creator or a non-string mention", () => {
+		const value = { text: "hi", attachments: [], editedAt: null, deletedAt: null };
+		const withMention = chat_validate_message_doc(doc_envelope({ value: { ...value, mentions: ["user_b"] } }));
+		expect(withMention?.createdBy).toBe("user_a");
+		expect(withMention?.value.mentions).toEqual(["user_b"]);
+		expect(chat_validate_message_doc(doc_envelope({}))?.value.mentions).toBeUndefined();
+		expect(chat_validate_message_doc(doc_envelope({ createdBy: "" }))).toBeNull();
+		expect(chat_validate_message_doc(doc_envelope({ value: { ...value, mentions: [1] } }))).toBeNull();
+	});
+
 	test("validates channel docs", () => {
 		const raw = doc_envelope({
 			collection: "channels",

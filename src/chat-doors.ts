@@ -1,5 +1,6 @@
 import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
 import type { FunctionReturnType } from "convex/server";
+import type { GenericId } from "convex/values";
 
 /**
  * The plugin doors the page calls on the frame's own Convex client, plus the small shapes the
@@ -10,13 +11,13 @@ import type { FunctionReturnType } from "convex/server";
 type Doors = BonoboClient["api"]["plugins_data"];
 
 /** A workspace member as the pickers and the @-menu name them. */
-export type chat_Member = { userId: string; displayName: string | null };
+export type chat_Member = { userId: GenericId<"users">; displayName: string | null };
 
 /** One private range this member is in, as the `watch_my_scopes` door delivers it. */
 export type chat_Scope = NonNullable<FunctionReturnType<Doors["watch_my_scopes"]>>[number];
 
 /** One grant on a private range, as the `watch_scope_principals` door delivers it. */
-export type chat_ScopePrincipal = { userId: string; level: "member" | "manage" };
+export type chat_ScopePrincipal = { userId: GenericId<"users">; level: "member" | "manage" };
 
 export type chat_MemberListResult =
 	| { _yay: { members: chat_Member[]; cursor: string | null } }

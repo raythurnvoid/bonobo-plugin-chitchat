@@ -8,7 +8,6 @@ import {
 	chat_mention_roster_refusal_copy,
 	chat_PRIVATE_CHANNEL_COLLECTIONS,
 } from "./chat-data";
-import type { chat_Member, chat_ScopePrincipal } from "./chat-doors";
 
 /**
  * The fake behind `convex/react`. The real hooks need a `ConvexReactClient` with a WebSocket and
@@ -404,7 +403,10 @@ function invoke_nay(name: string, message: string, retryAfterMs?: number): Invok
 	return { _nay: { name, message, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) } };
 }
 /** What `list_members` answers: a page, the consent refusal, or null for lost access. */
-type MembersListAnswer = { members: chat_Member[]; cursor: string | null } | { refusal: "not_consented" } | null;
+/** The fakes answer raw server JSON, where a user id is a plain string, not the page's branded id. */
+type FakeMember = { userId: string; displayName: string | null };
+
+type MembersListAnswer = { members: FakeMember[]; cursor: string | null } | { refusal: "not_consented" } | null;
 type ScopeChangeResult =
 	| { _yay: { scopeId: string; deleted: boolean; membershipRevision: number } }
 	| { _nay: { name?: string; message: string } };
@@ -464,7 +466,7 @@ function make_harness() {
 	 */
 	const calls: { op: string; args: Record<string, unknown> }[] = [];
 	/** What `watch_scope_principals` answers per scope. A missing entry answers null, as the server does. */
-	const scopePrincipals = new Map<string, chat_ScopePrincipal[]>();
+	const scopePrincipals = new Map<string, ScopePrincipalInput[]>();
 	/**
 	 * The `user_manage_scope` answers, one function per action kind so a test can queue one
 	 * kind's refusal without touching the others. The door below dispatches on `action.kind`.
@@ -560,7 +562,7 @@ function make_harness() {
 			members: Object.entries(names).map(([userId, displayName]) => ({ userId, displayName })),
 			cursor: null,
 		})),
-		watch_scope_principals: vi.fn<(args: { scopeId: string }) => Promise<chat_ScopePrincipal[] | null>>(
+		watch_scope_principals: vi.fn<(args: { scopeId: string }) => Promise<ScopePrincipalInput[] | null>>(
 			async (args) => scopePrincipals.get(args.scopeId) ?? null,
 		),
 		user_put_owned_document: vi.fn<(opts: PutOpts) => Promise<WriteResult>>(async () => ({
@@ -4819,7 +4821,7 @@ test("a private exact retry conflict accepts a renamed exact read only after cur
 	const h = make_harness();
 	const pendingCreate = deferred<ScopeChangeResult>();
 	const exactRead = deferred<unknown>();
-	const exactPrincipals = deferred<chat_ScopePrincipal[] | null>();
+	const exactPrincipals = deferred<ScopePrincipalInput[] | null>();
 	h.raw.scopes.create_with_document
 		.mockReturnValueOnce(pendingCreate.promise)
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
@@ -5092,7 +5094,7 @@ test("private create unavailable and malformed principal reads retry until an ex
 	});
 	h.raw.doors.watch_scope_principals
 		.mockRejectedValueOnce(new Error("Connection lost"))
-		.mockResolvedValueOnce("not a principal list" as unknown as chat_ScopePrincipal[])
+		.mockResolvedValueOnce("not a principal list" as unknown as ScopePrincipalInput[])
 		.mockResolvedValueOnce([{ userId: "user_me", level: "manage" }]);
 	await boot(h);
 
@@ -5246,7 +5248,7 @@ test("an unavailable add reloads and shows a committed member before ending the 
 	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
 	const dialog = await screen.findByRole("dialog");
 	const bob = await within(dialog).findByLabelText("Bob");
-	const reload = deferred<chat_ScopePrincipal[] | null>();
+	const reload = deferred<ScopePrincipalInput[] | null>();
 	h.raw.scopes.set_principal.mockRejectedValueOnce(new Error("Connection lost after send"));
 	h.raw.doors.watch_scope_principals.mockReturnValueOnce(reload.promise);
 
@@ -5278,7 +5280,7 @@ test("an unavailable remove reloads and hides a committed removal before ending 
 	fireEvent.click(await open_channel_menu_item("secret-plans", "People in #secret-plans"));
 	const dialog = await screen.findByRole("dialog");
 	const remove = await within(dialog).findByRole("button", { name: "Remove" });
-	const reload = deferred<chat_ScopePrincipal[] | null>();
+	const reload = deferred<ScopePrincipalInput[] | null>();
 	h.raw.scopes.remove_principal.mockRejectedValueOnce(new Error("Connection lost after send"));
 	h.raw.doors.watch_scope_principals.mockReturnValueOnce(reload.promise);
 

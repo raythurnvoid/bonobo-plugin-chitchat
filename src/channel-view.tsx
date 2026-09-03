@@ -1,5 +1,6 @@
 import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
 import { usePaginatedQuery, useQuery } from "convex/react";
+import type { GenericId } from "convex/values";
 import type { CSSProperties, ChangeEvent, KeyboardEvent, PointerEvent } from "react";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Paperclip } from "lucide-react";
@@ -58,7 +59,7 @@ export type chat_MemberNamesApi = {
 	/** undefined = not resolved yet; null = missing or deleted user ("Former member"). */
 	get: (userId: string) => string | null | undefined;
 	/** Resolves unknown ids through the `resolve_member_display` door; already-known ids are skipped. */
-	resolve: (userIds: string[]) => Promise<void>;
+	resolve: (userIds: GenericId<"users">[]) => Promise<void>;
 };
 
 // #region send queue
@@ -67,7 +68,7 @@ type PendingSend = {
 	clientRequestId: string;
 	text: string;
 	attachments: chat_Attachment[];
-	mentions: string[];
+	mentions: GenericId<"users">[];
 	status: "sending" | "failed";
 	errorMessage: string | null;
 };
@@ -92,7 +93,7 @@ function use_send_queue(opts: {
 	client: BonoboClient;
 	collection: "messages" | "replies";
 	keyPrefix: string;
-	userId: string;
+	userId: GenericId<"users">;
 	/**
 	 * The sender's own display name at send time. The backend snapshots it onto the message doc
 	 * so the projected transcript can name the author without a members door.
@@ -150,7 +151,7 @@ function use_send_queue(opts: {
 		clientRequestId: string;
 		text: string;
 		attachments: chat_Attachment[];
-		mentions: string[];
+		mentions: GenericId<"users">[];
 	}) => {
 		if (activeSendsRef.current.has(entry.clientRequestId)) {
 			return;
@@ -264,7 +265,7 @@ function use_send_queue(opts: {
 		run();
 	};
 
-	const send = (text: string, attachments: chat_Attachment[], mentions: string[]) => {
+	const send = (text: string, attachments: chat_Attachment[], mentions: GenericId<"users">[]) => {
 		const clientRequestId = crypto.randomUUID();
 		setPending((prev) => [
 			...prev,
@@ -545,7 +546,7 @@ type Composer_Props = {
 	 * away whatever the member had already typed.
 	 */
 	disabled: boolean;
-	onSend: (text: string, attachments: chat_Attachment[], mentions: string[]) => void;
+	onSend: (text: string, attachments: chat_Attachment[], mentions: GenericId<"users">[]) => void;
 };
 
 /** How many people the @-menu offers at once — a menu a person scans, not a roster. */
@@ -627,7 +628,7 @@ function Composer(props: Composer_Props) {
 	/** The `@word` under the caret: where the `@` sits and what follows it. */
 	const [mentionQuery, setMentionQuery] = useState<{ start: number; query: string } | null>(null);
 	/** userId → the display name that was inserted for it. Send keeps only names still in the text. */
-	const chosenMentionsRef = useRef(new Map<string, string>());
+	const chosenMentionsRef = useRef(new Map<GenericId<"users">, string>());
 	const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 	const pendingCaretRef = useRef<number | null>(null);
 	// The layout effect below pushes `mentionOpen` into the store; `setOpen` mirrors the other
@@ -668,7 +669,7 @@ function Composer(props: Composer_Props) {
 		load_mention_roster(props.client).then(setMentionRoster);
 	};
 
-	const pick_mention = (member: { userId: string; label: string }) => {
+	const pick_mention = (member: { userId: GenericId<"users">; label: string }) => {
 		if (mentionQuery === null) {
 			return;
 		}
@@ -1095,7 +1096,9 @@ function render_message_text(value: chat_MessageValue, memberNames: chat_MemberN
 	}
 	const named = mentions
 		.map((id) => ({ id, name: memberNames.get(id) }))
-		.filter((entry): entry is { id: string; name: string } => typeof entry.name === "string" && entry.name !== "")
+		.filter(
+			(entry): entry is { id: GenericId<"users">; name: string } => typeof entry.name === "string" && entry.name !== "",
+		)
 		// Longest name first, so "@Ana Pane" is not cut short by a colleague named "Ana".
 		.sort((a, b) => b.name.length - a.name.length);
 	if (named.length === 0) {
@@ -1138,7 +1141,7 @@ type MessageRow_Props = {
 	collection: "messages" | "replies";
 	doc: chat_Doc<chat_MessageValue>;
 	isOwn: boolean;
-	selfUserId: string;
+	selfUserId: GenericId<"users">;
 	memberNames: chat_MemberNamesApi;
 	/** True when this row joins the group above it: same author, same day, close in time. */
 	isContinuation: boolean;
@@ -1735,7 +1738,7 @@ function watch_death_message(client: BonoboClient, subject: string) {
 
 type ThreadPanel_Props = {
 	client: BonoboClient;
-	userId: string;
+	userId: GenericId<"users">;
 	root: chat_Doc<chat_MessageValue>;
 	replies: chat_Doc<chat_MessageValue>[];
 	repliesLoaded: boolean;
@@ -1783,7 +1786,7 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 
 	// Resolve author names for the replies in view, and mentioned members' names for the text.
 	useEffect(() => {
-		const ids = new Set<string>();
+		const ids = new Set<GenericId<"users">>();
 		for (const doc of replies) {
 			ids.add(doc.createdBy);
 			for (const id of doc.value.mentions ?? []) {
@@ -1930,7 +1933,7 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 
 type ChannelView_Props = {
 	client: BonoboClient;
-	userId: string;
+	userId: GenericId<"users">;
 	channel: chat_Doc<chat_ChannelValue>;
 	memberNames: chat_MemberNamesApi;
 	announce: (text: string) => void;
@@ -2755,7 +2758,7 @@ export function ChannelView(props: ChannelView_Props) {
 	// Resolve author names for everything in view — and mentioned members, whose names the text
 	// needs even when they never posted here.
 	useEffect(() => {
-		const ids = new Set<string>();
+		const ids = new Set<GenericId<"users">>();
 		for (const doc of messages) {
 			ids.add(doc.createdBy);
 			for (const id of doc.value.mentions ?? []) {

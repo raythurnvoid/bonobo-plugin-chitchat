@@ -1,6 +1,7 @@
-import type { BonoboClient, BonoboUserId } from "bonobo-plugin-sdk/frontend";
+import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
 import { useQueries, useQuery } from "convex/react";
 import type { FunctionArgs, FunctionReturnType } from "convex/server";
+import type { GenericId } from "convex/values";
 import {
 	Component,
 	useCallback,
@@ -92,9 +93,9 @@ function use_member_names(client: BonoboClient): chat_MemberNamesApi {
 	}, []);
 
 	const resolve = useCallback(
-		async (userIds: string[]) => {
+		async (userIds: GenericId<"users">[]) => {
 			const now = Date.now();
-			const missing: string[] = [];
+			const missing: GenericId<"users">[] = [];
 			const requests = new Set<Promise<void>>();
 			for (const id of new Set(userIds)) {
 				const request = inflightRef.current.get(id);
@@ -112,7 +113,7 @@ function use_member_names(client: BonoboClient): chat_MemberNamesApi {
 			for (let start = 0; start < missing.length; start += 50) {
 				const batch = missing.slice(start, start + 50);
 				const request = client.convex
-					.query(client.api.plugins_data.resolve_member_display, { userIds: batch as BonoboUserId[] })
+					.query(client.api.plugins_data.resolve_member_display, { userIds: batch })
 					.then((answer) => {
 						// A null answer is a refusal. Every id in the batch then reads as a former member,
 						// the same as an id the server does not know.
@@ -197,10 +198,10 @@ function use_roster(client: BonoboClient): Roster | null {
  */
 function MemberPicker(props: {
 	client: BonoboClient;
-	selfUserId: string;
+	selfUserId: GenericId<"users">;
 	selected: string[];
 	disabled?: boolean;
-	onToggle: (userId: string, selected: boolean) => void;
+	onToggle: (userId: GenericId<"users">, selected: boolean) => void;
 }) {
 	// Mounted only while a dialog is really showing the picker, so the roster is read then and not
 	// on every page load.
@@ -259,12 +260,12 @@ function ChannelNameDialog(props: {
 	 * The privacy controls, or null when the dialog may not offer them. Renaming never may: the
 	 * channel's key decides whether it is private and a key never changes.
 	 */
-	privacy: { client: BonoboClient; selfUserId: string } | null;
+	privacy: { client: BonoboClient; selfUserId: GenericId<"users"> } | null;
 	busy: boolean;
 	waiting: boolean;
 	fieldsLocked: boolean;
 	error: string | null;
-	onSubmit: (name: string, topic: string, people: { isPrivate: boolean; userIds: string[] }) => void;
+	onSubmit: (name: string, topic: string, people: { isPrivate: boolean; userIds: GenericId<"users">[] }) => void;
 	onClose: () => void;
 }) {
 	const titleId = useId();
@@ -274,7 +275,7 @@ function ChannelNameDialog(props: {
 	const [name, setName] = useState(props.initialName);
 	const [topic, setTopic] = useState(props.initialTopic);
 	const [isPrivate, setIsPrivate] = useState(false);
-	const [invited, setInvited] = useState<string[]>([]);
+	const [invited, setInvited] = useState<GenericId<"users">[]>([]);
 	const [validationError, setValidationError] = useState<string | null>(null);
 	const fieldsLocked = props.busy || props.fieldsLocked;
 
@@ -406,7 +407,7 @@ function ChannelNameDialog(props: {
 function ChannelPeopleDialog(props: {
 	client: BonoboClient;
 	channel: chat_Doc<chat_ChannelValue>;
-	selfUserId: string;
+	selfUserId: GenericId<"users">;
 	memberNames: chat_MemberNamesApi;
 	onClose: () => void;
 }) {
@@ -560,7 +561,7 @@ function ChannelPeopleDialog(props: {
 										change({
 											kind: "remove_principal",
 											scopeId: props.channel.key,
-											userId: principal.userId as BonoboUserId,
+											userId: principal.userId,
 										})
 									}
 								>
@@ -587,10 +588,10 @@ function ChannelPeopleDialog(props: {
 									? {
 											kind: "set_principal",
 											scopeId: props.channel.key,
-											userId: userId as BonoboUserId,
+											userId,
 											level: "member",
 										}
-									: { kind: "remove_principal", scopeId: props.channel.key, userId: userId as BonoboUserId },
+									: { kind: "remove_principal", scopeId: props.channel.key, userId },
 							)
 						}
 					/>
@@ -912,7 +913,7 @@ function UnreadsView(props: {
 function ActivityView(props: {
 	feed: chat_Doc<chat_MessageValue>[];
 	channels: chat_Doc<chat_ChannelValue>[];
-	selfUserId: string;
+	selfUserId: GenericId<"users">;
 	recentDead: boolean;
 	memberNames: chat_MemberNamesApi;
 	onSelectChannel: (channel: chat_Doc<chat_ChannelValue>) => void;
@@ -1464,7 +1465,7 @@ export function App(props: { client: BonoboClient }) {
 		name: string;
 		topic: string;
 		isPrivate: boolean;
-		userIds: string[];
+		userIds: GenericId<"users">[];
 		/** Public creates dedupe by this id in the backend, so an uncertain retry cannot create twice. */
 		clientRequestId: string;
 	} | null>(null);
@@ -3042,7 +3043,7 @@ export function App(props: { client: BonoboClient }) {
 					: {
 							kind: "remove_principal",
 							scopeId: channel.key,
-							userId: userId as BonoboUserId,
+							userId,
 							...(expectedPrincipalCount === undefined ? {} : { expectedPrincipalCount }),
 						},
 		});
@@ -3260,7 +3261,11 @@ export function App(props: { client: BonoboClient }) {
 		setDialogError("Someone else changed this channel while the request was pending. Review it and try again.");
 	}, [channelValueUncertain, channels, dialog]);
 
-	const handle_create_channel = (name: string, topic: string, people: { isPrivate: boolean; userIds: string[] }) => {
+	const handle_create_channel = (
+		name: string,
+		topic: string,
+		people: { isPrivate: boolean; userIds: GenericId<"users">[] },
+	) => {
 		setDialogBusy(true);
 		setDialogError(null);
 		// Public channels go through the backend, which mints the key and dedupes by
@@ -3337,7 +3342,7 @@ export function App(props: { client: BonoboClient }) {
 					scopeId: attempt.key,
 					collections: chat_PRIVATE_CHANNEL_COLLECTIONS,
 					keyPrefix: attempt.key,
-					principals: attempt.userIds.map((userId) => ({ userId: userId as BonoboUserId, level: "member" as const })),
+					principals: attempt.userIds.map((userId) => ({ userId, level: "member" as const })),
 					document: { collection: "channels", key: attempt.key, value },
 				},
 			});

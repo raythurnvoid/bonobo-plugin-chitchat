@@ -13,6 +13,7 @@ import {
 	chat_message_value_schema,
 	chat_REACTION_TOKENS,
 	chat_reply_root_key,
+	chat_user_id_schema,
 	type chat_MessageValue,
 } from "../chat-data";
 import { chatbe_create_host, chatbe_host_message, type chatbe_Host, type chatbe_HostAnswer } from "./host";
@@ -709,7 +710,7 @@ const send_input_schema = z.object({
 	channelKey: z.string().min(1).max(128),
 	text: z.string().min(1),
 	attachments: z.array(chat_attachment_schema).max(20).default([]),
-	mentions: z.array(z.string()).max(50).default([]),
+	mentions: z.array(chat_user_id_schema).max(50).default([]),
 	/** The sender's own display name, snapshotted onto the message for transcript rendering. */
 	authorName: z.string().nullable().default(null),
 	clientRequestId: z.string().min(1).max(64),
@@ -792,7 +793,7 @@ const reply_input_schema = z.object({
 	rootMessageKey: z.string().min(1).max(200),
 	text: z.string().min(1),
 	attachments: z.array(chat_attachment_schema).max(20).default([]),
-	mentions: z.array(z.string()).max(50).default([]),
+	mentions: z.array(chat_user_id_schema).max(50).default([]),
 	authorName: z.string().nullable().default(null),
 	clientRequestId: z.string().min(1).max(64),
 });
@@ -887,7 +888,7 @@ async function handle_reply_send(ctx: Ctx, input: z.infer<typeof reply_input_sch
 const edit_input_schema = z.object({
 	messageKey: z.string().min(1).max(200),
 	text: z.string().min(1),
-	mentions: z.array(z.string()).max(50).default([]),
+	mentions: z.array(chat_user_id_schema).max(50).default([]),
 });
 
 const delete_input_schema = z.object({

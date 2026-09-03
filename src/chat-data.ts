@@ -1,3 +1,4 @@
+import type { GenericId } from "convex/values";
 import { z } from "zod";
 
 /**
@@ -265,6 +266,13 @@ export const chat_attachment_schema = z.object({
 
 export type chat_Attachment = z.infer<typeof chat_attachment_schema>;
 
+/**
+ * A `users` table id inside a stored document, as the doors type it. The store hands ids back as
+ * plain JSON strings, so the parse brands them here once, and a parsed id then reaches a door
+ * with no cast at the call site.
+ */
+export const chat_user_id_schema = z.custom<GenericId<"users">>((value) => typeof value === "string");
+
 export const chat_message_value_schema = z.object({
 	text: z.string(),
 	attachments: z.array(chat_attachment_schema),
@@ -275,7 +283,7 @@ export const chat_message_value_schema = z.object({
 	 * in the text at send time are stored. Optional: messages written before mentions existed
 	 * carry none, and a required field would drop them all at validation.
 	 */
-	mentions: z.array(z.string()).optional(),
+	mentions: z.array(chat_user_id_schema).optional(),
 });
 
 export type chat_MessageValue = z.infer<typeof chat_message_value_schema>;
@@ -326,11 +334,11 @@ export function chat_mention_query_at(value: string, caret: number): { start: nu
  * inserted, filtered with a case-insensitive substring. A null display name uses
  * {@link chat_ANONYMOUS_MEMBER_LABEL}.
  */
-export function chat_filter_mention_members(
-	members: { userId: string; displayName: string | null }[],
+export function chat_filter_mention_members<Member extends { userId: string; displayName: string | null }>(
+	members: Member[],
 	query: string,
 	selfUserId: string,
-): { userId: string; displayName: string | null; label: string }[] {
+): (Member & { label: string })[] {
 	const needle = query.toLowerCase();
 	return members
 		.filter((member) => member.userId !== selfUserId)
@@ -350,8 +358,11 @@ export function chat_insert_mention(text: string, start: number, caret: number, 
  * Ids whose inserted `@Name` is still in the sent text. Deleting the name from the composer
  * deletes the mention, so a rename later cannot retarget a leftover id.
  */
-export function chat_mention_ids_still_in_text(chosen: Iterable<readonly [string, string]>, text: string): string[] {
-	const ids: string[] = [];
+export function chat_mention_ids_still_in_text<Id extends string>(
+	chosen: Iterable<readonly [Id, string]>,
+	text: string,
+): Id[] {
+	const ids: Id[] = [];
 	for (const [id, name] of chosen) {
 		if (text.includes(`@${name}`)) {
 			ids.push(id);
@@ -421,8 +432,8 @@ const public_doc_schema = z.object({
 	key: z.string().min(1).max(128),
 	value: z.record(z.string(), z.unknown()),
 	revision: z.number(),
-	createdBy: z.string().min(1),
-	updatedBy: z.string(),
+	createdBy: chat_user_id_schema.refine((id) => id.length > 0),
+	updatedBy: chat_user_id_schema,
 	ownership: z.union([z.literal("shared"), z.literal("owned")]),
 	createdAt: z.number(),
 	updatedAt: z.number(),
@@ -433,8 +444,8 @@ export type chat_Doc<V> = {
 	key: string;
 	value: V;
 	revision: number;
-	createdBy: string;
-	updatedBy: string;
+	createdBy: GenericId<"users">;
+	updatedBy: GenericId<"users">;
 	createdAt: number;
 	updatedAt: number;
 	/** Creation time parsed from the key tail — the trusted, server-minted chronology. */
@@ -506,7 +517,7 @@ export type chat_ReactionDoc = {
 	key: string;
 	targetKey: string;
 	token: chat_ReactionToken;
-	createdBy: string;
+	createdBy: GenericId<"users">;
 	revision: number;
 	updatedAt: number;
 	removed: boolean;
@@ -567,7 +578,7 @@ export function chat_validate_cursor_map_doc(raw: unknown): chat_CursorMapDoc | 
 export type chat_PrivateCursorDoc = {
 	key: string;
 	channelKey: string;
-	createdBy: string;
+	createdBy: GenericId<"users">;
 	at: number;
 	activity: chat_PrivateActivityCursor;
 	revision: number;
@@ -633,7 +644,7 @@ export type chat_PublicUnread = {
 export function chat_fold_public_unreads(opts: {
 	docs: chat_Doc<chat_MessageValue>[];
 	cursorChannels: Record<string, number>;
-	selfUserId: string;
+	selfUserId: GenericId<"users">;
 }): Map<string, chat_PublicUnread> {
 	const result = new Map<string, chat_PublicUnread>();
 	for (const doc of opts.docs) {
