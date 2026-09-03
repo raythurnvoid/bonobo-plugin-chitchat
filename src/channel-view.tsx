@@ -335,9 +335,13 @@ function MessageAttachments(props: { client: BonoboClient; attachments: chat_Att
 					fileNodeIds: batch.map((attachment) => attachment.fileNodeId),
 				});
 				// Every refusal this route declares carries its own sentence. The catch below turns
-				// it into the message under the attachments.
+				// it into the message under the attachments, and a body that did not parse takes
+				// the same path.
 				if (answer.status !== 200) {
-					throw new Error(answer.body.message);
+					throw new Error(answer.body?.message ?? `The download-urls door answered ${answer.status}`);
+				}
+				if (answer.body === null) {
+					throw new Error("The download-urls door answered 200 with a body that is not JSON");
 				}
 				for (const item of answer.body.items) {
 					next.set(item.fileNodeId, { kind: "ready", url: item.url });
@@ -446,7 +450,12 @@ function AttachmentPickerDialog(props: {
 			.then((answer) => {
 				setLoading(false);
 				if (answer.status !== 200) {
-					setError(answer.body.message);
+					setError(answer.body?.message ?? `The files list door answered ${answer.status}`);
+					return;
+				}
+				// A 200 whose body did not parse leaves nothing to add to the picker.
+				if (answer.body === null) {
+					setError("The files list door answered with a body that is not JSON");
 					return;
 				}
 				const fresh = answer.body.items.filter((item) => !seenNodeIdsRef.current.has(item.nodeId));
@@ -2038,7 +2047,12 @@ function list_plugin_documents(
 ) {
 	return client.fetchJson("/api/v1/plugin-data/list", body).then((answer) => {
 		if (answer.status !== 200) {
-			throw new Error(answer.body.message);
+			throw new Error(answer.body?.message ?? `The list door answered ${answer.status}`);
+		}
+		// A 200 whose body did not parse is not a page. Callers all have a catch, so throwing here
+		// keeps the null out of every one of them.
+		if (answer.body === null) {
+			throw new Error("The list door answered 200 with a body that is not JSON");
 		}
 		return answer.body;
 	});

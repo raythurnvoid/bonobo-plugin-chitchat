@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { BonoboEnv } from "bonobo-plugin-sdk";
-import type { BonoboHttpApi, BonoboHttpApiPath } from "bonobo-plugin-sdk/http-api";
+import type { BonoboHttpApi, BonoboHttpApiPath, BonoboHttpResponse } from "bonobo-plugin-sdk/http-api";
 import {
 	chat_attachment_schema,
 	chat_BACKEND_ENDPOINTS,
@@ -131,6 +131,41 @@ function relay_refusal(answer: chatbe_HostAnswer) {
 // #region door calls
 
 /**
+ * The same answer with the body known to have parsed. `host_post` throws when it did not, so every
+ * caller below reads the body the route table declares, without a null check per call site.
+ */
+type ParsedAnswer<A> = A extends { status: infer S; body: infer B } ? { status: S; body: NonNullable<B> } : never;
+
+/**
+ * One door call, with the two answers this worker must not relay turned back into a throw.
+ *
+ * The host resolves every answer since SDK 0.18.0, so this is where the decision lives. A 5xx, or
+ * a body that did not parse, means nobody knows whether the write happened. The throw escapes
+ * `worker.fetch`, the host answers the page 502, and the page treats that as an unknown outcome
+ * and replays with the same `clientRequestId`. Relaying the status instead would tell the page the
+ * write definitely failed, which nobody knows.
+ */
+async function host_post<P extends BonoboHttpApiPath>(
+	ctx: Ctx,
+	path: P,
+	body: BonoboHttpApi[P]["POST"]["body"],
+): Promise<ParsedAnswer<BonoboHttpResponse<P>>> {
+	const answer = await ctx.host.post(path, body);
+	// `P` is still generic here, so TypeScript cannot narrow the answer union by its status. The
+	// route table stays the authority for both guards; only this helper needs the cast.
+	const { status, body: parsed } = answer as { status: number; body: unknown };
+	if (status >= 500) {
+		// Keep the host's own sentence in the error: it is what the failed run records, and
+		// `files/write` is one door whose 500 body says why.
+		throw new Error(`${path} responded ${status}: ${chatbe_host_message({ status, body: parsed })}`);
+	}
+	if (parsed === null) {
+		throw new Error(`${path} responded ${status}: the body was not JSON`);
+	}
+	return answer as ParsedAnswer<BonoboHttpResponse<P>>;
+}
+
+/**
  * One door call: the 200 body on success, or the relayed refusal as a `Response` the endpoint
  * returns as-is. The host types both, so there is nothing left to parse here.
  */
@@ -139,9 +174,8 @@ async function door<P extends BonoboHttpApiPath>(
 	path: P,
 	body: BonoboHttpApi[P]["POST"]["body"],
 ): Promise<BonoboHttpApi[P]["POST"]["response"][200]["body"] | Response> {
-	// `P` is still generic here, so TypeScript cannot narrow the answer union by its status. The
-	// route table stays the authority for both branches; only this one helper needs the casts.
-	const answer = (await ctx.host.post(path, body)) as { status: number; body: unknown };
+	// Generic `P` again: the status cannot narrow the union here either.
+	const answer = (await host_post(ctx, path, body)) as { status: number; body: unknown };
 	if (answer.status !== 200) {
 		return relay_refusal(answer);
 	}
@@ -172,7 +206,7 @@ function data_list(
  * Transcript files stay under the rollover cap, so the route's read cap never truncates one.
  */
 async function files_read_or_null(ctx: Ctx, path: string) {
-	const answer = await ctx.host.post("/api/v1/files/read", { path });
+	const answer = await host_post(ctx, "/api/v1/files/read", { path });
 	if (answer.status === 404) {
 		return null;
 	}

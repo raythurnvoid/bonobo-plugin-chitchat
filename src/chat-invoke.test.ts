@@ -108,12 +108,41 @@ describe("chat_invoke_backend", () => {
 	});
 
 	test("turns a thrown answer into an uncertain outcome", async () => {
-		// Only a 5xx, a body that is not JSON, a refused session refresh, and a network failure
-		// throw. The run may have happened in every one of those cases.
+		// Only a refused session refresh and a network failure throw now: the call produced no
+		// answer at all. The run may have happened all the same.
 		const fetchJson = vi.fn().mockRejectedValue(new Error("Plugin backend failed"));
 
 		expect(await chat_invoke_backend(make_client(fetchJson), "message-send", {})).toEqual({
 			_nay: { name: "unavailable", message: "Plugin backend failed" },
+		});
+	});
+
+	test("keeps a 5xx and an unparsed body uncertain instead of calling them refusals", async () => {
+		// SDK 0.18.0 resolves these instead of throwing them. Nobody knows whether the run
+		// happened, so they must not fall through to the refusal branch below them: a refusal
+		// tells the page the write definitely did not happen, and the page stops replaying.
+		const answered = async (answer: unknown) =>
+			chat_invoke_backend(make_client(vi.fn().mockResolvedValue(answer)), "message-send", {});
+
+		expect(await answered({ status: 502, body: { message: "Plugin backend failed", runId: "run1" } })).toEqual({
+			_nay: { name: "unavailable", message: "The Chitchat backend did not answer (502)" },
+		});
+		expect(await answered({ status: 500, body: null })).toEqual({
+			_nay: { name: "unavailable", message: "The Chitchat backend did not answer (500)" },
+		});
+		// 401 and 403 come first because they are where the null half of the guard changes the
+		// name, not just the message: those two branches never read the body, so without it an
+		// edge answering HTML would become a definite "refused" and the page would stop replaying.
+		expect(await answered({ status: 401, body: null })).toEqual({
+			_nay: { name: "unavailable", message: "The Chitchat backend did not answer (401)" },
+		});
+		expect(await answered({ status: 403, body: null })).toEqual({
+			_nay: { name: "unavailable", message: "The Chitchat backend did not answer (403)" },
+		});
+
+		// A body that did not parse, on a status the route does declare.
+		expect(await answered({ status: 200, body: null })).toEqual({
+			_nay: { name: "unavailable", message: "The Chitchat backend did not answer (200)" },
 		});
 	});
 });

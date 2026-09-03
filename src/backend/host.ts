@@ -15,10 +15,12 @@ export type chatbe_HostAnswer = {
  * not serve is a compile error, so is a body field the route does not accept, and narrowing on
  * `status` narrows the body.
  *
- * Refusals are values, not exceptions: the door's status and body come back as-is so an endpoint
- * can relay a clear message (a 16 KiB store refusal, a scope "Permission denied") to the page
- * instead of turning everything into a generic 500. Only a 5xx and a body that is not JSON throw,
- * the way `client.fetchJson` throws them on the page side.
+ * Every answer is a value, not an exception: the door's status and body come back as-is so an
+ * endpoint can relay a clear message (a 16 KiB store refusal, a scope "Permission denied") to the
+ * page instead of turning everything into a generic 500. `body` is `null` when the text did not
+ * parse. This mirrors `client.fetchJson` on the page side. The worker's `host_post` helper is where
+ * a 5xx and a null body become a throw, because that decision belongs to the caller. Every door
+ * call goes through it, `door` and `files_read_or_null` alike.
  */
 export type chatbe_Host = {
 	post<P extends BonoboHttpApiPath>(path: P, body: BonoboHttpApi[P]["POST"]["body"]): Promise<BonoboHttpResponse<P>>;
@@ -35,23 +37,14 @@ export function chatbe_create_host(env: BonoboEnv): chatbe_Host {
 				},
 				body: JSON.stringify(body),
 			});
-			// Read the body as text first. A 5xx is refused whatever it says, and a body that will
-			// not parse has to be reported with its status.
+			// Read the body as text first, so a body that will not parse can become `null` beside
+			// its status instead of taking the status with it.
 			const text = await response.text();
-
-			// This throw is meant to escape `worker.fetch`. The host then answers the page 502,
-			// and the page treats a thrown answer as an unknown outcome and replays with the same
-			// clientRequestId. Relaying the 5xx as this run's own status would instead tell the
-			// page the write definitely failed, which nobody knows.
-			if (response.status >= 500) {
-				throw new Error(`${path} responded ${response.status}: ${text}`);
-			}
-
-			let parsed: unknown;
+			let parsed: unknown = null;
 			try {
 				parsed = JSON.parse(text);
 			} catch {
-				throw new Error(`${path} responded ${response.status}: the body was not JSON`);
+				// Not JSON, so the answer keeps its status and a null body.
 			}
 
 			// The route table says what this status carries. The host is the app itself, so the

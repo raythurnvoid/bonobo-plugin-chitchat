@@ -4795,13 +4795,10 @@ function chatbe_create_host(env) {
 				body: JSON.stringify(body),
 			});
 			const text = await response.text();
-			if (response.status >= 500) throw new Error(`${path} responded ${response.status}: ${text}`);
-			let parsed;
+			let parsed = null;
 			try {
 				parsed = JSON.parse(text);
-			} catch {
-				throw new Error(`${path} responded ${response.status}: the body was not JSON`);
-			}
+			} catch {}
 			return {
 				status: response.status,
 				body: parsed,
@@ -5196,11 +5193,33 @@ function relay_refusal(answer) {
 	});
 }
 /**
+ * One door call, with the two answers this worker must not relay turned back into a throw.
+ *
+ * The host resolves every answer since SDK 0.18.0, so this is where the decision lives. A 5xx, or
+ * a body that did not parse, means nobody knows whether the write happened. The throw escapes
+ * `worker.fetch`, the host answers the page 502, and the page treats that as an unknown outcome
+ * and replays with the same `clientRequestId`. Relaying the status instead would tell the page the
+ * write definitely failed, which nobody knows.
+ */
+async function host_post(ctx, path, body) {
+	const answer = await ctx.host.post(path, body);
+	const { status, body: parsed } = answer;
+	if (status >= 500)
+		throw new Error(
+			`${path} responded ${status}: ${chatbe_host_message({
+				status,
+				body: parsed,
+			})}`,
+		);
+	if (parsed === null) throw new Error(`${path} responded ${status}: the body was not JSON`);
+	return answer;
+}
+/**
  * One door call: the 200 body on success, or the relayed refusal as a `Response` the endpoint
  * returns as-is. The host types both, so there is nothing left to parse here.
  */
 async function door(ctx, path, body) {
-	const answer = await ctx.host.post(path, body);
+	const answer = await host_post(ctx, path, body);
 	if (answer.status !== 200) return relay_refusal(answer);
 	return answer.body;
 }
@@ -5228,7 +5247,7 @@ function data_list(ctx, body) {
  * Transcript files stay under the rollover cap, so the route's read cap never truncates one.
  */
 async function files_read_or_null(ctx, path) {
-	const answer = await ctx.host.post("/api/v1/files/read", { path });
+	const answer = await host_post(ctx, "/api/v1/files/read", { path });
 	if (answer.status === 404) return null;
 	if (answer.status !== 200) return relay_refusal(answer);
 	return answer.body;

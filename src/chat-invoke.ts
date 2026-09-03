@@ -5,8 +5,9 @@ import { chat_get_error_message, type chat_BackendEndpointId } from "./chat-data
  * Page-side wrapper for the invoke route: waits out the held-back answers (409 is the
  * serialization lock, 429 the rate bucket, and both may carry `retryAfterMs`), parses the
  * backend's relayed JSON, and maps everything into the `_yay`/`_nay` shape the page's write
- * machinery already speaks. A thrown answer becomes `unavailable` — the run may have happened,
- * so callers replay with the same `clientRequestId`, exactly like the old append door.
+ * machinery already speaks. A 5xx, an answer that did not parse, and a thrown call all become
+ * `unavailable` — the run may have happened, so callers replay with the same `clientRequestId`,
+ * exactly like the old append door.
  */
 
 const BUSY_RETRY_MAX_CALLS = 3;
@@ -45,6 +46,21 @@ export async function chat_invoke_backend(
 	try {
 		for (let call = 1; ; call += 1) {
 			const answer = await client.fetchJson("/api/v1/plugin-backend/invoke", { endpoint, input });
+
+			// Nobody knows whether the run happened: the host failed (5xx, including this route's
+			// own 502), or the answer did not parse. Callers replay with the same
+			// `clientRequestId`, exactly like the old append door. Since SDK 0.18.0 these resolve
+			// like any other answer, so this branch has to come before the status checks below —
+			// without it a 502 would read as a plain refusal, which says the run definitely did
+			// not happen.
+			if (answer.status >= 500 || answer.body === null) {
+				return {
+					_nay: {
+						name: "unavailable",
+						message: `The Chitchat backend did not answer (${answer.status})`,
+					},
+				};
+			}
 
 			// The host held the call back instead of running the backend. 429 without a hint is
 			// the plugin API call limit, so fall back to one second.
@@ -99,9 +115,9 @@ export async function chat_invoke_backend(
 			return { _nay: { name, message } };
 		}
 	} catch (error: unknown) {
-		// Only a 5xx, a body that is not JSON, a refused session refresh, or a network failure
-		// throw now. The backend may have run in every one of those cases, so the outcome is
-		// uncertain, like a lost network answer.
+		// Only a network failure and a refused session refresh throw now: the call produced no
+		// answer at all. The backend may have run all the same, so the outcome is uncertain, like
+		// a lost network answer.
 		return { _nay: { name: "unavailable", message: chat_get_error_message(error) } };
 	}
 }

@@ -1732,7 +1732,7 @@ export function App(props: { client: BonoboClient }) {
 							run_private_cursor_write(write);
 							return;
 						}
-						const cursor = answer.status === 200 ? chat_validate_private_cursor_doc(answer.body.document) : null;
+						const cursor = answer.status === 200 && answer.body !== null ? chat_validate_private_cursor_doc(answer.body.document) : null;
 						if (
 							cursor !== null &&
 							cursor.key === storedKey &&
@@ -2052,7 +2052,8 @@ export function App(props: { client: BonoboClient }) {
 						if (!is_current()) {
 							return;
 						}
-						if (answer.status !== 200) {
+						// A 200 whose body did not parse is not an answer either, so retry it too.
+						if (answer.status !== 200 || answer.body === null) {
 							reconciliation.running = false;
 							schedule_retry();
 							return;
@@ -2930,7 +2931,8 @@ export function App(props: { client: BonoboClient }) {
 				if (!is_current()) {
 					return;
 				}
-				if (answer.status !== 200) {
+				// A 200 whose body did not parse is not an answer either, so retry it too.
+				if (answer.status !== 200 || answer.body === null) {
 					reconciliation.running = false;
 					schedule_retry();
 					return;
@@ -3150,7 +3152,8 @@ export function App(props: { client: BonoboClient }) {
 				if (!is_current()) {
 					return;
 				}
-				if (answer.status !== 200) {
+				// A 200 whose body did not parse is not an answer either, so retry it too.
+				if (answer.status !== 200 || answer.body === null) {
 					reconciliation.running = false;
 					schedule_retry();
 					return;
