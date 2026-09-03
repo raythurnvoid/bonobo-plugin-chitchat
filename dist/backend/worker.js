@@ -4708,8 +4708,8 @@ var chat_message_value_schema = object({
 });
 /**
  * The backend invoke endpoints, shared between the manifest, the worker router, and the page's
- * `client.backend.invoke` calls. Every endpoint runs under the one installation-wide
- * serialization lock so transcript read-modify-write stays ordered.
+ * calls to the invoke route. Every endpoint runs under the one installation-wide serialization
+ * lock so transcript read-modify-write stays ordered.
  */
 var chat_BACKEND_ENDPOINTS = [
 	{
@@ -4769,12 +4769,7 @@ union([
 		},
 	})),
 ]);
-/**
- * The stored-document envelope every read surface returns (plain watch and window
- * updates alike). The store is a generic multi-writer surface, so every doc is runtime
- * validated before the page uses it. A doc that fails is dropped and counted.
- */
-var public_doc_schema = object({
+object({
 	collection: string(),
 	key: string().min(1).max(128),
 	value: record(string(), unknown()),
@@ -4786,42 +4781,6 @@ var public_doc_schema = object({
 	updatedAt: number(),
 });
 object({ removed: literal(true).optional() });
-object({ document: public_doc_schema.nullable() });
-object({
-	items: array(
-		object({
-			path: string(),
-			name: string(),
-			kind: union([literal("file"), literal("folder")]),
-			nodeId: string(),
-			contentType: string().nullable(),
-			updatedAt: number(),
-		}),
-	),
-	cursor: string().nullable(),
-	isDone: boolean(),
-});
-object({
-	documents: array(public_doc_schema),
-	cursor: string().nullable(),
-	isDone: boolean(),
-});
-object({
-	items: array(
-		object({
-			fileNodeId: string(),
-			url: string(),
-			expiresAt: number(),
-		}),
-	),
-	errors: array(
-		object({
-			fileNodeId: string(),
-			message: string(),
-		}),
-	),
-	truncated: boolean(),
-});
 //#endregion
 //#region src/backend/host.ts
 function chatbe_create_host(env) {
@@ -4836,11 +4795,12 @@ function chatbe_create_host(env) {
 				body: JSON.stringify(body),
 			});
 			const text = await response.text();
-			let parsed = null;
+			if (response.status >= 500) throw new Error(`${path} responded ${response.status}: ${text}`);
+			let parsed;
 			try {
-				parsed = text === "" ? null : JSON.parse(text);
+				parsed = JSON.parse(text);
 			} catch {
-				parsed = { message: text };
+				throw new Error(`${path} responded ${response.status}: the body was not JSON`);
 			}
 			return {
 				status: response.status,
@@ -5235,65 +5195,33 @@ function relay_refusal(answer) {
 		...(typeof retryAfterMs === "number" ? { retryAfterMs } : {}),
 	});
 }
-async function door(ctx, path, body, schema) {
+/**
+ * One door call: the 200 body on success, or the relayed refusal as a `Response` the endpoint
+ * returns as-is. The host types both, so there is nothing left to parse here.
+ */
+async function door(ctx, path, body) {
 	const answer = await ctx.host.post(path, body);
 	if (answer.status !== 200) return relay_refusal(answer);
-	const parsed = schema.safeParse(answer.body);
-	if (!parsed.success) return refuse(502, `The host answered ${path} with an unexpected shape`);
-	return parsed.data;
+	return answer.body;
 }
-var read_answer_schema = object({ document: unknown() });
-var write_answer_schema = object({
-	revision: number(),
-	byteSize: number(),
-});
-var write_batch_answer_schema = object({ documents: unknown() });
-var list_answer_schema = object({
-	documents: array(unknown()),
-	cursor: string().nullable(),
-	isDone: boolean(),
-});
-var files_read_answer_schema = object({
-	path: string(),
-	content: string(),
-});
-var files_write_answer_schema = object({
-	path: string(),
-	nodeId: string(),
-});
-var folders_ensure_answer_schema = object({
-	nodeId: string(),
-	path: string(),
-	created: boolean(),
-});
 function data_read(ctx, collection, key) {
-	return door(
-		ctx,
-		"/api/v1/plugin-data/read",
-		{
-			collection,
-			key,
-		},
-		read_answer_schema,
-	);
+	return door(ctx, "/api/v1/plugin-data/read", {
+		collection,
+		key,
+	});
 }
 function data_write(ctx, collection, key, value) {
-	return door(
-		ctx,
-		"/api/v1/plugin-data/write",
-		{
-			collection,
-			key,
-			value,
-		},
-		write_answer_schema,
-	);
+	return door(ctx, "/api/v1/plugin-data/write", {
+		collection,
+		key,
+		value,
+	});
 }
 function data_write_batch(ctx, documents) {
-	return door(ctx, "/api/v1/plugin-data/write-batch", { documents }, write_batch_answer_schema);
+	return door(ctx, "/api/v1/plugin-data/write-batch", { documents });
 }
 function data_list(ctx, body) {
-	return door(ctx, "/api/v1/plugin-data/list", body, list_answer_schema);
+	return door(ctx, "/api/v1/plugin-data/list", body);
 }
 /**
  * Read one transcript file; a missing file answers null instead of a refusal, for heal paths.
@@ -5303,40 +5231,28 @@ async function files_read_or_null(ctx, path) {
 	const answer = await ctx.host.post("/api/v1/files/read", { path });
 	if (answer.status === 404) return null;
 	if (answer.status !== 200) return relay_refusal(answer);
-	const parsed = files_read_answer_schema.safeParse(answer.body);
-	if (!parsed.success) return refuse(502, "The host answered /api/v1/files/read with an unexpected shape");
-	return parsed.data;
+	return answer.body;
 }
 /**
  * Every transcript write asks for the plugin-named lock. On a create that locks the new file;
  * on an update the door ignores the request and the existing lock stays.
  */
 function files_write(ctx, path, content) {
-	return door(
-		ctx,
-		"/api/v1/files/write",
-		{
-			path,
-			content,
-			nonCollaborative: true,
-			access: { readOnly: true },
-		},
-		files_write_answer_schema,
-	);
+	return door(ctx, "/api/v1/files/write", {
+		path,
+		content,
+		nonCollaborative: true,
+		access: { readOnly: true },
+	});
 }
 function folders_ensure(ctx, path, access) {
-	return door(
-		ctx,
-		"/api/v1/files/plugin-folders/ensure",
-		{
-			path,
-			...(access ? { access } : {}),
-		},
-		folders_ensure_answer_schema,
-	);
+	return door(ctx, "/api/v1/files/plugin-folders/ensure", {
+		path,
+		...(access ? { access } : {}),
+	});
 }
 function files_archive(ctx, path) {
-	return door(ctx, "/api/v1/files/plugin-archive", { path }, object({ archivedNodes: number() }));
+	return door(ctx, "/api/v1/files/plugin-archive", { path });
 }
 var stored_doc_schema = object({
 	key: string(),

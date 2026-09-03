@@ -403,6 +403,29 @@ describe("message-send", () => {
 		expect(sent.body.message).toBe("Permission denied");
 	});
 
+	test("a door 5xx escapes the worker instead of becoming this run's own status", async () => {
+		seed_public_channel();
+		fake.refusals.set("/api/v1/plugin-data/read", { status: 500, body: { message: "Internal server error" } });
+
+		// The host answers the page 502 for a run that threw, and the page treats that as an
+		// unknown outcome and replays with the same clientRequestId. Relaying the 500 as this
+		// run's own status would instead tell the page the write definitely failed, which nobody
+		// knows.
+		await expect(
+			invoke("message-send", { channelKey: "chan-public", text: "hi", clientRequestId: "req-5xx" }),
+		).rejects.toThrow("/api/v1/plugin-data/read responded 500");
+	});
+
+	test("a door answer that is not JSON escapes the worker with its status", async () => {
+		seed_public_channel();
+		// An older host with no such route answers plain text, which is not the route refusing.
+		vi.stubGlobal("fetch", async () => new Response("not found", { status: 404 }));
+
+		await expect(
+			invoke("message-send", { channelKey: "chan-public", text: "hi", clientRequestId: "req-text" }),
+		).rejects.toThrow("responded 404: the body was not JSON");
+	});
+
 	test("an append that crosses the rollover cap archives the tail and restarts it", async () => {
 		seed_public_channel();
 		const header = "# general\n\nPublic Chitchat channel. This file is a derived copy. Edit chat in the Chitchat page, not here.";

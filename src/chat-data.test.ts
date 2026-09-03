@@ -14,8 +14,6 @@ import {
 	chat_message_key_prefix,
 	chat_message_value_schema,
 	chat_parse_reaction_key,
-	chat_plugin_data_list_response_schema,
-	chat_plugin_data_read_response_schema,
 	chat_private_channel_key_is_valid,
 	chat_reaction_caller_key,
 	chat_reply_key_prefix,
@@ -214,69 +212,6 @@ describe("value schemas", () => {
 				deletedAt: null,
 			}).success,
 		).toBe(false);
-	});
-});
-
-describe("chat_plugin_data_list_response_schema", () => {
-	test("rejects an envelope with no documents and keeps a null cursor", () => {
-		// The deep-history fallback reads this off `fetchJson`, which resolves `unknown`. The store
-		// validates each document but never the envelope, so this is the only check on the shape the
-		// page destructures.
-		expect(chat_plugin_data_list_response_schema.safeParse({ cursor: null, isDone: true }).success).toBe(false);
-		expect(chat_plugin_data_list_response_schema.safeParse({ documents: [], cursor: 7, isDone: true }).success).toBe(
-			false,
-		);
-
-		const parsed = chat_plugin_data_list_response_schema.safeParse({
-			documents: [
-				{
-					collection: "messages",
-					key: "anything",
-					value: { futureField: true },
-					revision: 1,
-					createdBy: "user_1",
-					updatedBy: "user_1",
-					ownership: "shared",
-					createdAt: 1,
-					updatedAt: 1,
-				},
-			],
-			cursor: null,
-			isDone: false,
-		});
-		// The full envelope and unknown value fields must survive for the collection validator.
-		expect(parsed.success && parsed.data).toEqual({
-			documents: [
-				{
-					collection: "messages",
-					key: "anything",
-					value: { futureField: true },
-					revision: 1,
-					createdBy: "user_1",
-					updatedBy: "user_1",
-					ownership: "shared",
-					createdAt: 1,
-					updatedAt: 1,
-				},
-			],
-			cursor: null,
-			isDone: false,
-		});
-		expect(
-			chat_plugin_data_list_response_schema.safeParse({
-				documents: [{ key: "no public envelope" }],
-				cursor: null,
-				isDone: false,
-			}).success,
-		).toBe(false);
-	});
-});
-
-describe("chat_plugin_data_read_response_schema", () => {
-	test("requires the document field and accepts a missing stored document", () => {
-		expect(chat_plugin_data_read_response_schema.safeParse({}).success).toBe(false);
-		expect(chat_plugin_data_read_response_schema.safeParse({ document: null }).success).toBe(true);
-		expect(chat_plugin_data_read_response_schema.safeParse({ document: doc_envelope({}) }).success).toBe(true);
 	});
 });
 

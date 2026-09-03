@@ -130,53 +130,41 @@ function relay_refusal(answer: chatbe_HostAnswer) {
 
 // #region door calls
 
-async function door<P extends BonoboHttpApiPath, T>(
+/**
+ * One door call: the 200 body on success, or the relayed refusal as a `Response` the endpoint
+ * returns as-is. The host types both, so there is nothing left to parse here.
+ */
+async function door<P extends BonoboHttpApiPath>(
 	ctx: Ctx,
 	path: P,
 	body: BonoboHttpApi[P]["POST"]["body"],
-	schema: z.ZodType<T>,
-): Promise<T | Response> {
-	const answer = await ctx.host.post(path, body);
+): Promise<BonoboHttpApi[P]["POST"]["response"][200]["body"] | Response> {
+	// `P` is still generic here, so TypeScript cannot narrow the answer union by its status. The
+	// route table stays the authority for both branches; only this one helper needs the casts.
+	const answer = (await ctx.host.post(path, body)) as { status: number; body: unknown };
 	if (answer.status !== 200) {
 		return relay_refusal(answer);
 	}
-
-	const parsed = schema.safeParse(answer.body);
-	if (!parsed.success) {
-		return refuse(502, `The host answered ${path} with an unexpected shape`);
-	}
-	return parsed.data;
+	return answer.body as BonoboHttpApi[P]["POST"]["response"][200]["body"];
 }
 
-const read_answer_schema = z.object({ document: z.unknown() });
-const write_answer_schema = z.object({ revision: z.number(), byteSize: z.number() });
-const write_batch_answer_schema = z.object({ documents: z.unknown() });
-const list_answer_schema = z.object({
-	documents: z.array(z.unknown()),
-	cursor: z.string().nullable(),
-	isDone: z.boolean(),
-});
-const files_read_answer_schema = z.object({ path: z.string(), content: z.string() });
-const files_write_answer_schema = z.object({ path: z.string(), nodeId: z.string() });
-const folders_ensure_answer_schema = z.object({ nodeId: z.string(), path: z.string(), created: z.boolean() });
-
 function data_read(ctx: Ctx, collection: string, key: string) {
-	return door(ctx, "/api/v1/plugin-data/read", { collection, key }, read_answer_schema);
+	return door(ctx, "/api/v1/plugin-data/read", { collection, key });
 }
 
 function data_write(ctx: Ctx, collection: string, key: string, value: Record<string, unknown>) {
-	return door(ctx, "/api/v1/plugin-data/write", { collection, key, value }, write_answer_schema);
+	return door(ctx, "/api/v1/plugin-data/write", { collection, key, value });
 }
 
 function data_write_batch(ctx: Ctx, documents: { collection: string; key: string; value: Record<string, unknown> }[]) {
-	return door(ctx, "/api/v1/plugin-data/write-batch", { documents }, write_batch_answer_schema);
+	return door(ctx, "/api/v1/plugin-data/write-batch", { documents });
 }
 
 function data_list(
 	ctx: Ctx,
 	body: { collection: string; keyPrefix?: string; limit?: number; cursor?: string | null },
 ) {
-	return door(ctx, "/api/v1/plugin-data/list", body, list_answer_schema);
+	return door(ctx, "/api/v1/plugin-data/list", body);
 }
 
 /**
@@ -191,12 +179,7 @@ async function files_read_or_null(ctx: Ctx, path: string) {
 	if (answer.status !== 200) {
 		return relay_refusal(answer);
 	}
-
-	const parsed = files_read_answer_schema.safeParse(answer.body);
-	if (!parsed.success) {
-		return refuse(502, "The host answered /api/v1/files/read with an unexpected shape");
-	}
-	return parsed.data;
+	return answer.body;
 }
 
 /**
@@ -215,7 +198,6 @@ function files_write(ctx: Ctx, path: string, content: string) {
 		// markers gone it always decided "missing" and appended a second copy of the same message.
 		// The door reads this flag only when the write creates the file.
 		{ path, content, nonCollaborative: true, access: { readOnly: true } },
-		files_write_answer_schema,
 	);
 }
 
@@ -224,12 +206,11 @@ function folders_ensure(ctx: Ctx, path: string, access?: { readOnly?: boolean; r
 		ctx,
 		"/api/v1/files/plugin-folders/ensure",
 		{ path, ...(access ? { access } : {}) },
-		folders_ensure_answer_schema,
 	);
 }
 
 function files_archive(ctx: Ctx, path: string) {
-	return door(ctx, "/api/v1/files/plugin-archive", { path }, z.object({ archivedNodes: z.number() }));
+	return door(ctx, "/api/v1/files/plugin-archive", { path });
 }
 
 // #endregion door calls

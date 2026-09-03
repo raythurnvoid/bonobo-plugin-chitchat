@@ -61,10 +61,13 @@ scan, and appends or nests the block only when the marker is absent. So replayin
 never writes the block twice. A replayed channel create re-runs `ensure_channel` for the same
 reason.
 
-The page calls these through `client.backend.invoke`, wrapped in `src/chat-invoke.ts`: it waits out
-`busy` answers (serialization lock and invoke rate bucket, both with `retryAfterMs`), maps the
-relayed JSON into the `_yay`/`_nay` shape the write machinery speaks, and keeps `unavailable` as a
-replay-with-same-client-request-id case exactly like the old append door. Because of this,
+The page calls these with `client.fetchJson("/api/v1/plugin-backend/invoke", { endpoint, input })`,
+wrapped in `src/chat-invoke.ts`: it waits out the held-back answers (409 is the serialization lock,
+429 the invoke rate bucket, and both may carry `retryAfterMs`), maps the relayed JSON into the
+`_yay`/`_nay` shape the write machinery speaks, and keeps `unavailable` as a
+replay-with-same-client-request-id case exactly like the old append door. A thrown answer is what
+becomes `unavailable` now: a 5xx, a body that is not JSON, a refused session refresh, or a network
+failure. The run may have happened in all four cases. Because of this,
 `userWritableCollections` narrows the user-write door to `channels` + `cursors`; the store refuses a
 page write to `messages`, `replies`, or `reactions`. `channels` stays user-writable because private
 create writes the channel document from the page via `user_manage_scope` (`create_with_document`) — a

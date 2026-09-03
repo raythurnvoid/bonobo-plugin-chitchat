@@ -1,4 +1,5 @@
 import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
+import type { BonoboHttpApi } from "bonobo-plugin-sdk/http-api";
 import { usePaginatedQuery, useQuery } from "convex/react";
 import type { GenericId } from "convex/values";
 import type { CSSProperties, ChangeEvent, KeyboardEvent, PointerEvent } from "react";
@@ -9,8 +10,6 @@ import { ArrowUp, Paperclip } from "lucide-react";
 import * as Ariakit from "@ariakit/react/combobox";
 import {
 	chat_channel_is_private,
-	chat_download_urls_response_schema,
-	chat_files_list_response_schema,
 	chat_filter_mention_members,
 	chat_format_recency,
 	chat_get_error_message,
@@ -20,7 +19,6 @@ import {
 	chat_mention_query_at,
 	chat_mention_roster_refusal_copy,
 	chat_message_key_prefix,
-	chat_plugin_data_list_response_schema,
 	chat_PRIVATE_CHANNEL_DISCLOSURE,
 	chat_REACTION_EMOJI,
 	chat_REACTION_LABELS,
@@ -33,7 +31,6 @@ import {
 	type chat_Attachment,
 	type chat_ChannelValue,
 	type chat_Doc,
-	type chat_FilesListItem,
 	type chat_MessageValue,
 	type chat_ReactionDoc,
 	type chat_ReactionToken,
@@ -103,12 +100,6 @@ function use_send_queue(opts: {
 	/** Track the request in App before the append can settle or a navigation handler can run. */
 	onRequestStart: () => void;
 	onRequestSettled: () => void;
-	/**
-	 * A full store is not this send's problem, it is the channel's. Report it up so the channel
-	 * says so once and stops the composer, instead of printing the same sentence on every row the
-	 * member then tries to send.
-	 */
-	onStorageFull: (message: string) => void;
 }) {
 	const [pending, setPending] = useState<PendingSend[]>([]);
 	const activeSendsRef = useRef(new Map<string, ActiveSend>());
@@ -173,17 +164,14 @@ function use_send_queue(opts: {
 		activeSendsRef.current.set(entry.clientRequestId, active);
 		opts.onRequestStart();
 
-		const fail = (message: string, storageFull = false) => {
+		const fail = (message: string) => {
 			if (activeSendsRef.current.get(entry.clientRequestId) !== active || active.cancelled) {
 				return;
-			}
-			if (storageFull) {
-				opts.onStorageFull(message);
 			}
 			setPending((prev) =>
 				prev.map((p) =>
 					p.clientRequestId === entry.clientRequestId
-						? { ...p, status: "failed" as const, errorMessage: storageFull ? null : message }
+						? { ...p, status: "failed" as const, errorMessage: message }
 						: p,
 				),
 			);
@@ -229,7 +217,7 @@ function use_send_queue(opts: {
 									}, delayMs);
 									return;
 								}
-								fail(result._nay.message, result._nay.name === "storage_full");
+								fail(result._nay.message);
 								return;
 							}
 							const key = result._yay.messageKey;
@@ -343,17 +331,18 @@ function MessageAttachments(props: { client: BonoboClient; attachments: chat_Att
 			// 20 always answers false and a message with 21 attachments would lose the last one.
 			for (let index = 0; index < props.attachments.length; index += DOWNLOAD_URL_BATCH_SIZE) {
 				const batch = props.attachments.slice(index, index + DOWNLOAD_URL_BATCH_SIZE);
-				const raw: unknown = await props.client.fetchJson("/api/v1/files/download-urls", {
-					body: { fileNodeIds: batch.map((attachment) => attachment.fileNodeId) },
+				const answer = await props.client.fetchJson("/api/v1/files/download-urls", {
+					fileNodeIds: batch.map((attachment) => attachment.fileNodeId),
 				});
-				const parsed = chat_download_urls_response_schema.safeParse(raw);
-				if (!parsed.success) {
-					throw new Error("Unexpected response for the download links");
+				// Every refusal this route declares carries its own sentence. The catch below turns
+				// it into the message under the attachments.
+				if (answer.status !== 200) {
+					throw new Error(answer.body.message);
 				}
-				for (const item of parsed.data.items) {
+				for (const item of answer.body.items) {
 					next.set(item.fileNodeId, { kind: "ready", url: item.url });
 				}
-				for (const failure of parsed.data.errors) {
+				for (const failure of answer.body.errors) {
 					next.set(failure.fileNodeId, { kind: "error", message: failure.message });
 				}
 			}
@@ -424,13 +413,16 @@ function MessageAttachments(props: { client: BonoboClient; attachments: chat_Att
 	);
 }
 
+/** One row of `POST /api/v1/files/list`, as the app's own route table declares it. */
+type FilesListItem = BonoboHttpApi["/api/v1/files/list"]["POST"]["response"][200]["body"]["items"][number];
+
 function AttachmentPickerDialog(props: {
 	client: BonoboClient;
 	onPick: (attachment: chat_Attachment) => void;
 	onClose: () => void;
 }) {
 	const titleId = useId();
-	const [items, setItems] = useState<chat_FilesListItem[]>([]);
+	const [items, setItems] = useState<FilesListItem[]>([]);
 	const [cursor, setCursor] = useState<string | null>(null);
 	const [isDone, setIsDone] = useState(false);
 	const [loading, setLoading] = useState(false);
@@ -443,30 +435,27 @@ function AttachmentPickerDialog(props: {
 		setError(null);
 		props.client
 			.fetchJson("/api/v1/files/list", {
-				body: {
-					path: "/",
-					recursive: true,
-					kind: "file",
-					limit: 100,
-					scanLimit: 10_000,
-					contentTypePrefixes: ATTACHABLE_CONTENT_TYPE_PREFIXES,
-					cursor,
-				},
+				path: "/",
+				recursive: true,
+				kind: "file",
+				limit: 100,
+				scanLimit: 10_000,
+				contentTypePrefixes: ATTACHABLE_CONTENT_TYPE_PREFIXES,
+				cursor,
 			})
-			.then((raw: unknown) => {
+			.then((answer) => {
 				setLoading(false);
-				const parsed = chat_files_list_response_schema.safeParse(raw);
-				if (!parsed.success) {
-					setError("Unexpected response from the file list");
+				if (answer.status !== 200) {
+					setError(answer.body.message);
 					return;
 				}
-				const fresh = parsed.data.items.filter((item) => !seenNodeIdsRef.current.has(item.nodeId));
+				const fresh = answer.body.items.filter((item) => !seenNodeIdsRef.current.has(item.nodeId));
 				for (const item of fresh) {
 					seenNodeIdsRef.current.add(item.nodeId);
 				}
 				setItems((prev) => [...prev, ...fresh]);
-				setCursor(parsed.data.cursor);
-				setIsDone(parsed.data.isDone);
+				setCursor(answer.body.cursor);
+				setIsDone(answer.body.isDone);
 			})
 			.catch((loadError: unknown) => {
 				setLoading(false);
@@ -541,9 +530,10 @@ type Composer_Props = {
 	label: string;
 	busy: boolean;
 	/**
-	 * The store refused a write, so sending cannot succeed until somebody frees space. The text
-	 * box stays editable on purpose: disabling it would take it out of the tab order and throw
-	 * away whatever the member had already typed.
+	 * Sending cannot succeed, so the Send button is off. The thread composer uses it when the
+	 * reply list is dead; the channel composer has no such state and passes `false`. The text box
+	 * stays editable on purpose: disabling it would take it out of the tab order and throw away
+	 * whatever the member had already typed.
 	 */
 	disabled: boolean;
 	onSend: (text: string, attachments: chat_Attachment[], mentions: GenericId<"users">[]) => void;
@@ -1169,8 +1159,6 @@ type MessageRow_Props = {
 	onRequestSettled: () => void;
 	/** Merge a reaction the member just wrote, including a removed marker. */
 	onApplyReaction: (doc: chat_ReactionDoc) => void;
-	/** See `use_send_queue`: a full store is the channel's state, not this row's error. */
-	onStorageFull: (message: string) => void;
 };
 
 type ActiveMessageChange = {
@@ -1292,10 +1280,6 @@ export function MessageRow(props: MessageRow_Props) {
 						settle_change(active);
 						setBusy(false);
 						setChangeUncertain(false);
-						if (result._nay.name === "storage_full") {
-							props.onStorageFull(result._nay.message);
-							return;
-						}
 						setRowError(result._nay.message);
 						return;
 					}
@@ -1467,10 +1451,6 @@ export function MessageRow(props: MessageRow_Props) {
 		chat_invoke_backend(client, "reaction-toggle", { targetKey: doc.key, token, on: !removed })
 			.then((result) => {
 				if ("_nay" in result) {
-					if (result._nay.name === "storage_full") {
-						props.onStorageFull(result._nay.message);
-						return;
-					}
 					setRowError(result._nay.message);
 					return;
 				}
@@ -1749,8 +1729,6 @@ type ThreadPanel_Props = {
 	memberNames: chat_MemberNamesApi;
 	/** Below 720px the panel covers the whole frame, so its way out reads as "back", not "close". */
 	isNarrow: boolean;
-	storageFull: string | null;
-	onStorageFull: (message: string) => void;
 	onApplyLocalRoot: (doc: chat_Doc<chat_MessageValue>) => void;
 	onApplyLocalReply: (doc: chat_Doc<chat_MessageValue>) => void;
 	onRequestStart: () => void;
@@ -1781,7 +1759,6 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 		},
 		onRequestStart: props.onRequestStart,
 		onRequestSettled: props.onRequestSettled,
-		onStorageFull: props.onStorageFull,
 	});
 
 	// Resolve author names for the replies in view, and mentioned members' names for the text.
@@ -1849,7 +1826,6 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 					onRequestStart={props.onRequestStart}
 					onRequestSettled={props.onRequestSettled}
 					onApplyReaction={props.onApplyReaction}
-					onStorageFull={props.onStorageFull}
 				/>
 			</ul>
 			{props.repliesError !== null ? (
@@ -1902,7 +1878,6 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 								onRequestStart={props.onRequestStart}
 								onRequestSettled={props.onRequestSettled}
 								onApplyReaction={props.onApplyReaction}
-								onStorageFull={props.onStorageFull}
 							/>
 						),
 					)}
@@ -1911,16 +1886,11 @@ export function ThreadPanel(props: ThreadPanel_Props) {
 					))}
 				</ul>
 			) : null}
-			{props.storageFull !== null ? (
-				<div className="channel-status is-error" role="alert">
-					{props.storageFull}
-				</div>
-			) : null}
 			<Composer
 				client={client}
 				label="Reply in thread"
 				busy={queue.busy}
-				disabled={props.storageFull !== null || props.repliesError !== null}
+				disabled={props.repliesError !== null}
 				onSend={queue.send}
 			/>
 		</section>
@@ -2066,12 +2036,11 @@ function list_plugin_documents(
 	client: BonoboClient,
 	body: { collection: string; keyPrefix: string; keyStartExclusive?: string; limit: number },
 ) {
-	return client.fetchJson("/api/v1/plugin-data/list", { body }).then((raw: unknown) => {
-		const parsed = chat_plugin_data_list_response_schema.safeParse(raw);
-		if (!parsed.success) {
-			throw new Error("Unexpected response from the document list");
+	return client.fetchJson("/api/v1/plugin-data/list", body).then((answer) => {
+		if (answer.status !== 200) {
+			throw new Error(answer.body.message);
 		}
-		return parsed.data;
+		return answer.body;
 	});
 }
 
@@ -2154,7 +2123,6 @@ export function ChannelView(props: ChannelView_Props) {
 	const [channelReplies, setChannelReplies] = useState<chat_Doc<chat_MessageValue>[]>([]);
 	const [reactionCoverage, setReactionCoverage] = useState<CompanionCoverageState>(INITIAL_COMPANION_COVERAGE);
 	const [replyCoverage, setReplyCoverage] = useState<CompanionCoverageState>(INITIAL_COMPANION_COVERAGE);
-	const [storageFull, setStorageFull] = useState<string | null>(null);
 	const [threadWidth, setThreadWidth] = useState(DEFAULT_THREAD_WIDTH);
 	const [bodyWidth, setBodyWidth] = useState(0);
 	const [messagesSince, setMessagesSince] = useState<number | null>(null);
@@ -2752,7 +2720,6 @@ export function ChannelView(props: ChannelView_Props) {
 		},
 		onRequestStart: handle_request_start,
 		onRequestSettled: handle_request_settled,
-		onStorageFull: setStorageFull,
 	});
 
 	// Resolve author names for everything in view — and mentioned members, whose names the text
@@ -3033,7 +3000,6 @@ export function ChannelView(props: ChannelView_Props) {
 										onRequestStart={handle_request_start}
 										onRequestSettled={handle_request_settled}
 										onApplyReaction={apply_local_reaction}
-										onStorageFull={setStorageFull}
 									/>
 								),
 							)}
@@ -3079,8 +3045,6 @@ export function ChannelView(props: ChannelView_Props) {
 						reactionGroupsByTarget={reactionGroupsByTarget}
 						memberNames={memberNames}
 						isNarrow={isNarrow}
-						storageFull={storageFull}
-						onStorageFull={setStorageFull}
 						onApplyLocalRoot={apply_local_message}
 						onApplyLocalReply={apply_local_reply}
 						onRequestStart={handle_request_start}
@@ -3092,13 +3056,6 @@ export function ChannelView(props: ChannelView_Props) {
 					/>
 				) : null}
 			</div>
-			{/* One channel-level statement, not the same sentence repeated on every refused row.
-			    The server's own message is what separates "you are full" from "the plugin is full". */}
-			{storageFull !== null ? (
-				<div className="channel-status is-error" role="alert">
-					{storageFull}
-				</div>
-			) : null}
 			{sendInFlight ? (
 				<div className="channel-status" role="status">
 					Wait for pending message changes to finish before leaving this channel or thread.
@@ -3108,7 +3065,7 @@ export function ChannelView(props: ChannelView_Props) {
 				client={client}
 				label={`Message #${channel.value.name}`}
 				busy={queue.busy}
-				disabled={storageFull !== null}
+				disabled={false}
 				onSend={queue.send}
 			/>
 		</div>

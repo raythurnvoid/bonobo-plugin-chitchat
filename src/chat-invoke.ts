@@ -2,11 +2,11 @@ import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
 import { chat_get_error_message, type chat_BackendEndpointId } from "./chat-data";
 
 /**
- * Page-side wrapper for `client.backend.invoke`: waits out `busy` answers (the serialization
- * lock and the invoke rate bucket both answer `busy` with `retryAfterMs`), parses the backend's
- * relayed JSON, and maps everything into the `_yay`/`_nay` shape the page's write machinery
- * already speaks. `unavailable` stays `unavailable` — the run may have happened, so callers
- * replay with the same `clientRequestId`, exactly like the old append door.
+ * Page-side wrapper for the invoke route: waits out the held-back answers (409 is the
+ * serialization lock, 429 the rate bucket, and both may carry `retryAfterMs`), parses the
+ * backend's relayed JSON, and maps everything into the `_yay`/`_nay` shape the page's write
+ * machinery already speaks. A thrown answer becomes `unavailable` — the run may have happened,
+ * so callers replay with the same `clientRequestId`, exactly like the old append door.
  */
 
 const BUSY_RETRY_MAX_CALLS = 3;
@@ -22,6 +22,10 @@ export const chat_INVOKE_INPUT_MAX_BYTES = 30_000;
 export const chat_INVOKE_TOO_LARGE_MESSAGE = "This message is too long to send. Shorten it and try again.";
 
 export const chat_INVOKE_BUSY_MESSAGE = "Sending too fast — wait a moment and try again.";
+
+export const chat_INVOKE_SESSION_EXPIRED_MESSAGE = "This plugin session expired. Reload the page and try again.";
+
+export const chat_INVOKE_DENIED_MESSAGE = "This plugin may not run its backend here.";
 
 export type chat_InvokeResult = { _yay: Record<string, unknown> } | { _nay: { name: string; message: string } };
 
@@ -40,43 +44,63 @@ export async function chat_invoke_backend(
 ): Promise<chat_InvokeResult> {
 	try {
 		for (let call = 1; ; call += 1) {
-			const result = await client.backend.invoke({ endpoint, input });
-			if ("_nay" in result) {
-				if (result._nay.name === "busy" && call < BUSY_RETRY_MAX_CALLS) {
-					await wait(Math.min(result._nay.retryAfterMs ?? 1_000, BUSY_RETRY_MAX_WAIT_MS));
+			const answer = await client.fetchJson("/api/v1/plugin-backend/invoke", { endpoint, input });
+
+			// The host held the call back instead of running the backend. 429 without a hint is
+			// the plugin API call limit, so fall back to one second.
+			if (answer.status === 409 || answer.status === 429) {
+				if (call < BUSY_RETRY_MAX_CALLS) {
+					await wait(Math.min(answer.body.retryAfterMs ?? 1_000, BUSY_RETRY_MAX_WAIT_MS));
 					continue;
 				}
-				if (result._nay.name === "busy") {
-					return { _nay: { name: "busy", message: chat_INVOKE_BUSY_MESSAGE } };
-				}
-				return { _nay: { name: result._nay.name, message: result._nay.message } };
+				return { _nay: { name: "busy", message: chat_INVOKE_BUSY_MESSAGE } };
+			}
+
+			// A lapsed session and a revoked plugin look the same on the wire: the route answers
+			// 401 or 403 with one domain word. The session clock is the whole difference, and the
+			// two need different sentences, because one asks the member to reload and the other
+			// says this frame lost access.
+			if (answer.status === 401 || answer.status === 403) {
+				const message =
+					Date.now() >= client.session.expiresAt() ? chat_INVOKE_SESSION_EXPIRED_MESSAGE : chat_INVOKE_DENIED_MESSAGE;
+				return { _nay: { name: "refused", message } };
+			}
+
+			// The host refused the request itself: an unknown endpoint or a body over the 32 KiB
+			// cap. Both answers carry their own sentence, and 413 keeps the name the page's
+			// too-large handling listens for.
+			if (answer.status !== 200) {
+				return {
+					_nay: { name: answer.status === 413 ? "too_large" : "refused", message: answer.body.message },
+				};
 			}
 
 			let body: unknown = null;
 			try {
-				body = JSON.parse(result._yay.output);
+				body = JSON.parse(answer.body.output);
 			} catch {
 				body = null;
 			}
 			const bodyRecord = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
 
-			if (result._yay.pluginStatus >= 200 && result._yay.pluginStatus < 300) {
+			if (answer.body.pluginStatus >= 200 && answer.body.pluginStatus < 300) {
 				return { _yay: bodyRecord };
 			}
 
 			const message =
 				typeof bodyRecord.message === "string" && bodyRecord.message !== ""
 					? bodyRecord.message
-					: `The Chitchat backend refused this call (${result._yay.pluginStatus})`;
+					: `The Chitchat backend refused this call (${answer.body.pluginStatus})`;
 			// 409 keeps the name the page's conflict handling listens for; 413 marks both
 			// too-large states (the 16 KiB store cap relayed by the backend, like the 32 KiB
 			// pre-check above).
 			const name =
-				result._yay.pluginStatus === 409 ? "conflict" : result._yay.pluginStatus === 413 ? "too_large" : "refused";
+				answer.body.pluginStatus === 409 ? "conflict" : answer.body.pluginStatus === 413 ? "too_large" : "refused";
 			return { _nay: { name, message } };
 		}
 	} catch (error: unknown) {
-		// The SDK call itself resolves refusals, so a throw here is unexpected — treat it as
+		// Only a 5xx, a body that is not JSON, a refused session refresh, or a network failure
+		// throw now. The backend may have run in every one of those cases, so the outcome is
 		// uncertain, like a lost network answer.
 		return { _nay: { name: "unavailable", message: chat_get_error_message(error) } };
 	}

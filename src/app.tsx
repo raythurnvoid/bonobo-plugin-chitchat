@@ -28,7 +28,6 @@ import {
 	chat_mention_roster_refusal_copy,
 	chat_merge_cursor_maps,
 	chat_message_channel_key,
-	chat_plugin_data_read_response_schema,
 	chat_private_channel_key_is_valid,
 	chat_private_cursor_caller_key,
 	chat_PRIVATE_CHANNEL_COLLECTIONS,
@@ -1722,10 +1721,8 @@ export function App(props: { client: BonoboClient }) {
 				write.running = true;
 				const storedKey = `${chat_private_cursor_caller_key(write.channelKey)}:${userId}`;
 				client
-					.fetchJson("/api/v1/plugin-data/read", {
-						body: { collection: "channels", key: storedKey },
-					})
-					.then((raw: unknown) => {
+					.fetchJson("/api/v1/plugin-data/read", { collection: "channels", key: storedKey })
+					.then((answer) => {
 						if (privateCursorWritesRef.current.get(write.channelKey) !== write || write.cancelled) {
 							return;
 						}
@@ -1735,8 +1732,7 @@ export function App(props: { client: BonoboClient }) {
 							run_private_cursor_write(write);
 							return;
 						}
-						const response = chat_plugin_data_read_response_schema.safeParse(raw);
-						const cursor = response.success ? chat_validate_private_cursor_doc(response.data.document) : null;
+						const cursor = answer.status === 200 ? chat_validate_private_cursor_doc(answer.body.document) : null;
 						if (
 							cursor !== null &&
 							cursor.key === storedKey &&
@@ -2050,27 +2046,24 @@ export function App(props: { client: BonoboClient }) {
 
 				Promise.resolve()
 					.then(() =>
-						client.fetchJson("/api/v1/plugin-data/read", {
-							body: { collection: "channels", key: scope.scopeId },
-						}),
+						client.fetchJson("/api/v1/plugin-data/read", { collection: "channels", key: scope.scopeId }),
 					)
-					.then((raw: unknown) => {
+					.then((answer) => {
 						if (!is_current()) {
 							return;
 						}
-						const response = chat_plugin_data_read_response_schema.safeParse(raw);
-						if (!response.success) {
+						if (answer.status !== 200) {
 							reconciliation.running = false;
 							schedule_retry();
 							return;
 						}
-						if (response.data.document === null) {
+						if (answer.body.document === null) {
 							settle_absent();
 							return;
 						}
-						const channel = chat_validate_channel_doc(response.data.document);
+						const channel = chat_validate_channel_doc(answer.body.document);
 						if (
-							response.data.document.collection !== "channels" ||
+							answer.body.document.collection !== "channels" ||
 							channel === null ||
 							channel.key !== scope.scopeId ||
 							!chat_channel_is_private(channel.key)
@@ -2931,28 +2924,25 @@ export function App(props: { client: BonoboClient }) {
 		reconciliation.running = true;
 		Promise.resolve()
 			.then(() =>
-				client.fetchJson("/api/v1/plugin-data/read", {
-					body: { collection: "channels", key: reconciliation.channel.key },
-				}),
+				client.fetchJson("/api/v1/plugin-data/read", { collection: "channels", key: reconciliation.channel.key }),
 			)
-			.then((raw: unknown) => {
+			.then((answer) => {
 				if (!is_current()) {
 					return;
 				}
-				const response = chat_plugin_data_read_response_schema.safeParse(raw);
-				if (!response.success) {
+				if (answer.status !== 200) {
 					reconciliation.running = false;
 					schedule_retry();
 					return;
 				}
-				if (response.data.document === null) {
+				if (answer.body.document === null) {
 					reconciliation.running = false;
 					settle_departure();
 					return;
 				}
-				const channel = chat_validate_channel_doc(response.data.document);
+				const channel = chat_validate_channel_doc(answer.body.document);
 				if (
-					response.data.document.collection !== "channels" ||
+					answer.body.document.collection !== "channels" ||
 					channel === null ||
 					channel.key !== reconciliation.channel.key ||
 					!chat_channel_is_private(channel.key)
@@ -3154,29 +3144,26 @@ export function App(props: { client: BonoboClient }) {
 		reconciliation.running = true;
 		Promise.resolve()
 			.then(() =>
-				client.fetchJson("/api/v1/plugin-data/read", {
-					body: { collection: "channels", key: reconciliation.key },
-				}),
+				client.fetchJson("/api/v1/plugin-data/read", { collection: "channels", key: reconciliation.key }),
 			)
-			.then((raw: unknown) => {
+			.then((answer) => {
 				if (!is_current()) {
 					return;
 				}
-				const response = chat_plugin_data_read_response_schema.safeParse(raw);
-				if (!response.success) {
+				if (answer.status !== 200) {
 					reconciliation.running = false;
 					schedule_retry();
 					return;
 				}
-				if (response.data.document === null) {
+				if (answer.body.document === null) {
 					reconciliation.running = false;
 					// Null hides absent, released, and unreadable scopes. Keep the exact key until Cancel.
 					stop_with_locked_retry(PRIVATE_CREATE_READ_ABSENT_MESSAGE);
 					return;
 				}
-				const channel = chat_validate_channel_doc(response.data.document);
+				const channel = chat_validate_channel_doc(answer.body.document);
 				if (
-					response.data.document.collection !== "channels" ||
+					answer.body.document.collection !== "channels" ||
 					channel === null ||
 					channel.key !== reconciliation.key ||
 					!chat_channel_is_private(channel.key)

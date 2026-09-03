@@ -384,23 +384,21 @@ function window_update(docs: unknown[], overrides: Partial<Omit<WindowUpdate, "d
 type WriteResult = { _yay: { key: string; revision: number } } | { _nay: { name?: string; message: string } };
 type PutOpts = { collection: string; key: string; value: Record<string, unknown>; expectedRevision?: number };
 type InvokeOpts = { endpoint: string; input: Record<string, unknown> };
-type InvokeResult =
-	| { _yay: { runId: string; pluginStatus: number; output: string; outputTruncated: boolean } }
-	| { _nay: { name: string; message: string; retryAfterMs?: number } };
+type InvokeAnswer =
+	| { status: 200; body: { runId: string; pluginStatus: number; output: string; outputTruncated: boolean } }
+	| { status: 400 | 401 | 403 | 404 | 409 | 413 | 429; body: { message: string; retryAfterMs?: number } };
 
-/** Wraps a backend answer the way the invoke door delivers a finished run: the body as JSON text. */
-function invoke_ok(body: Record<string, unknown>, pluginStatus = 200): InvokeResult {
-	return { _yay: { runId: "run1", pluginStatus, output: JSON.stringify(body), outputTruncated: false } };
+/** Wraps a backend answer the way the invoke route delivers a finished run: the body as JSON text. */
+function invoke_ok(body: Record<string, unknown>, pluginStatus = 200): InvokeAnswer {
+	return {
+		status: 200,
+		body: { runId: "run1", pluginStatus, output: JSON.stringify(body), outputTruncated: false },
+	};
 }
 
-/** A relayed backend refusal: a non-2xx pluginStatus still resolves `_yay`, not `_nay`. */
-function invoke_refused(pluginStatus: number, message: string): InvokeResult {
+/** A relayed backend refusal: a non-2xx pluginStatus is still a 200 from the route. */
+function invoke_refused(pluginStatus: number, message: string): InvokeAnswer {
 	return invoke_ok({ message }, pluginStatus);
-}
-
-/** A door-level failure — busy, denied, unavailable — where the run may never have started. */
-function invoke_nay(name: string, message: string, retryAfterMs?: number): InvokeResult {
-	return { _nay: { name, message, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) } };
 }
 /** What `list_members` answers: a page, the consent refusal, or null for lost access. */
 /** The fakes answer raw server JSON, where a user id is a plain string, not the page's branded id. */
@@ -410,7 +408,6 @@ type MembersListAnswer = { members: FakeMember[]; cursor: string | null } | { re
 type ScopeChangeResult =
 	| { _yay: { scopeId: string; deleted: boolean; membershipRevision: number } }
 	| { _nay: { name?: string; message: string } };
-type FetchInit = { method?: string; headers?: Record<string, string>; body?: Record<string, unknown> };
 type ScopeEntry = {
 	scopeId: string;
 	keyPrefix: string;
@@ -614,11 +611,11 @@ function make_harness() {
 		apiOrigin: "https://api.example",
 		getToken: vi.fn(async () => "tok"),
 		refreshToken: vi.fn(async () => "tok"),
-		fetchJson: vi.fn<(path: string, init?: FetchInit) => Promise<unknown>>(async (path: string) => {
+		fetchJson: vi.fn<(path: string, body?: Record<string, unknown>) => Promise<unknown>>(async (path: string) => {
 			// Companion HTTP lists run after the first timeline delivery. An empty finished page
 			// covers every rendered row, which is the ordinary test default.
 			if (path === "/api/v1/plugin-data/list") {
-				return { documents: [], cursor: null, isDone: true };
+				return http_page([], true);
 			}
 			throw new Error("fetchJson not stubbed");
 		}),
@@ -647,11 +644,11 @@ function make_harness() {
 			expiresAt: vi.fn(() => Date.now() + 60 * 60 * 1_000),
 			fetchJwt: vi.fn(async () => "tok"),
 		},
-		backend: {
-			// Messages, replies, reactions, and channel create/update go through the plugin backend
-			// now. The defaults mirror what the worker answers on a clean run; a test overrides the
-			// mock for refusals, lost answers, and replay checks.
-			invoke: vi.fn<(opts: InvokeOpts) => Promise<InvokeResult>>(async (opts) => {
+		// Messages, replies, reactions, and channel create/update go through the plugin backend
+		// now. The defaults mirror what the worker answers on a clean run; a test overrides the
+		// mock for refusals, lost answers, and replay checks. The page reaches this through
+		// `fetchJson` on the invoke route; the dispatcher below sends that route here.
+		invoke: vi.fn<(opts: InvokeOpts) => Promise<InvokeAnswer>>(async (opts) => {
 				const input = opts.input;
 				switch (opts.endpoint) {
 					case "message-send":
@@ -676,11 +673,10 @@ function make_harness() {
 						return invoke_ok({});
 					case "reconcile":
 						return invoke_ok({ done: true });
-					default:
-						return invoke_refused(404, "Unknown endpoint");
-				}
-			}),
-		},
+				default:
+					return invoke_refused(404, "Unknown endpoint");
+			}
+		}),
 		doors,
 		scopes,
 		theme: {
@@ -740,8 +736,16 @@ function make_harness() {
 		}
 		sub.onUpdate(null);
 	};
+	// The page knows one route table, so the invoke route arrives at `fetchJson` like any other.
+	// The harness keeps the backend fake as its own mock, so a test can queue backend runs without
+	// touching the HTTP stub, and `without_open_reconcile` can swap one of them alone.
+	const sdk_client = {
+		...client,
+		fetchJson: (path: string, body?: Record<string, unknown>) =>
+			path === "/api/v1/plugin-backend/invoke" ? client.invoke(body as InvokeOpts) : client.fetchJson(path, body),
+	};
 	return {
-		client: client as unknown as BonoboClient,
+		client: sdk_client as unknown as BonoboClient,
 		raw: client,
 		get watches() {
 			return subs_of("watch_documents") as unknown as WatchSub[];
@@ -788,16 +792,16 @@ async function without_open_reconcile<T>(
 	open: () => Promise<T>,
 	opensChannel = true,
 ) {
-	const invoke = h.raw.backend.invoke;
-	const stub = vi.fn<(opts: InvokeOpts) => Promise<InvokeResult>>(async () => invoke_ok({ done: true }));
-	h.raw.backend.invoke = stub;
+	const invoke = h.raw.invoke;
+	const stub = vi.fn<(opts: InvokeOpts) => Promise<InvokeAnswer>>(async () => invoke_ok({ done: true }));
+	h.raw.invoke = stub;
 
 	const opened = await open();
 	if (opensChannel) {
 		await waitFor(() => expect(stub).toHaveBeenCalledWith({ endpoint: "reconcile", input: expect.anything() }));
 	}
 
-	h.raw.backend.invoke = invoke;
+	h.raw.invoke = invoke;
 	return opened;
 }
 
@@ -818,24 +822,29 @@ async function boot(h: ReturnType<typeof make_harness>, channels: unknown[] = [c
 }
 
 function list_calls(h: ReturnType<typeof make_harness>, collection?: string) {
-	return h.raw.fetchJson.mock.calls.filter(([path, init]) => {
+	return h.raw.fetchJson.mock.calls.filter(([path, callBody]) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			return false;
 		}
 		if (collection === undefined) {
 			return true;
 		}
-		return (init?.body as { collection?: string } | undefined)?.collection === collection;
+		return (callBody as { collection?: string } | undefined)?.collection === collection;
 	});
 }
 
 function http_page(documents: unknown[], isDone: boolean) {
-	return { documents, cursor: null, isDone };
+	return { status: 200, body: { documents, cursor: null, isDone } };
+}
+
+/** One `plugin-data/read` answer. A missing document is `null`, exactly like the door's. */
+function http_read(document: unknown) {
+	return { status: 200, body: { document } };
 }
 
 /** The invoke calls the page made, optionally narrowed to one endpoint, as their `{endpoint, input}` opts. */
 function invoke_calls(h: ReturnType<typeof make_harness>, endpoint?: string) {
-	return h.raw.backend.invoke.mock.calls
+	return h.raw.invoke.mock.calls
 		.map(([opts]) => opts)
 		.filter((opts) => endpoint === undefined || opts.endpoint === endpoint);
 }
@@ -1113,8 +1122,8 @@ test("a narrow resize keeps focus in an open drawer that stays visible", async (
 
 test("a narrow resize focuses the thread region while its Back button is disabled", async () => {
 	const h = make_harness();
-	const ack = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(ack.promise);
+	const ack = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(ack.promise);
 	set_viewport_narrow(false);
 	await boot(h);
 	const message = message_doc(1_000, { rand: "thread", text: "thread root" });
@@ -1270,7 +1279,7 @@ test("opening a channel reconciles it, and a switch reconciles the channel switc
 
 test("a refused reconcile leaves the channel usable and shows no alert", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockImplementation(async (opts: InvokeOpts) => {
+	h.raw.invoke.mockImplementation(async (opts: InvokeOpts) => {
 		if (opts.endpoint === "reconcile") {
 			return invoke_refused(503, "Files service unavailable");
 		}
@@ -1400,7 +1409,7 @@ test("create channel dialog validates the name and sends the create through the 
 	// Empty name refused locally, nothing sent.
 	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
 	expect(await within(dialog).findByRole("alert")).toBeTruthy();
-	expect(h.raw.backend.invoke).not.toHaveBeenCalled();
+	expect(h.raw.invoke).not.toHaveBeenCalled();
 
 	fireEvent.input(within(dialog).getByLabelText("Channel name"), { target: { value: "general" } });
 	fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
@@ -1417,7 +1426,7 @@ test("create channel dialog validates the name and sends the create through the 
 
 test("an unavailable public create retries the same create request, which the backend dedupes", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
+	h.raw.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
 	await boot(h, []);
 
 	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
@@ -1448,7 +1457,7 @@ test("an unavailable public create retries the same create request, which the ba
 
 test("a first public create conflict unlocks the form and a new submit uses a fresh request", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "Channel already exists"));
+	h.raw.invoke.mockResolvedValueOnce(invoke_refused(409, "Channel already exists"));
 	await boot(h, []);
 
 	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
@@ -1498,7 +1507,7 @@ test("a non-creator can rename a channel: the backend update succeeds and the di
 
 test("a rename conflict keeps the dialog open with a clear error", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
+	h.raw.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 	await boot(h, [{ ...channel_doc(CH1_KEY, "general"), revision: 4 }]);
 
 	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
@@ -1514,46 +1523,39 @@ test("a rename conflict keeps the dialog open with a clear error", async () => {
 	expect(screen.getByRole("dialog")).toBeTruthy();
 });
 
-test.each(["unavailable", "thrown"] as const)(
-	"an %s rename locks its exact request until a retry and matching watch settle it",
-	async (failure) => {
-		const h = make_harness();
-		if (failure === "unavailable") {
-			h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
-		} else {
-			h.raw.backend.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
-		}
-		h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
-		await boot(h);
+test("an uncertain rename locks its exact request until a retry and matching watch settle it", async () => {
+	const h = make_harness();
+	h.raw.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
+	h.raw.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
+	await boot(h);
 
-		fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
-		const dialog = await screen.findByRole("dialog");
-		const name = within(dialog).getByLabelText("Channel name") as HTMLInputElement;
-		const topic = within(dialog).getByLabelText("Topic (optional)") as HTMLInputElement;
-		fireEvent.input(name, { target: { value: "renamed" } });
-		fireEvent.input(topic, { target: { value: "daily updates" } });
-		fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
+	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
+	const dialog = await screen.findByRole("dialog");
+	const name = within(dialog).getByLabelText("Channel name") as HTMLInputElement;
+	const topic = within(dialog).getByLabelText("Topic (optional)") as HTMLInputElement;
+	fireEvent.input(name, { target: { value: "renamed" } });
+	fireEvent.input(topic, { target: { value: "daily updates" } });
+	fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
 
-		expect((await within(dialog).findByRole("alert")).textContent).toContain("Connection lost after send");
-		expect(name.disabled).toBe(true);
-		expect(topic.disabled).toBe(true);
-		expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
-		fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
+	expect((await within(dialog).findByRole("alert")).textContent).toContain("Connection lost after send");
+	expect(name.disabled).toBe(true);
+	expect(topic.disabled).toBe(true);
+	expect((within(dialog).getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+	fireEvent.click(within(dialog).getByRole("button", { name: "Retry" }));
 
-		await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(2));
-		const [firstUpdate, retryUpdate] = invoke_calls(h, "channel-manage");
-		expect(retryUpdate!.input).toEqual(firstUpdate!.input);
-		h.find_watch("channels")!.onUpdate(
-			watch_update([{ ...channel_doc(CH1_KEY, "renamed", null, { topic: "daily updates" }), revision: 2 }]),
-		);
+	await waitFor(() => expect(invoke_calls(h, "channel-manage")).toHaveLength(2));
+	const [firstUpdate, retryUpdate] = invoke_calls(h, "channel-manage");
+	expect(retryUpdate!.input).toEqual(firstUpdate!.input);
+	h.find_watch("channels")!.onUpdate(
+		watch_update([{ ...channel_doc(CH1_KEY, "renamed", null, { topic: "daily updates" }), revision: 2 }]),
+	);
 
-		await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-	},
-);
+	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+});
 
 test("an uncertain rename settles when its name and topic arrive with a concurrent archive", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
+	h.raw.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
 	await boot(h);
 
 	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
@@ -1572,8 +1574,8 @@ test("an uncertain rename settles when its name and topic arrive with a concurre
 
 test("Escape cannot dismiss a channel-name dialog while its write is pending", async () => {
 	const h = make_harness();
-	const pendingInvoke = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
+	const pendingInvoke = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h);
 
 	fireEvent.click(await open_channel_menu_item("general", "Rename #general"));
@@ -1592,8 +1594,8 @@ test("Escape cannot dismiss a channel-name dialog while its write is pending", a
 
 test("Escape cannot dismiss the archive dialog while its write is pending", async () => {
 	const h = make_harness();
-	const pendingInvoke = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
+	const pendingInvoke = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h);
 
 	fireEvent.click(await open_channel_menu_item("general", "Archive #general"));
@@ -1607,19 +1609,12 @@ test("Escape cannot dismiss the archive dialog while its write is pending", asyn
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 });
 
-test.each([
-	{ failure: "unavailable", matchingWatch: true },
-	{ failure: "thrown", matchingWatch: false },
-] as const)(
-	"an uncertain archive after a $failure result retries exactly and settles from the watch",
+test.each([{ matchingWatch: true }, { matchingWatch: false }] as const)(
+	"an uncertain archive retries exactly and settles from the watch (matchingWatch=$matchingWatch)",
 	async (testCase) => {
 		const h = make_harness();
-		if (testCase.failure === "unavailable") {
-			h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
-		} else {
-			h.raw.backend.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
-		}
-		h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
+		h.raw.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
+		h.raw.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 		await boot(h);
 
 		fireEvent.click(await open_channel_menu_item("general", "Archive #general"));
@@ -1659,8 +1654,8 @@ test.each([
 
 test("keyboard archive repairs focus after the channel watch moves the row", async () => {
 	const h = make_harness();
-	const pendingInvoke = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
+	const pendingInvoke = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1683,8 +1678,8 @@ test("keyboard archive repairs focus after the channel watch moves the row", asy
 
 test("keyboard unarchive repairs focus after the channel watch moves the row", async () => {
 	const h = make_harness();
-	const pendingInvoke = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
+	const pendingInvoke = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1724,7 +1719,7 @@ test("a delayed unarchive watch keeps focus on the control the member moved to",
 
 test("archive repairs focus when its response is lost before the committed watch update", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
+	h.raw.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
 	await boot(h);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1747,7 +1742,7 @@ test("archive repairs focus when its response is lost before the committed watch
 
 test("unarchive repairs focus when its response is lost before the committed watch update", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
+	h.raw.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
 	const utils = await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1766,7 +1761,7 @@ test("unarchive repairs focus when its response is lost before the committed wat
 
 test("archive conflict repairs focus when the winner arrives through the watch", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
+	h.raw.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 	await boot(h);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1785,7 +1780,7 @@ test("archive conflict repairs focus when the winner arrives through the watch",
 
 test("unarchive conflict repairs focus when the winner arrives through the watch", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
+	h.raw.invoke.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 	const utils = await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
 	const nav = screen.getByRole("navigation", { name: "Channels" });
 
@@ -1804,7 +1799,7 @@ test("unarchive conflict repairs focus when the winner arrives through the watch
 
 test("a missing background private channel settles unarchive and repairs focus", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "Connection lost after send"));
+	h.raw.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
 	const utils = await boot_sidebar(
 		h,
 		[channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans", 123)],
@@ -1826,8 +1821,8 @@ test("a missing background private channel settles unarchive and repairs focus",
 
 test("one conflicted unarchive cannot remove an overlapping successful request's focus repair", async () => {
 	const h = make_harness();
-	const successfulInvoke = deferred<InvokeResult>();
-	h.raw.backend.invoke
+	const successfulInvoke = deferred<InvokeAnswer>();
+	h.raw.invoke
 		.mockReturnValueOnce(successfulInvoke.promise)
 		.mockResolvedValueOnce(invoke_refused(409, "This document changed since it was read"));
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "old-stuff", 123)]);
@@ -1856,7 +1851,7 @@ test("one conflicted unarchive cannot remove an overlapping successful request's
 
 test("a newer opposite update discards an uncertain move without stealing focus later", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
+	h.raw.invoke.mockRejectedValueOnce(new Error("Connection lost after send"));
 	await boot(h);
 
 	fireEvent.click(await open_channel_menu_item("general", "Archive #general"));
@@ -2085,7 +2080,7 @@ test("Enter sends, Shift+Enter does not, and the send invokes the backend under 
 	const input = await screen.findByRole("combobox", { name: "Message #general" });
 	fireEvent.input(input, { target: { value: "line one" } });
 	fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
-	expect(h.raw.backend.invoke).not.toHaveBeenCalled();
+	expect(h.raw.invoke).not.toHaveBeenCalled();
 
 	fireEvent.keyDown(input, { key: "Enter" });
 	await waitFor(() => expect(invoke_calls(h, "message-send")).toHaveLength(1));
@@ -2099,8 +2094,8 @@ test("Enter sends, Shift+Enter does not, and the send invokes the backend under 
 
 test("an in-flight send disables Send, shows the pending row, and the ack keeps the message", async () => {
 	const h = make_harness();
-	const ack = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(ack.promise);
+	const ack = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(ack.promise);
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
@@ -2122,8 +2117,8 @@ test("an in-flight send disables Send, shows the pending row, and the ack keeps 
 
 test("an in-flight top-level send blocks a channel switch, and a late failure keeps Retry visible", async () => {
 	const h = make_harness();
-	const ack = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(ack.promise);
+	const ack = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(ack.promise);
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
@@ -2157,7 +2152,7 @@ test("an in-flight top-level send blocks a channel switch, and a late failure ke
 
 test("a failed send surfaces the refusal message and Retry reuses the same clientRequestId", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(429, "Rate limited — try again in a few seconds"));
+	h.raw.invoke.mockResolvedValueOnce(invoke_refused(429, "Rate limited — try again in a few seconds"));
 	await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
@@ -2185,33 +2180,9 @@ test("a failed send surfaces the refusal message and Retry reuses the same clien
 	expect(invoke_calls(h, "message-send")[2]!.input.clientRequestId).not.toBe(firstId);
 });
 
-test("a storage_full refusal becomes one announced channel state and stops the composer", async () => {
-	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(
-		invoke_nay("storage_full", "This plugin has used its 10000 document slots"),
-	);
-	await boot(h);
-	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
-
-	fireEvent.input(screen.getByRole("combobox", { name: "Message #general" }), { target: { value: "hello" } });
-	fireEvent.click(screen.getByRole("button", { name: "Send" }));
-
-	// A full store is the channel's state, not this row's error. The server's own message is the
-	// only thing that separates "you are full" from "the plugin is full", so it is what shows.
-	const alert = await screen.findByText("This plugin has used its 10000 document slots");
-	expect(alert.getAttribute("role")).toBe("alert");
-	expect(alert.closest(".message")).toBeNull();
-	await waitFor(() => expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true));
-
-	// The failed row keeps its retry, but not a second copy of the same sentence.
-	const failedRow = screen.getByText("hello").closest(".message") as HTMLElement;
-	expect(within(failedRow).queryByText(/document slots/)).toBeNull();
-	expect(within(failedRow).getByRole("button", { name: "Retry sending message" })).toBeTruthy();
-});
-
 test("an unavailable send retry timer stops when the page unmounts", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValue(invoke_nay("unavailable", "Reply lost"));
+	h.raw.invoke.mockRejectedValue(new Error("Reply lost"));
 	const { unmount } = await boot(h);
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([]));
 
@@ -2222,13 +2193,13 @@ test("an unavailable send retry timer stops when the page unmounts", async () =>
 			fireEvent.keyDown(composer_box("Message #general"), { key: "Enter" });
 			await Promise.resolve();
 		});
-		expect(h.raw.backend.invoke).toHaveBeenCalledTimes(1);
+		expect(h.raw.invoke).toHaveBeenCalledTimes(1);
 
 		unmount();
 		await act(async () => {
 			await vi.advanceTimersByTimeAsync(60_000);
 		});
-		expect(h.raw.backend.invoke).toHaveBeenCalledTimes(1);
+		expect(h.raw.invoke).toHaveBeenCalledTimes(1);
 	} finally {
 		vi.useRealTimers();
 	}
@@ -2240,8 +2211,8 @@ test("an unavailable send retry timer stops when the page unmounts", async () =>
 
 test("a remote arrival announces author and preview; the user's own send never announces", async () => {
 	const h = make_harness();
-	const ack = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(ack.promise);
+	const ack = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(ack.promise);
 	const { container } = await boot(h);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	messages.onUpdate(window_update([]));
@@ -2424,8 +2395,8 @@ test("Cancel closes an edit and restores focus to its Edit button", async () => 
 
 test("a pending message edit freezes its draft and ignores Escape until a refusal settles", async () => {
 	const h = make_harness();
-	const pendingInvoke = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
+	const pendingInvoke = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
@@ -2454,9 +2425,9 @@ test("a pending message edit freezes its draft and ignores Escape until a refusa
 
 test("an unavailable message edit retries the exact write and stays locked until its watch echo", async () => {
 	const h = make_harness();
-	const firstInvoke = deferred<InvokeResult>();
-	const retryInvoke = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(firstInvoke.promise).mockReturnValueOnce(retryInvoke.promise);
+	const firstInvoke = deferred<InvokeAnswer>();
+	const retryInvoke = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(firstInvoke.promise).mockReturnValueOnce(retryInvoke.promise);
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
@@ -2486,8 +2457,12 @@ test("an unavailable message edit retries the exact write and stays locked until
 	expect(submitted.input.text).toBe("submitted once");
 
 	await act(async () => {
-		firstInvoke.resolve(invoke_nay("unavailable", "The edit result was lost"));
-		await firstInvoke.promise;
+		firstInvoke.reject(new Error("The edit result was lost"));
+		try {
+			await firstInvoke.promise;
+		} catch {
+			// The row turns the transport rejection into the exact retry state below.
+		}
 	});
 	expect((await within(panel).findByRole("alert")).textContent).toContain("The edit result was lost");
 	expect(editBox.readOnly).toBe(true);
@@ -2527,7 +2502,7 @@ test("an unavailable message edit retries the exact write and stays locked until
 
 test("a newer different watch value settles an uncertain edit as a conflict", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "The edit result was lost"));
+	h.raw.invoke.mockRejectedValueOnce(new Error("The edit result was lost"));
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
@@ -2562,7 +2537,7 @@ test("a newer different watch value settles an uncertain edit as a conflict", as
 
 test("a newer tombstone ends an uncertain edit and focuses the stable message row", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "The edit result was lost"));
+	h.raw.invoke.mockRejectedValueOnce(new Error("The edit result was lost"));
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	const doc = message_doc(1_000, { rand: "mine", text: "before", createdBy: "user_me" });
@@ -2661,8 +2636,8 @@ test("deleting an own message confirms in a dialog, puts a tombstone, and render
 
 test("Escape cannot close a delete confirmation while its write is pending", async () => {
 	const h = make_harness();
-	const pendingInvoke = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(pendingInvoke.promise);
+	const pendingInvoke = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(pendingInvoke.promise);
 	await boot(h);
 	const doc = message_doc(1_000, { rand: "mine", text: "to remove", createdBy: "user_me" });
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
@@ -2684,9 +2659,9 @@ test("Escape cannot close a delete confirmation while its write is pending", asy
 
 test("a thrown message delete retries the exact tombstone and stays locked until its watch echo", async () => {
 	const h = make_harness();
-	const firstInvoke = deferred<InvokeResult>();
-	const retryInvoke = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(firstInvoke.promise).mockReturnValueOnce(retryInvoke.promise);
+	const firstInvoke = deferred<InvokeAnswer>();
+	const retryInvoke = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(firstInvoke.promise).mockReturnValueOnce(retryInvoke.promise);
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	const doc = message_doc(1_000, { rand: "mine", text: "to remove", createdBy: "user_me" });
@@ -2738,7 +2713,7 @@ test("a thrown message delete retries the exact tombstone and stays locked until
 
 test("a newer live message settles an uncertain delete as a conflict", async () => {
 	const h = make_harness();
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "The delete result was lost"));
+	h.raw.invoke.mockRejectedValueOnce(new Error("The delete result was lost"));
 	await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 	const messages = h.find_window("messages", `${CH1_KEY}:`)!;
 	const doc = message_doc(1_000, { rand: "mine", text: "to remove", createdBy: "user_me" });
@@ -2815,7 +2790,7 @@ test("a second edit follows the first before any watch echo, and a conflict keep
 	expect(await screen.findByText("third")).toBeTruthy();
 
 	// A backend conflict is a real refusal, and the row says so without changing what it shows.
-	h.raw.backend.invoke.mockResolvedValueOnce(invoke_refused(409, "Revision mismatch"));
+	h.raw.invoke.mockResolvedValueOnce(invoke_refused(409, "Revision mismatch"));
 	await save("fourth");
 	expect(await screen.findByText("Revision mismatch")).toBeTruthy();
 	expect(invoke_calls(h, "message-edit")[2]!.input.text).toBe("fourth");
@@ -2912,11 +2887,11 @@ async function boot_two_roots(
 	await boot(h);
 	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
 	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const body = init?.body as { collection?: string; keyStartExclusive?: string } | undefined;
+		const body = requestBody as { collection?: string; keyStartExclusive?: string } | undefined;
 		const collection = body?.collection;
 		// A lagging first page would otherwise catch up immediately. Hold later pages so the
 		// frontier stays where the test put it.
@@ -2959,11 +2934,11 @@ test("an initial pending reactions list stays neutral until its result arrives",
 	await boot(h);
 	const root = message_doc(2_000, { rand: "newr", text: "pending reactions" });
 	const pendingReactions = deferred<unknown>();
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		return collection === "reactions" ? pendingReactions.promise : http_page([], true);
 	});
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
@@ -3018,11 +2993,11 @@ test("an incomplete companion list makes every row uncovered, however deep it re
 	await boot(h);
 	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
 	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions" || collection === "replies") {
 			throw new Error("companion list failed");
 		}
@@ -3042,11 +3017,11 @@ test("an incomplete companion list makes every row uncovered, however deep it re
 test("an incomplete companion list is reported to the member", async () => {
 	const h = make_harness();
 	await boot(h);
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			throw new Error("companion list failed");
 		}
@@ -3071,11 +3046,11 @@ test("a failed companion list retries on the backoff timer without a feed", asyn
 	const root = message_doc(2_000, { rand: "newr", text: "new root" });
 	const heart = reaction_doc(root.key, "heart", "user_other");
 	let reactionLists = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			reactionLists += 1;
 			if (reactionLists === 1) {
@@ -3115,11 +3090,11 @@ test("an empty non-final companion page is incomplete and retries", async () => 
 	const root = message_doc(2_000, { rand: "newr", text: "new root" });
 	const heart = reaction_doc(root.key, "heart", "user_other");
 	let reactionLists = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			reactionLists += 1;
 			return reactionLists === 1 ? http_page([], false) : http_page([heart], true);
@@ -3156,11 +3131,11 @@ test("a failed companion list retries with backoff until it succeeds and then st
 	const root = message_doc(2_000, { rand: "newr", text: "new root" });
 	const heart = reaction_doc(root.key, "heart", "user_other");
 	let reactionLists = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			reactionLists += 1;
 			if (reactionLists <= 3) {
@@ -3217,11 +3192,11 @@ test("a dead incomplete companion list does not keep retrying on the backoff tim
 	vi.useFakeTimers();
 	const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
 	const root = message_doc(2_000, { rand: "newr", text: "new root" });
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			throw new Error("companion list failed");
 		}
@@ -3260,11 +3235,11 @@ test("a failed companion list retries when that collection's feed delivers", asy
 	const root = message_doc(2_000, { rand: "newr", text: "new root" });
 	const heart = reaction_doc(root.key, "heart", "user_other");
 	let reactionLists = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			reactionLists += 1;
 			if (reactionLists === 1) {
@@ -3310,11 +3285,11 @@ test("a dead incomplete companion list does not retry when the tab becomes visib
 	vi.useFakeTimers();
 	const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
 	const root = message_doc(2_000, { rand: "newr", text: "new root" });
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			throw new Error("companion list failed");
 		}
@@ -3351,11 +3326,11 @@ test("an in-flight companion list does not start backoff after a channel switch"
 	vi.useFakeTimers();
 	const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
 	const pendingReactions = deferred<unknown>();
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			return pendingReactions.promise;
 		}
@@ -3364,7 +3339,7 @@ test("an in-flight companion list does not start backoff after a channel switch"
 	const ch1Prefix = `${CH1_KEY}:`;
 	const lists_for_ch1 = () =>
 		list_calls(h, "reactions").filter(
-			([, init]) => (init?.body as { keyPrefix?: string } | undefined)?.keyPrefix === ch1Prefix,
+			([, callBody]) => (callBody as { keyPrefix?: string } | undefined)?.keyPrefix === ch1Prefix,
 		);
 	try {
 		await act(async () => {
@@ -3400,11 +3375,11 @@ test("a companion list that finishes after the feed dies does not clear death", 
 	const root = message_doc(2_000, { rand: "newr", text: "new root" });
 	const heart = reaction_doc(root.key, "heart", "user_other");
 	const pendingReactions = deferred<unknown>();
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			return pendingReactions.promise;
 		}
@@ -3471,11 +3446,11 @@ test("a failed reactions list hides a cached thread-root chip", async () => {
 	const h = make_harness();
 	await boot(h);
 	const root = message_doc(1_000, { rand: "root", text: "failed thread root" });
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			throw new Error("reaction list failed");
 		}
@@ -3505,11 +3480,11 @@ test("a dead reactions feed hides stale chips on the thread root and its reply",
 	};
 	const rootHeart = reaction_doc(root.key, "heart", "user_me");
 	const replyParty = reaction_doc(reply.key, "party", "user_other");
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			return http_page([rootHeart, replyParty], true);
 		}
@@ -3548,11 +3523,11 @@ test("reply counts follow the replies list: covered roots get counts, the deepes
 		collection: "replies",
 		key: `${rootNew.key}:${inv(2_000 + index)}:r${index}`,
 	}));
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const body = init?.body as { collection?: string; keyStartExclusive?: string } | undefined;
+		const body = requestBody as { collection?: string; keyStartExclusive?: string } | undefined;
 		if (body?.collection === "replies") {
 			if (body.keyStartExclusive !== undefined) {
 				return new Promise(() => {});
@@ -3571,11 +3546,11 @@ test("a finished replies list claims an exact count on every rendered root", asy
 	await boot(h);
 	const rootNew = message_doc(2_000, { rand: "newr", text: "new root" });
 	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "replies") {
 			return http_page(
 				[
@@ -3626,8 +3601,8 @@ test("the thread panel opens with focus inside, replies append under the root, c
 
 test("an in-flight reply blocks a thread switch, and a late failure keeps Retry visible", async () => {
 	const h = make_harness();
-	const ack = deferred<InvokeResult>();
-	h.raw.backend.invoke.mockReturnValueOnce(ack.promise);
+	const ack = deferred<InvokeAnswer>();
+	h.raw.invoke.mockReturnValueOnce(ack.promise);
 	await boot(h);
 	const rootA = message_doc(1_000, { rand: "aaam", text: "root a" });
 	const rootB = message_doc(2_000, { rand: "bbbm", text: "root b" });
@@ -3638,11 +3613,11 @@ test("an in-flight reply blocks a thread switch, and a late failure keeps Retry 
 	const rowA = screen.getByText("root a").closest("[data-key]") as HTMLElement;
 	fireEvent.click(within(rowA).getByRole("button", { name: "Reply in thread" }));
 	const panel = await screen.findByRole("region", { name: "Thread" });
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
+		const body = requestBody as { collection?: string; keyPrefix?: string } | undefined;
 		if (body?.collection === "replies" && body.keyPrefix === `${rootA.key}:`) {
 			return http_page(
 				[
@@ -3709,11 +3684,11 @@ test("a thread whose replies list is cut says so in the panel", async () => {
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 	await screen.findByText("root row");
 	await wait_for_companion_lists(h);
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
+		const body = requestBody as { collection?: string; keyPrefix?: string } | undefined;
 		if (body?.collection === "replies" && body.keyPrefix === `${doc.key}:`) {
 			return http_page(
 				Array.from({ length: 100 }, (_, index) => ({
@@ -3736,11 +3711,11 @@ test("a dead replies feed makes an exact count read unknown", async () => {
 	const h = make_harness();
 	await boot(h);
 	const root = message_doc(1_000, { rand: "root", text: "counted root" });
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "replies") {
 			return http_page([{ ...message_doc(900, {}), collection: "replies", key: `${root.key}:${inv(900)}:r0` }], true);
 		}
@@ -3758,11 +3733,11 @@ test("the thread summary is body content on a root with replies, outside the hov
 	const h = make_harness();
 	await boot(h);
 	const root = message_doc(1_000, { rand: "root", text: "summarised root" });
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "replies") {
 			return http_page(
 				[
@@ -3804,11 +3779,11 @@ test("a failed thread replies list is reported and does not sit on Loading repli
 	h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([doc]));
 	await screen.findByText("thread root");
 	await wait_for_companion_lists(h);
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const body = init?.body as { collection?: string; keyPrefix?: string } | undefined;
+		const body = requestBody as { collection?: string; keyPrefix?: string } | undefined;
 		if (body?.collection === "replies" && body.keyPrefix === `${doc.key}:`) {
 			throw new Error("thread list failed");
 		}
@@ -4156,11 +4131,11 @@ test("the catch-up loop lists another companion page after every delivery", asyn
 	const rootOld = message_doc(1_000, { rand: "oldr", text: "old root" });
 	const rootOldest = message_doc(500, { rand: "olds", text: "oldest root" });
 	let reactionPages = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			reactionPages += 1;
 			if (reactionPages === 1) {
@@ -4219,11 +4194,11 @@ test("private same-millisecond roots do not collapse at the companion frontier",
 	};
 	let reactionPages = 0;
 	let replyPages = 0;
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path !== "/api/v1/plugin-data/list") {
 			throw new Error("fetchJson not stubbed");
 		}
-		const collection = (init?.body as { collection?: string } | undefined)?.collection;
+		const collection = (requestBody as { collection?: string } | undefined)?.collection;
 		if (collection === "reactions") {
 			reactionPages += 1;
 			return reactionPages === 1
@@ -4246,8 +4221,8 @@ test("private same-millisecond roots do not collapse at the companion frontier",
 
 	const reactionCalls = list_calls(h, "reactions");
 	const replyCalls = list_calls(h, "replies");
-	expect(reactionCalls[1]?.[1]?.body).toMatchObject({ keyStartExclusive: firstReaction.key });
-	expect(replyCalls[1]?.[1]?.body).toMatchObject({ keyStartExclusive: firstReply.key });
+	expect(reactionCalls[1]?.[1]).toMatchObject({ keyStartExclusive: firstReaction.key });
+	expect(replyCalls[1]?.[1]).toMatchObject({ keyStartExclusive: firstReply.key });
 	expect(within(oldRow).getByRole("button", { name: "Party, 1 reaction" })).toBeTruthy();
 	expect(within(oldRow).getByRole("button", { name: /^1 reply/ })).toBeTruthy();
 });
@@ -4277,11 +4252,11 @@ test("invalid full companion pages advance from their raw envelope keys", async 
 		};
 		let reactionPages = 0;
 		let replyPages = 0;
-		h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+		h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 			if (path !== "/api/v1/plugin-data/list") {
 				throw new Error("fetchJson not stubbed");
 			}
-			const collection = (init?.body as { collection?: string } | undefined)?.collection;
+			const collection = (requestBody as { collection?: string } | undefined)?.collection;
 			if (collection === "reactions") {
 				reactionPages += 1;
 				return reactionPages === 1
@@ -4302,10 +4277,10 @@ test("invalid full companion pages advance from their raw envelope keys", async 
 			expect(list_calls(h, "replies")).toHaveLength(2);
 		});
 
-		expect(list_calls(h, "reactions")[1]?.[1]?.body).toMatchObject({
+		expect(list_calls(h, "reactions")[1]?.[1]).toMatchObject({
 			keyStartExclusive: invalidReactions.at(-1)!.key,
 		});
-		expect(list_calls(h, "replies")[1]?.[1]?.body).toMatchObject({
+		expect(list_calls(h, "replies")[1]?.[1]).toMatchObject({
 			keyStartExclusive: invalidReplies.at(-1)!.key,
 		});
 		expect(within(oldRow).getByRole("button", { name: "Party, 1 reaction" })).toBeTruthy();
@@ -4327,9 +4302,12 @@ test("one click resolves the whole message in a single request; a per-file error
 		}
 		if (path === "/api/v1/files/download-urls") {
 			return {
-				items: [{ fileNodeId: "n1", url: "https://signed.example/n1", expiresAt: Date.now() + 600_000 }],
-				errors: [{ fileNodeId: "n2", message: "Permission denied" }],
-				truncated: false,
+				status: 200,
+				body: {
+					items: [{ fileNodeId: "n1", url: "https://signed.example/n1", expiresAt: Date.now() + 600_000 }],
+					errors: [{ fileNodeId: "n2", message: "Permission denied" }],
+					truncated: false,
+				},
 			};
 		}
 		throw new Error("fetchJson not stubbed");
@@ -4355,7 +4333,7 @@ test("one click resolves the whole message in a single request; a per-file error
 	expect(link.getAttribute("href")).toBe("https://signed.example/n1");
 	const downloadCalls = file_calls(h, "/api/v1/files/download-urls");
 	expect(downloadCalls).toHaveLength(1);
-	expect(downloadCalls[0]?.[1]?.body).toEqual({ fileNodeIds: ["n1", "n2"] });
+	expect(downloadCalls[0]?.[1]).toEqual({ fileNodeIds: ["n1", "n2"] });
 
 	expect(screen.getByRole("button", { name: "untouched.pdf" })).toBeTruthy();
 
@@ -4369,16 +4347,19 @@ test("a message with 21 attachments issues a second request carrying the 21st id
 		fileNodeId: `n${index + 1}`,
 		name: `file-${index + 1}.pdf`,
 	}));
-	h.raw.fetchJson.mockImplementation(async (path: string, init?: FetchInit) => {
+	h.raw.fetchJson.mockImplementation(async (path: string, requestBody?: Record<string, unknown>) => {
 		if (path === "/api/v1/plugin-data/list") {
 			return http_page([], true);
 		}
 		if (path === "/api/v1/files/download-urls") {
-			const ids = ((init?.body as { fileNodeIds?: string[] } | undefined)?.fileNodeIds ?? []) as string[];
+			const ids = ((requestBody as { fileNodeIds?: string[] } | undefined)?.fileNodeIds ?? []) as string[];
 			return {
-				items: ids.map((fileNodeId) => ({ fileNodeId, url: `https://s/${fileNodeId}`, expiresAt: 1 })),
-				errors: [],
-				truncated: false,
+				status: 200,
+				body: {
+					items: ids.map((fileNodeId) => ({ fileNodeId, url: `https://s/${fileNodeId}`, expiresAt: 1 })),
+					errors: [],
+					truncated: false,
+				},
 			};
 		}
 		throw new Error("fetchJson not stubbed");
@@ -4394,8 +4375,8 @@ test("a message with 21 attachments issues a second request carrying the 21st id
 
 	const downloadCalls = file_calls(h, "/api/v1/files/download-urls");
 	expect(downloadCalls).toHaveLength(2);
-	expect(downloadCalls[0]?.[1]?.body).toEqual({ fileNodeIds: attachments.slice(0, 20).map((a) => a.fileNodeId) });
-	expect(downloadCalls[1]?.[1]?.body).toEqual({ fileNodeIds: ["n21"] });
+	expect(downloadCalls[0]?.[1]).toEqual({ fileNodeIds: attachments.slice(0, 20).map((a) => a.fileNodeId) });
+	expect(downloadCalls[1]?.[1]).toEqual({ fileNodeIds: ["n21"] });
 });
 
 test("the picker lists workspace files and a picked file rides the next send", async () => {
@@ -4406,18 +4387,21 @@ test("the picker lists workspace files and a picked file rides the next send", a
 		}
 		if (path === "/api/v1/files/list") {
 			return {
-				items: [
-					{
-						path: "/docs/spec.pdf",
-						name: "spec.pdf",
-						kind: "file",
-						nodeId: "n1",
-						contentType: "application/pdf",
-						updatedAt: 1,
-					},
-				],
-				cursor: null,
-				isDone: true,
+				status: 200,
+				body: {
+					items: [
+						{
+							path: "/docs/spec.pdf",
+							name: "spec.pdf",
+							kind: "file",
+							nodeId: "n1",
+							contentType: "application/pdf",
+							updatedAt: 1,
+						},
+					],
+					cursor: null,
+					isDone: true,
+				},
 			};
 		}
 		throw new Error("fetchJson not stubbed");
@@ -4429,7 +4413,7 @@ test("the picker lists workspace files and a picked file rides the next send", a
 	const dialog = await screen.findByRole("dialog");
 	const fileListCalls = file_calls(h, "/api/v1/files/list");
 	expect(fileListCalls).toHaveLength(1);
-	const listBody = fileListCalls[0]?.[1]?.body;
+	const listBody = fileListCalls[0]?.[1];
 	expect(listBody?.kind).toBe("file");
 	expect(listBody?.contentTypePrefixes).toContain("image/");
 
@@ -4831,7 +4815,7 @@ test("a private exact retry conflict accepts a renamed exact read only after cur
 			return exactRead.promise;
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -4875,7 +4859,7 @@ test("a private exact retry conflict accepts a renamed exact read only after cur
 	const retry = h.raw.scopes.create_with_document.mock.calls[1]![0];
 	expect(retry).toEqual(first);
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
-	expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]?.body).toEqual({
+	expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]).toEqual({
 		collection: "channels",
 		key: first.scopeId,
 	});
@@ -4887,7 +4871,7 @@ test("a private exact retry conflict accepts a renamed exact read only after cur
 	// A restarted Convex watch would replay this cached absence first. It is not proof.
 	h.send_scopes([]);
 	expect(screen.getByRole("dialog")).toBe(dialog);
-	exactRead.resolve({ document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } });
+	exactRead.resolve(http_read({ ...channel_doc(first.scopeId, "renamed"), revision: 2 }));
 	await waitFor(() => expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledWith({ scopeId: first.scopeId }));
 	expect(screen.getByRole("dialog")).toBe(dialog);
 	exactPrincipals.resolve([{ userId: "user_me", level: "manage" }]);
@@ -4917,7 +4901,7 @@ test("a null private create proof keeps the same key uncertain and locked", asyn
 			return exactRead.promise;
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -4939,7 +4923,7 @@ test("a null private create proof keeps the same key uncertain and locked", asyn
 	// Cached presence is also not proof that the original create still exists now.
 	h.send_scopes([private_scope([], first.scopeId)]);
 	expect(within(dialog).getByRole("button", { name: "Checking…" })).toBeTruthy();
-	exactRead.resolve({ document: null });
+	exactRead.resolve(http_read(null));
 	await waitFor(() => expect(within(dialog).getByRole("alert").textContent).toContain("cannot confirm whether"));
 	expect(h.raw.doors.watch_scope_principals).not.toHaveBeenCalled();
 	expect(name.disabled).toBe(true);
@@ -4973,10 +4957,10 @@ test("an owner-readable private channel with an exact-null principal list keeps 
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
 			const first = h.raw.scopes.create_with_document.mock.calls[0]![0];
-			return { document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } };
+			return http_read({ ...channel_doc(first.scopeId, "renamed"), revision: 2 });
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5029,16 +5013,16 @@ test("private create exact-read failures retry with exponential backoff capped a
 				throw new Error("Connection lost");
 			}
 			if (readAttempts === 2 || readAttempts === 5) {
-				return {};
+				return { status: 403, body: { message: "Permission denied" } };
 			}
 			if (readAttempts === 3) {
-				return { document: channel_doc(CH1_KEY, "wrong channel") };
+				return http_read(channel_doc(CH1_KEY, "wrong channel"));
 			}
 			const first = h.raw.scopes.create_with_document.mock.calls[0]![0];
-			return { document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } };
+			return http_read({ ...channel_doc(first.scopeId, "renamed"), revision: 2 });
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5085,10 +5069,10 @@ test("private create unavailable and malformed principal reads retry until an ex
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
 			const first = h.raw.scopes.create_with_document.mock.calls[0]![0];
-			return { document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } };
+			return http_read({ ...channel_doc(first.scopeId, "renamed"), revision: 2 });
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5139,10 +5123,10 @@ test("cancelling private create reconciliation clears its retry timer", async ()
 		.mockResolvedValueOnce({ _nay: { name: "conflict", message: "This scope changed" } });
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
-			return {};
+			return { status: 403, body: { message: "Permission denied" } };
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5184,7 +5168,7 @@ test("a late private create exact read cannot settle a new dialog after Cancel",
 			return exactRead.promise;
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5204,7 +5188,7 @@ test("a late private create exact read cannot settle a new dialog after Cancel",
 
 	fireEvent.click(screen.getByRole("button", { name: "Create channel" }));
 	dialog = await screen.findByRole("dialog");
-	exactRead.resolve({ document: { ...channel_doc(first.scopeId, "renamed"), revision: 2 } });
+	exactRead.resolve(http_read({ ...channel_doc(first.scopeId, "renamed"), revision: 2 }));
 	await act(async () => {
 		await Promise.resolve();
 		await Promise.resolve();
@@ -5637,7 +5621,7 @@ test.each([
 			return exactRead.promise;
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5660,7 +5644,7 @@ test.each([
 	fireEvent.click(await within(dialog).findByRole("button", { name: confirmName }));
 	await within(dialog).findByRole("alert");
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
-	expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]?.body).toEqual({
+	expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]).toEqual({
 		collection: "channels",
 		key: PRIVATE_KEY,
 	});
@@ -5671,7 +5655,7 @@ test.each([
 	// A restarted watch can replay either cached state. Neither state settles the request.
 	h.send_scopes(testCase.document === null ? [private_scope([])] : []);
 	expect(screen.getByRole("dialog")).toBe(dialog);
-	exactRead.resolve({ document: testCase.document });
+	exactRead.resolve(http_read(testCase.document));
 
 	if (testCase.document !== null) {
 		await waitFor(() => expect(within(dialog).getByRole("button", { name: confirmName })).toBeTruthy());
@@ -5693,7 +5677,7 @@ test("an owner Leave settles from the exact principal list when one member remai
 			return exactRead.promise;
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5711,7 +5695,7 @@ test("an owner Leave settles from the exact principal list when one member remai
 	// The owner can still read the channel after leaving. The live principal list is the membership proof.
 	h.scopePrincipals.set(PRIVATE_KEY, [{ userId: "user_other", level: "manage" }]);
 	h.raw.doors.watch_scope_principals.mockResolvedValueOnce(null);
-	exactRead.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
+	exactRead.resolve(http_read({ ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 }));
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 	expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledWith({ scopeId: PRIVATE_KEY });
 	await waitFor(() => expect(announcer_text(utils.container)).toContain("Left #secret-plans"));
@@ -5730,7 +5714,7 @@ test("a re-add candidate delivered before a late exact-null Leave result waits f
 			return [exitRead.promise, malformedRead.promise, lateRead.promise, readdRead.promise][readIndex++]!;
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5749,7 +5733,7 @@ test("a re-add candidate delivered before a late exact-null Leave result waits f
 	// The first read may have observed departure before this candidate reached the client. Its late
 	// null result cannot decide whether the newer candidate includes this member now.
 	h.send_scopes([{ ...private_scope([]), membershipRevision: 8 }]);
-	exitRead.resolve({ document: null });
+	exitRead.resolve(http_read(null));
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(2));
@@ -5758,14 +5742,14 @@ test("a re-add candidate delivered before a late exact-null Leave result waits f
 
 	// A full-list removal cancels this proof. Its late success cannot restore the departed scope.
 	h.send_scopes([]);
-	lateRead.resolve({ document: { ...channel_doc(PRIVATE_KEY, "stale"), revision: 2 } });
+	lateRead.resolve(http_read({ ...channel_doc(PRIVATE_KEY, "stale"), revision: 2 }));
 	await Promise.resolve();
 	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
 
 	// A later candidate starts a new proof with a new identity.
 	h.send_scopes([{ ...private_scope([]), membershipRevision: 9 }]);
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(4));
-	readdRead.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
+	readdRead.resolve(http_read({ ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 }));
 	await waitFor(() => expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy());
 	expect(h.raw.doors.watch_scope_principals).toHaveBeenLastCalledWith({ scopeId: PRIVATE_KEY });
 	expect(announcer_text(utils.container)).toContain("Left #secret-plans");
@@ -5788,7 +5772,7 @@ test.each([
 			return reads[readIndex++]!.promise;
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5812,14 +5796,14 @@ test.each([
 	h.send_scopes([{ ...private_scope([]), membershipRevision: 11 }]);
 	exitResult.reject(new Error("Connection lost after commit"));
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1));
-	reads[0]!.resolve({ document: null });
+	reads[0]!.resolve(http_read(null));
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
 
 	// Recheck the candidate because it arrived before the exact departure result. A fresh null keeps
 	// the departure fence in place.
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(2));
-	reads[1]!.resolve({ document: null });
+	reads[1]!.resolve(http_read(null));
 	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
 
 	// Even a later, higher scope row stays hidden when the exact principal list excludes this member.
@@ -5827,7 +5811,7 @@ test.each([
 	h.send_scopes([{ ...private_scope([]), membershipRevision: 12 }]);
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(3));
 	h.raw.doors.watch_scope_principals.mockResolvedValueOnce(null);
-	reads[2]!.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
+	reads[2]!.resolve(http_read({ ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 }));
 	await waitFor(() => expect(h.raw.doors.watch_scope_principals).toHaveBeenCalledTimes(2));
 	expect(screen.queryByRole("button", { name: "#secret-plans (private)" })).toBeNull();
 
@@ -5838,7 +5822,7 @@ test.each([
 	]);
 	h.send_scopes([{ ...private_scope([]), membershipRevision: 13 }]);
 	await waitFor(() => expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(4));
-	reads[3]!.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed-again"), revision: 3 } });
+	reads[3]!.resolve(http_read({ ...channel_doc(PRIVATE_KEY, "renamed-again"), revision: 3 }));
 	await waitFor(() => expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy());
 });
 
@@ -5850,7 +5834,7 @@ test("an exact readable channel unlocks Leave after a rejected change", async ()
 			return exactRead.promise;
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5877,7 +5861,7 @@ test("an exact readable channel unlocks Leave after a rejected change", async ()
 		},
 	]);
 	expect(within(dialog).getByRole("button", { name: "Checking…" })).toBeTruthy();
-	exactRead.resolve({ document: { ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 } });
+	exactRead.resolve(http_read({ ...channel_doc(PRIVATE_KEY, "renamed"), revision: 2 }));
 
 	await waitFor(() => expect(within(dialog).getByRole("button", { name: "Leave channel" })).toBeTruthy());
 	expect(screen.getByRole("button", { name: "#secret-plans (private)" })).toBeTruthy();
@@ -5894,15 +5878,15 @@ test("uncertain Delete exact-read failures back off to four seconds", async () =
 				throw new Error("Connection lost");
 			}
 			if (readAttempts === 2 || readAttempts === 5) {
-				return {};
+				return { status: 403, body: { message: "Permission denied" } };
 			}
 			if (readAttempts === 3 || readAttempts === 6) {
-				return { document: channel_doc(CH1_KEY, "wrong channel") };
+				return http_read(channel_doc(CH1_KEY, "wrong channel"));
 			}
-			return { document: null };
+			return http_read(null);
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5940,7 +5924,7 @@ test("uncertain Delete exact-read failures back off to four seconds", async () =
 		}
 		expect(readAttempts).toBe(7);
 		expect(screen.queryByRole("dialog")).toBeNull();
-		expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]?.body).toEqual({
+		expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]).toEqual({
 			collection: "channels",
 			key: PRIVATE_KEY,
 		});
@@ -5957,7 +5941,7 @@ test("Cancel ignores a late uncertain Leave exact read", async () => {
 			return exactRead.promise;
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -5975,7 +5959,7 @@ test("Cancel ignores a late uncertain Leave exact read", async () => {
 	fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
 	await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
-	exactRead.resolve({ document: null });
+	exactRead.resolve(http_read(null));
 	await act(async () => {
 		await Promise.resolve();
 		await Promise.resolve();
@@ -6526,10 +6510,10 @@ test.each([{ action: "Leave" as const }, { action: "Delete" as const }])(
 	const h = make_harness();
 	h.raw.fetchJson.mockImplementation(async (path: string) => {
 		if (path === "/api/v1/plugin-data/read") {
-			return { document: null };
+			return http_read(null);
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -6690,10 +6674,10 @@ test(
 		const secondPrivateKey = "p/20000000-0000-4000-8000-000000000000";
 		h.raw.fetchJson.mockImplementation(async (path: string) => {
 			if (path === "/api/v1/plugin-data/read") {
-				return { document: channel_doc(PRIVATE_KEY, "secret-a") };
+				return http_read(channel_doc(PRIVATE_KEY, "secret-a"));
 			}
 			if (path === "/api/v1/plugin-data/list") {
-				return { documents: [], cursor: null, isDone: true };
+				return http_page([], true);
 			}
 			throw new Error("fetchJson not stubbed");
 		});
@@ -6784,10 +6768,10 @@ test(
 		const h = make_harness();
 		h.raw.fetchJson.mockImplementation(async (path: string) => {
 			if (path === "/api/v1/plugin-data/read") {
-				return { document: channel_doc(PRIVATE_KEY, "secret-plans") };
+				return http_read(channel_doc(PRIVATE_KEY, "secret-plans"));
 			}
 			if (path === "/api/v1/plugin-data/list") {
-				return { documents: [], cursor: null, isDone: true };
+				return http_page([], true);
 			}
 			throw new Error("fetchJson not stubbed");
 		});
@@ -7756,12 +7740,10 @@ test("a conflicted private mark-read refreshes after its ninth-scope watch close
 			if (readAttempts === 1) {
 				throw new Error("Connection lost");
 			}
-			return {
-				document: private_cursor_doc(PRIVATE_KEY, 6_000, 11, { messages: 0, replies: 4 }),
-			};
+			return http_read(private_cursor_doc(PRIVATE_KEY, 6_000, 11, { messages: 0, replies: 4 }));
 		}
 		if (path === "/api/v1/plugin-data/list") {
-			return { documents: [], cursor: null, isDone: true };
+			return http_page([], true);
 		}
 		throw new Error("fetchJson not stubbed");
 	});
@@ -7808,7 +7790,7 @@ test("a conflicted private mark-read refreshes after its ninth-scope watch close
 			await Promise.resolve();
 		});
 		expect(file_calls(h, "/api/v1/plugin-data/read")).toHaveLength(1);
-		expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]?.body).toEqual({
+		expect(file_calls(h, "/api/v1/plugin-data/read")[0]![1]).toEqual({
 			collection: "channels",
 			key: `${PRIVATE_KEY}:read:user_me`,
 		});
@@ -8031,7 +8013,7 @@ test("the composer's @-menu stores the member's id, and Enter picks before it se
 
 	// Enter while the menu is open picks — it must not send.
 	fireEvent.keyDown(textarea, { key: "Enter" });
-	expect(h.raw.backend.invoke).not.toHaveBeenCalled();
+	expect(h.raw.invoke).not.toHaveBeenCalled();
 	await waitFor(() => expect(textarea.value).toBe("Hi @Bob "));
 
 	// The next Enter sends, and the stored mention is the member's ID, not the display name —
@@ -8407,7 +8389,7 @@ test.each([
 
 test("a private send with a lost response remains unread after the sender reloads", async () => {
 	const first = make_harness();
-	first.raw.backend.invoke.mockResolvedValueOnce(invoke_nay("unavailable", "The message may have been stored"));
+	first.raw.invoke.mockRejectedValueOnce(new Error("The message may have been stored"));
 	const { textarea, unmount } = await open_private_composer(first);
 	type_in_composer(textarea, "stored before reload");
 	await act(async () => {
@@ -8450,9 +8432,9 @@ test("an unavailable private send replays one request while navigation and Leave
 		{ userId: "user_me", level: "manage" },
 		{ userId: "user_other", level: "member" },
 	]);
-	const replay = deferred<InvokeResult>();
-	h.raw.backend.invoke
-		.mockResolvedValueOnce(invoke_nay("unavailable", "The reply may have been lost"))
+	const replay = deferred<InvokeAnswer>();
+	h.raw.invoke
+		.mockRejectedValueOnce(new Error("The reply may have been lost"))
 		.mockReturnValueOnce(replay.promise);
 	const { textarea } = await open_private_composer(h);
 
@@ -8502,9 +8484,9 @@ test("an unavailable private reply replays one request and unlocks its thread af
 	h.find_window("messages", `${PRIVATE_KEY}:`)!.onUpdate(window_update([rootA, rootB]));
 	await screen.findByText("private root a");
 
-	const replay = deferred<InvokeResult>();
-	h.raw.backend.invoke
-		.mockResolvedValueOnce(invoke_nay("unavailable", "The reply may have been lost"))
+	const replay = deferred<InvokeAnswer>();
+	h.raw.invoke
+		.mockRejectedValueOnce(new Error("The reply may have been lost"))
 		.mockReturnValueOnce(replay.promise);
 	const rowA = screen.getByText("private root a").closest("[data-key]") as HTMLElement;
 	fireEvent.click(within(rowA).getByRole("button", { name: "Reply in thread" }));
@@ -8549,9 +8531,9 @@ test("Leave waits for a delayed send, then removes the member without a channel 
 		{ userId: "user_me", level: "manage" },
 		{ userId: "user_other", level: "member" },
 	]);
-	const send = deferred<InvokeResult>();
+	const send = deferred<InvokeAnswer>();
 	const events: string[] = [];
-	h.raw.backend.invoke.mockImplementationOnce(() => {
+	h.raw.invoke.mockImplementationOnce(() => {
 		events.push("invoke");
 		return send.promise;
 	});
