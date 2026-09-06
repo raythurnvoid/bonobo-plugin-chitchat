@@ -4728,7 +4728,7 @@ test("a two-person direct message renders through the same component and store p
 	expect(h.find_window("replies", `${PRIVATE_KEY}:`)).toBeUndefined();
 });
 
-test("a private channel names the organization owner as a reader, and a public one says nothing of the sort", async () => {
+test("a private channel explains its readers and separate file sharing", async () => {
 	const h = make_harness();
 	// "general" sorts before "secret-plans", so the public channel opens first.
 	await boot_sidebar(h, [channel_doc(CH1_KEY, "general"), channel_doc(PRIVATE_KEY, "secret-plans")], [PRIVATE_KEY]);
@@ -4744,6 +4744,8 @@ test("a private channel names the organization owner as a reader, and a public o
 	// Saying "private" and stopping there would be a disclosure: the organization owner passes every
 	// permission check before any grant is read.
 	expect(privacy.textContent).toContain("organization owner");
+	expect(privacy.textContent).toContain("Its copies in Files have separate sharing settings.");
+	expect(privacy.textContent).toContain("including later updates");
 });
 
 test("creating a private channel sends its whole setup through one atomic scope call", async () => {
@@ -5519,7 +5521,7 @@ test("Delete is manager-only, uses its own copy, and sends the frozen count", as
 	fireEvent.click(await open_channel_menu_item("secret-plans", "Delete #secret-plans for everyone"));
 	const dialog = await screen.findByRole("dialog", { name: "Delete #secret-plans for everyone?" });
 	expect((await within(dialog).findByText(/This deletes the channel for all 2 people in it/)).textContent).toBe(
-		"This deletes the channel for all 2 people in it. Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone.",
+		"This deletes the channel for all 2 people in it. Nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings. This cannot be undone.",
 	);
 	h.raw.scopes.delete.mockResolvedValueOnce({ _nay: { message: "Try again" } });
 	fireEvent.click(within(dialog).getByRole("button", { name: "Delete channel" }));
@@ -5551,13 +5553,13 @@ test.each([
 		action: "Leave" as const,
 		menuName: "Leave #secret-plans",
 		confirmName: "Leave channel",
-		body: "We could not read who else is in this channel. If other people remain, they keep the channel and somebody who can add people has to add you back. If you are the only person left, leaving deletes it. Then nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files.",
+		body: "We could not read who else is in this channel. If other people remain, they keep the channel and somebody who can add people has to add you back. If you are the only person left, leaving deletes it. Then nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings.",
 	},
 	{
 		action: "Delete" as const,
 		menuName: "Delete #secret-plans for everyone",
 		confirmName: "Delete channel",
-		body: "We could not read how many people are in this channel. Deleting it will remove the channel for everyone who is in it. Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone.",
+		body: "We could not read how many people are in this channel. Deleting it will remove the channel for everyone who is in it. Nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings. This cannot be undone.",
 	},
 ])("unknown-count $action uses its exact copy and omits expectedPrincipalCount", async (testCase) => {
 	const h = make_harness();

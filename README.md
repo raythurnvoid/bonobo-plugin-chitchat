@@ -19,7 +19,7 @@ The page reads at most eight private scopes at a time through one `useQueries` s
 
 The App tracks every message and reply append, edit, and delete, including retries, by channel. While a request is in flight, channel, view, and thread controls that would unmount its state are disabled. Their handlers also refuse a stale or scripted click and announce why. Leave and Delete refuse before any scope change. An `unavailable` append result is uncertain because the write may have committed. The queue stays in flight and replays the exact client request id and payload with bounded backoff until the store gives a definite result. An uncertain edit or delete keeps its exact value, timestamp, and revision locked for Retry or Cancel until a newer watch value settles it. A definite failure unlocks navigation but keeps the draft or failed append visible, so the member can retry or choose to navigate away. The durable scope activity is the unread source after a stored append, even when the sender reloads or leaves before receiving the result.
 
-Every principal can use **Leave**. A manager also gets **Delete for everyone**. Both actions wait for an in-flight send in that channel to settle, then change the scope directly through `user_manage_scope`. They do not write the channel document. The confirmation reads and freezes the current principal count. A null principal answer uses the honest unknown-count copy and may continue without a count. A rejected or malformed count shows Retry and keeps the destructive action disabled. When a count is known, the write sends it back so a membership change cannot turn the confirmed result into a different result. A successful non-delete Leave waits until `watch_my_scopes` omits that scope. If a manager already added the member back, a greater `membershipRevision` than the definite Leave result keeps the live channel. A rejected mutation is uncertain: the write may have committed. Chitchat then reads that exact private channel through the authenticated HTTP door. A valid null proves this member has no current read. A valid channel is followed by an exact principal read because the organization owner can still read it without a scope grant. If an exact list includes this member, Retry unlocks. If it excludes this member or is null, Leave settles as left. Delete still says it could not be confirmed because caller absence does not prove global deletion. Failed, malformed, or wrong-channel reads and rejected or malformed principal reads retry with bounded backoff. Cached or higher-revision scope rows cannot settle this check because another principal's change can raise the revision. After exact departure, the scope stays hidden until a fresh exact channel and exact principal list includes this member; null stops that re-add proof, while rejected or malformed reads retry with bounded backoff. Cancel or unmount stops the check. The people dialog keeps a null answer separate from a failed read and offers Retry after a rejected or malformed one. It reloads the current principals after a rejected membership change. Leaving as the last principal deletes the scope. Both delete paths release access and archive the channel's transcript files, but the plugin documents stay stored until uninstall.
+Every principal can use **Leave**. A manager also gets **Delete for everyone**. Both actions wait for an in-flight send in that channel to settle, then change the scope directly through `user_manage_scope`. They do not write the channel document. The confirmation reads and freezes the current principal count. A null principal answer uses the honest unknown-count copy and may continue without a count. A rejected or malformed count shows Retry and keeps the destructive action disabled. When a count is known, the write sends it back so a membership change cannot turn the confirmed result into a different result. A successful non-delete Leave waits until `watch_my_scopes` omits that scope. If a manager already added the member back, a greater `membershipRevision` than the definite Leave result keeps the live channel. A rejected mutation is uncertain: the write may have committed. Chitchat then reads that exact private channel through the authenticated HTTP door. A valid null proves this member has no current read. A valid channel is followed by an exact principal read because the organization owner can still read it without a scope grant. If an exact list includes this member, Retry unlocks. If it excludes this member or is null, Leave settles as left. Delete still says it could not be confirmed because caller absence does not prove global deletion. Failed, malformed, or wrong-channel reads and rejected or malformed principal reads retry with bounded backoff. Cached or higher-revision scope rows cannot settle this check because another principal's change can raise the revision. After exact departure, the scope stays hidden until a fresh exact channel and exact principal list includes this member; null stops that re-add proof, while rejected or malformed reads retry with bounded backoff. Cancel or unmount stops the check. The people dialog keeps a null answer separate from a failed read and offers Retry after a rejected or malformed one. It reloads the current principals after a rejected membership change. Leaving as the last principal deletes the scope. Both delete paths remove the scope. Transcript folders still bound to it are archived; copies whose sharing was changed in Files keep that sharing. The plugin documents stay stored until uninstall.
 
 ### Seam contract (how the page stitches reads)
 
@@ -45,8 +45,8 @@ run mutates the installation's transcripts at a time:
   then rewrite its block (`(edited)` / `(message deleted)`).
 - `reaction-toggle` (`/reactions/toggle`) — write the owned reaction marker, then update the block's
   `reactions:` line.
-- `channel-manage` (`/channels/manage`) — create, ensure, and update (rename/topic/archive); archive archives
-  the channel's transcript folder or file through `plugin-archive`.
+- `channel-manage` (`/channels/manage`) — create, ensure, and update (rename/topic/archive).
+  Archiving a channel removes its public README row and keeps its transcript files.
 - `reconcile` (`/reconcile`) — rebuild a channel transcript from the store. The store and the file
   system commit separately, so a run can crash between them; the store is the source of truth and
   reconcile heals the file. Over the page caps it degrades to a truncated tail rebuild — a
@@ -60,6 +60,14 @@ finishes the file half itself, without a full rebuild: it looks for the block's
 scan, and appends or nests the block only when the marker is absent. So replaying a send twice
 never writes the block twice. A replayed channel create re-runs `ensure_channel` for the same
 reason.
+
+After a confirmed store write, a definite transcript refusal returns success with
+`transcriptUpdated: false`. Sends keep their stored message key, edits and reactions keep their
+stored revision, and exact request replays keep the original key and `replayed: true`. A later
+replay or reconcile can retry the transcript after access is restored. A folder ensure failure
+before a send's store write still refuses the send. Explicit ensure and reconcile report their
+own failures. A 5xx, unreadable response, or network failure remains an uncertain result;
+the page must keep the same request ID when it retries.
 
 The page calls these with `client.fetchJson("/api/v1/plugin-backend/invoke", { endpoint, input })`,
 wrapped in `src/chat-invoke.ts`: it waits out the held-back answers (409 is the serialization lock,
@@ -76,13 +84,30 @@ page write to `messages`, `replies`, or `reactions`. `channels` stays user-writa
 create writes the channel document from the page via `user_manage_scope` (`create_with_document`) — a
 known gap.
 
-Transcript layout, all files plugin-owned and read-only: public channels at `/chitchat/<slug>.md`
+Transcript layout: public channels at `/chitchat/<slug>.md`
 plus a `README.md` index; each private channel under `/chitchat/private/<slug>-<digest8>/` where
 the digest is the first 8 hex chars of SHA-256 of the channel key — two same-named private channels
-get separate folders, and a guessed name cannot be confirmed by probing. The private folder is
-bound to the channel's data scope (`access.readScopeId`), so exactly the channel's members (and the
-organization owner) can read it. If `/chitchat` is taken by a member folder, the root falls back to
-a workspace-digest suffix.
+get separate folders. New private folders start bound to the channel's data scope
+(`access.readScopeId`), with access for channel members and the organization owner. File managers
+can change sharing. That detaches the folder from reader sync; later transcript updates follow
+the chosen Files sharing, including after channel membership changes. Repeated ensure never
+resets an existing folder's sharing or lock.
+
+New files and folders get `source: plugin` and `plugin-name: chitchat` metadata and start locked.
+Members can unlock, edit, move, share, or archive them. A member's own lock blocks plugin writes.
+Only an exact `plugin-name` match lets Chitchat update an existing file or ensure a folder.
+Changing `source` does not stop writes. The host never repairs edited or removed labels on an
+existing node. File edits do not change chat: appends read the existing tail, block edits replace
+one block, and reconcile rebuilds from the store.
+
+Each transcript operation re-ensures the saved root and private channel folder. Missing folders
+are created with the initial lock and scoped readers before a private write. Each private write
+carries the freshly ensured parent node ID, so a move or replacement before publication refuses
+the write. These IDs are not stored in projection documents. A folder label change can stop
+Chitchat at ensure even when its child file still has the label. The host's direct file-write
+contract checks the existing file itself, not its parent's metadata. On first setup only, an
+occupied `/chitchat` without the Chitchat label uses a workspace-digest suffix. A conflict on a
+saved root stays a conflict.
 
 ## Known limits (accepted for the MVP)
 
@@ -119,7 +144,7 @@ A published plugin file may not exceed **900,000 bytes**. The shipped row below 
 | ---------------------------------- | ------- |
 | React, no minification             | 947,309 |
 | Identifier names preserved         | 908,086 |
-| Full esbuild minify, then prettier | 798,680 |
+| Full esbuild minify, then prettier | 795,260 |
 
 So the readable build does not fit and identifier names have to go. `vite.config.ts` minifies the
 JavaScript, and the build script then reformats it with prettier, which puts it back on 28,315 lines

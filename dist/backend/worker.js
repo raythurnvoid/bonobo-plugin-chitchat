@@ -4828,12 +4828,11 @@ function chatbe_host_message(answer) {
  */
 var MISSING_NAME = chat_ANONYMOUS_MEMBER_LABEL;
 /**
- * Copied from the host's `PRIVATE_DISCLOSURE`. The organization owner reads every scope and
- * every restricted file before any grant is consulted, so copy that says "private" must say
- * this too. The wording is the file header's, not the chat page's — keep them separate.
+ * File sharing starts with the channel's readers. A file manager can change it for later
+ * updates too. Keep this file-header wording separate from the chat-page disclosure.
  */
 var PRIVATE_DISCLOSURE =
-	"Only the people in this channel can read this file — and the organization owner, who can read everything in this workspace.";
+	"This copy starts with access for the channel's members and the organization owner. File managers can change its sharing, including who can read later updates.";
 /**
  * Rollover cap for one projected file, in UTF-8 bytes. The host engine used 600,000; the plugin
  * backend reads files back through `/api/v1/files/read`, which answers 404 above its 128,000-byte
@@ -5074,11 +5073,13 @@ function chatbe_readme_markdown(channels) {
 		"",
 		"These files are a derived copy of Chitchat channels in this workspace.",
 		"",
-		"- Edit chat in the Chitchat page, not in these files.",
-		"- Private channels appear under `private/`. Each channel folder is visible only to the people in that channel — and the organization owner, who can read everything in this workspace.",
-		"- Do not share those folders by hand. The plugin resets each folder's sharing to the channel's members.",
+		"- Edit chat in the Chitchat page. File edits do not change chat and may be replaced by later updates.",
+		"- Private channels appear under `private/`. New channel folders allow the channel's members and the organization owner to read them.",
+		"- File managers can change sharing. Later updates follow that sharing, even if channel membership changes.",
 		"- Author names are a snapshot written with each message. A rename shows up on later messages.",
-		"- The folder is read-only. The workspace agent can read these files with bash.",
+		"- New files and folders start locked. File managers can unlock them or apply their own lock to stop plugin writes.",
+		"- The `plugin-name` metadata label lets Chitchat update a file or reuse a folder. Removing it stops those operations. The `source` label is only a description.",
+		"- The workspace agent can read files it has access to with bash.",
 	];
 	const sorted = [...channels].sort((left, right) => left.name.localeCompare(right.name));
 	if (sorted.length > 0) {
@@ -5148,10 +5149,9 @@ function chatbe_tail_path(state) {
  * Markdown transcript files. A file update that fails or finds no block leaves the store
  * correct; the reconcile endpoint rebuilds the transcript from the store.
  *
- * Authorization model: the host verifies the acting member (`actorUserId`) and every store or
- * file door re-checks scope membership, so a non-member's call on a private channel fails at the
- * door and the refusal is relayed. The worker itself only adds the authorship rule: members may
- * edit and delete their own messages only.
+ * The host checks the acting member and each store scope. File doors use the current Files
+ * access rules, which a file manager can change. The worker also checks authorship: members
+ * may edit and delete their own messages only.
  */
 /** The host store door refuses values over this canonical-JSON size; pre-check for a clear message. */
 var STORE_VALUE_MAX_BYTES = 16384;
@@ -5256,12 +5256,13 @@ async function files_read_or_null(ctx, path) {
  * Every transcript write asks for the plugin-named lock. On a create that locks the new file;
  * on an update the door ignores the request and the existing lock stays.
  */
-function files_write(ctx, path, content) {
+function files_write(ctx, path, content, expectedParentNodeId) {
 	return door(ctx, "/api/v1/files/write", {
 		path,
 		content,
 		nonCollaborative: true,
 		access: { readOnly: true },
+		expectedParentNodeId,
 	});
 }
 function folders_ensure(ctx, path, access) {
@@ -5406,7 +5407,10 @@ async function write_readme(ctx, rootState, states) {
 async function ensure_root(ctx) {
 	const existing = await read_root_state(ctx);
 	if (existing instanceof Response) return existing;
-	if (existing !== null) return existing;
+	if (existing !== null) {
+		const ensured = await folders_ensure(ctx, existing.rootPath, { readOnly: true });
+		return ensured instanceof Response ? ensured : existing;
+	}
 	let rootPath = DEFAULT_ROOT_PATH;
 	let ensured = await folders_ensure(ctx, rootPath, { readOnly: true });
 	if (ensured instanceof Response) {
@@ -5454,21 +5458,25 @@ async function ensure_channel(ctx, channel) {
 	const read = await data_read(ctx, stateLocation.collection, stateLocation.key);
 	if (read instanceof Response) return read;
 	const existingDoc = parse_stored_doc(read.document);
-	if (existingDoc !== null) {
-		const existingState = chatbe_channel_state_schema.safeParse(existingDoc.value);
-		if (existingState.success)
-			return {
-				rootState,
-				state: existingState.data,
-				stateLocation,
-			};
-	}
+	const existingState = existingDoc === null ? null : chatbe_channel_state_schema.safeParse(existingDoc.value);
+	if (existingState?.success && !chat_channel_is_private(channel.key))
+		return {
+			rootState,
+			state: existingState.data,
+			stateLocation,
+		};
 	let slug;
 	let folderPath;
+	let expectedParentNodeId;
 	if (chat_channel_is_private(channel.key)) {
-		const digest = await chatbe_sha256_hex(channel.key);
-		slug = `${slug_channel_name(channel.name)}-${digest.slice(0, 8)}`;
-		folderPath = `${rootState.rootPath}/private/${slug}`;
+		if (existingState?.success) {
+			slug = existingState.data.slug;
+			folderPath = existingState.data.folderPath;
+		} else {
+			const digest = await chatbe_sha256_hex(channel.key);
+			slug = `${slug_channel_name(channel.name)}-${digest.slice(0, 8)}`;
+			folderPath = `${rootState.rootPath}/private/${slug}`;
+		}
 		const parent = await folders_ensure(ctx, `${rootState.rootPath}/private`, { readOnly: true });
 		if (parent instanceof Response) return parent;
 		const folder = await folders_ensure(ctx, folderPath, {
@@ -5476,6 +5484,14 @@ async function ensure_channel(ctx, channel) {
 			readScopeId: channel.key,
 		});
 		if (folder instanceof Response) return folder;
+		expectedParentNodeId = folder.nodeId;
+		if (existingState?.success)
+			return {
+				rootState,
+				state: existingState.data,
+				stateLocation,
+				expectedParentNodeId,
+			};
 	} else {
 		const states = await list_public_channel_states(ctx);
 		if (states instanceof Response) return states;
@@ -5509,7 +5525,7 @@ async function ensure_channel(ctx, channel) {
 	if (existingTail instanceof Response) return existingTail;
 	if (existingTail === null) {
 		const header = chatbe_channel_header(channel.name, channel.topic, chat_channel_is_private(channel.key));
-		const tail = await files_write(ctx, chatbe_tail_path(state), header);
+		const tail = await files_write(ctx, chatbe_tail_path(state), header, expectedParentNodeId);
 		if (tail instanceof Response) return tail;
 	}
 	const stateWrite = await data_write(ctx, stateLocation.collection, stateLocation.key, state);
@@ -5518,6 +5534,7 @@ async function ensure_channel(ctx, channel) {
 		rootState,
 		state,
 		stateLocation,
+		expectedParentNodeId,
 	};
 }
 /**
@@ -5527,7 +5544,7 @@ async function ensure_channel(ctx, channel) {
  * a small, documented deviation from the core splitter's header-less rollover files.
  */
 async function append_block(ctx, projection, channel, block) {
-	const { state, stateLocation } = projection;
+	const { state, stateLocation, expectedParentNodeId } = projection;
 	const tailPath = chatbe_tail_path(state);
 	const header = chatbe_channel_header(channel.name, channel.topic, chat_channel_is_private(channel.key));
 	const tail = await files_read_or_null(ctx, tailPath);
@@ -5546,14 +5563,15 @@ async function append_block(ctx, projection, channel, block) {
 			ctx,
 			chatbe_rollover_path(state.folderPath, state.slug, state.tailIndex + 1),
 			content,
+			expectedParentNodeId,
 		);
 		if (archived instanceof Response) return archived;
-		const restarted = await files_write(ctx, tailPath, `${header}\n\n${block}`);
+		const restarted = await files_write(ctx, tailPath, `${header}\n\n${block}`, expectedParentNodeId);
 		if (restarted instanceof Response) return restarted;
 		state.tailIndex += 1;
 		stateChanged = true;
 	} else {
-		const written = await files_write(ctx, tailPath, appended);
+		const written = await files_write(ctx, tailPath, appended, expectedParentNodeId);
 		if (written instanceof Response) return written;
 	}
 	if (stateChanged) {
@@ -5567,7 +5585,8 @@ async function append_block(ctx, projection, channel, block) {
  * then the rolled files newest-first, bounded. Answers false when the block is in none of them —
  * the store is already correct and reconcile will heal the transcript.
  */
-async function update_block_in_transcript(ctx, state, key, edit) {
+async function update_block_in_transcript(ctx, projection, key, edit) {
+	const { state, expectedParentNodeId } = projection;
 	const paths = [chatbe_tail_path(state)];
 	for (let index = state.tailIndex; index >= 1 && paths.length < TRANSCRIPT_SCAN_MAX_FILES; index -= 1)
 		paths.push(chatbe_rollover_path(state.folderPath, state.slug, index));
@@ -5577,7 +5596,7 @@ async function update_block_in_transcript(ctx, state, key, edit) {
 		if (file === null) continue;
 		const edited = edit(file.content);
 		if (edited === null) continue;
-		const written = await files_write(ctx, path, edited);
+		const written = await files_write(ctx, path, edited, expectedParentNodeId);
 		if (written instanceof Response) return written;
 		return true;
 	}
@@ -5606,10 +5625,10 @@ async function handle_message_send(ctx, input) {
 	if (replayed instanceof Response) return replayed;
 	if (replayed !== null) {
 		const repaired = await repair_replayed_block(ctx, replayed.messageKey);
-		if (repaired instanceof Response) return repaired;
 		return json_response(200, {
 			messageKey: replayed.messageKey,
 			replayed: true,
+			...(repaired instanceof Response ? { transcriptUpdated: false } : {}),
 		});
 	}
 	const channel = await read_channel_doc(ctx, input.channelKey);
@@ -5655,9 +5674,12 @@ async function handle_message_send(ctx, input) {
 		createdAt: ctx.now,
 	});
 	if (doc === null) return refuse(500, "Failed to render the sent message");
-	const appended = await append_block(ctx, projection, channel, render_block(doc, []));
-	if (appended instanceof Response) return appended;
-	return json_response(200, { messageKey });
+	return json_response(200, {
+		messageKey,
+		...((await append_block(ctx, projection, channel, render_block(doc, []))) instanceof Response
+			? { transcriptUpdated: false }
+			: {}),
+	});
 }
 var reply_input_schema = object({
 	rootMessageKey: string().min(1).max(200),
@@ -5672,10 +5694,10 @@ async function handle_reply_send(ctx, input) {
 	if (replayed instanceof Response) return replayed;
 	if (replayed !== null) {
 		const repaired = await repair_replayed_block(ctx, replayed.messageKey);
-		if (repaired instanceof Response) return repaired;
 		return json_response(200, {
 			messageKey: replayed.messageKey,
 			replayed: true,
+			...(repaired instanceof Response ? { transcriptUpdated: false } : {}),
 		});
 	}
 	if (message_collection_for_key(input.rootMessageKey) !== "messages")
@@ -5728,13 +5750,12 @@ async function handle_reply_send(ctx, input) {
 	});
 	if (doc === null) return refuse(500, "Failed to render the sent reply");
 	const block = render_block(doc, []);
-	const transcriptUpdated = await update_block_in_transcript(ctx, projection.state, input.rootMessageKey, (content) =>
-		chatbe_insert_reply_block(content, input.rootMessageKey, block),
-	);
-	if (transcriptUpdated instanceof Response) return transcriptUpdated;
 	return json_response(200, {
 		messageKey: replyKey,
-		transcriptUpdated,
+		transcriptUpdated:
+			(await update_block_in_transcript(ctx, projection, input.rootMessageKey, (content) =>
+				chatbe_insert_reply_block(content, input.rootMessageKey, block),
+			)) === true,
 	});
 }
 var edit_input_schema = object({
@@ -5803,7 +5824,7 @@ async function repair_replayed_block(ctx, messageKey) {
 	}
 	const rootKey = chat_reply_root_key(messageKey);
 	if (rootKey === null) return null;
-	const inserted = await update_block_in_transcript(ctx, projection.state, rootKey, (content) =>
+	const inserted = await update_block_in_transcript(ctx, projection, rootKey, (content) =>
 		chatbe_insert_reply_block(content, rootKey, block),
 	);
 	return inserted instanceof Response ? inserted : null;
@@ -5817,7 +5838,7 @@ async function splice_updated_block(ctx, doc) {
 	const reactions = await list_reactions_for(ctx, doc.key);
 	if (reactions instanceof Response) return reactions;
 	const block = render_block(doc, reactions);
-	return update_block_in_transcript(ctx, projection.state, doc.key, (content) =>
+	return update_block_in_transcript(ctx, projection, doc.key, (content) =>
 		chatbe_splice_block(content, doc.key, block),
 	);
 }
@@ -5837,18 +5858,17 @@ async function handle_message_edit(ctx, input) {
 		return refuse(413, "This message is too long to store. Shorten it and send again.");
 	const written = await data_write(ctx, loaded.collection, input.messageKey, value);
 	if (written instanceof Response) return written;
-	const transcriptUpdated = await splice_updated_block(ctx, {
-		...loaded.doc,
-		value: {
-			...loaded.doc.value,
-			text: input.text,
-			editedAt: ctx.now,
-			mentions: input.mentions,
-		},
-	});
-	if (transcriptUpdated instanceof Response) return transcriptUpdated;
 	return json_response(200, {
-		transcriptUpdated,
+		transcriptUpdated:
+			(await splice_updated_block(ctx, {
+				...loaded.doc,
+				value: {
+					...loaded.doc.value,
+					text: input.text,
+					editedAt: ctx.now,
+					mentions: input.mentions,
+				},
+			})) === true,
 		revision: written.revision,
 	});
 }
@@ -5870,16 +5890,15 @@ async function handle_message_delete(ctx, input) {
 	};
 	const written = await data_write(ctx, loaded.collection, input.messageKey, value);
 	if (written instanceof Response) return written;
-	const transcriptUpdated = await splice_updated_block(ctx, {
-		...loaded.doc,
-		value: {
-			...loaded.doc.value,
-			deletedAt: ctx.now,
-		},
-	});
-	if (transcriptUpdated instanceof Response) return transcriptUpdated;
 	return json_response(200, {
-		transcriptUpdated,
+		transcriptUpdated:
+			(await splice_updated_block(ctx, {
+				...loaded.doc,
+				value: {
+					...loaded.doc.value,
+					deletedAt: ctx.now,
+				},
+			})) === true,
 		revision: written.revision,
 	});
 }
@@ -5898,10 +5917,8 @@ async function handle_reaction_toggle(ctx, input) {
 	const reactionKey = `${input.targetKey}:${input.token}:${ctx.actorUserId}`;
 	const written = await data_write(ctx, "reactions", reactionKey, { removed: !input.on });
 	if (written instanceof Response) return written;
-	const transcriptUpdated = await splice_updated_block(ctx, target);
-	if (transcriptUpdated instanceof Response) return transcriptUpdated;
 	return json_response(200, {
-		transcriptUpdated,
+		transcriptUpdated: (await splice_updated_block(ctx, target)) === true,
 		key: reactionKey,
 		revision: written.revision,
 	});
@@ -5933,7 +5950,7 @@ var channel_manage_input_schema = discriminatedUnion("action", [
 async function refresh_channel_projection(ctx, channel) {
 	const projection = await ensure_channel(ctx, channel);
 	if (projection instanceof Response) return projection;
-	const { state, stateLocation, rootState } = projection;
+	const { state, stateLocation, rootState, expectedParentNodeId } = projection;
 	if (state.name !== channel.name || state.topic !== channel.topic || state.archived !== channel.archived) {
 		if (state.name !== channel.name || state.topic !== channel.topic) {
 			const tailPath = chatbe_tail_path(state);
@@ -5941,7 +5958,12 @@ async function refresh_channel_projection(ctx, channel) {
 			if (tail instanceof Response) return tail;
 			if (tail !== null) {
 				const header = chatbe_channel_header(channel.name, channel.topic, chat_channel_is_private(channel.key));
-				const written = await files_write(ctx, tailPath, chatbe_replace_header(tail.content, header));
+				const written = await files_write(
+					ctx,
+					tailPath,
+					chatbe_replace_header(tail.content, header),
+					expectedParentNodeId,
+				);
 				if (written instanceof Response) return written;
 			}
 		}
@@ -5967,10 +5989,10 @@ async function handle_channel_manage(ctx, input) {
 			const channel = await read_channel_doc(ctx, replayed.messageKey);
 			if (channel instanceof Response) return channel;
 			const ensured = await ensure_channel(ctx, channel);
-			if (ensured instanceof Response) return ensured;
 			return json_response(200, {
 				channelKey: replayed.messageKey,
 				replayed: true,
+				...(ensured instanceof Response ? { transcriptUpdated: false } : {}),
 			});
 		}
 		const channelKey = crypto.randomUUID();
@@ -5995,15 +6017,18 @@ async function handle_channel_manage(ctx, input) {
 			},
 		]);
 		if (written instanceof Response) return written;
-		const ensured = await ensure_channel(ctx, {
-			key: channelKey,
-			name: input.name,
-			topic: input.topic !== "" ? input.topic : null,
-			archived: false,
-			archivedAt: null,
+		return json_response(200, {
+			channelKey,
+			...((await ensure_channel(ctx, {
+				key: channelKey,
+				name: input.name,
+				topic: input.topic !== "" ? input.topic : null,
+				archived: false,
+				archivedAt: null,
+			})) instanceof Response
+				? { transcriptUpdated: false }
+				: {}),
 		});
-		if (ensured instanceof Response) return ensured;
-		return json_response(200, { channelKey });
 	}
 	const channel = await read_channel_doc(ctx, input.channelKey);
 	if (channel instanceof Response) return channel;
@@ -6028,9 +6053,10 @@ async function handle_channel_manage(ctx, input) {
 	};
 	const written = await data_write(ctx, "channels", channel.key, value);
 	if (written instanceof Response) return written;
-	const refreshed = await refresh_channel_projection(ctx, updated);
-	if (refreshed instanceof Response) return refreshed;
-	return json_response(200, {});
+	return json_response(
+		200,
+		(await refresh_channel_projection(ctx, updated)) instanceof Response ? { transcriptUpdated: false } : {},
+	);
 }
 var reconcile_input_schema = object({ channelKey: string().min(1).max(128).nullable().default(null) });
 /**
@@ -6052,7 +6078,7 @@ async function handle_reconcile(ctx, input) {
 	if (channel instanceof Response) return channel;
 	const projection = await ensure_channel(ctx, channel);
 	if (projection instanceof Response) return projection;
-	const { state, stateLocation } = projection;
+	const { state, stateLocation, expectedParentNodeId } = projection;
 	const collect = async (collection, maxPages) => {
 		const documents = [];
 		let cursor = null;
@@ -6137,7 +6163,7 @@ async function handle_reconcile(ctx, input) {
 			blocks,
 			maxBytes: chatbe_ROLLOVER_MAX_BYTES,
 		});
-		const written = await files_write(ctx, chatbe_tail_path(state), files[files.length - 1]);
+		const written = await files_write(ctx, chatbe_tail_path(state), files[files.length - 1], expectedParentNodeId);
 		if (written instanceof Response) return written;
 		return json_response(200, {
 			done: true,
@@ -6150,10 +6176,15 @@ async function handle_reconcile(ctx, input) {
 		maxBytes: chatbe_ROLLOVER_MAX_BYTES,
 	});
 	for (let index = 0; index < files.length - 1; index += 1) {
-		const written = await files_write(ctx, chatbe_rollover_path(state.folderPath, state.slug, index + 1), files[index]);
+		const written = await files_write(
+			ctx,
+			chatbe_rollover_path(state.folderPath, state.slug, index + 1),
+			files[index],
+			expectedParentNodeId,
+		);
 		if (written instanceof Response) return written;
 	}
-	const tailWritten = await files_write(ctx, chatbe_tail_path(state), files[files.length - 1]);
+	const tailWritten = await files_write(ctx, chatbe_tail_path(state), files[files.length - 1], expectedParentNodeId);
 	if (tailWritten instanceof Response) return tailWritten;
 	const newTailIndex = files.length - 1;
 	for (let index = newTailIndex + 1; index <= state.tailIndex; index += 1) {

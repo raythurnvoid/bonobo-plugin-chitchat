@@ -717,13 +717,13 @@ function ExitChannelDialog(props: {
 			? ""
 			: props.action === "delete"
 				? principalCount === null
-					? "We could not read how many people are in this channel. Deleting it will remove the channel for everyone who is in it. Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone."
-					: `${principalCount === 1 ? "This deletes the channel for the one person in it." : `This deletes the channel for all ${principalCount} people in it.`} Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone.`
+					? "We could not read how many people are in this channel. Deleting it will remove the channel for everyone who is in it. Nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings. This cannot be undone."
+					: `${principalCount === 1 ? "This deletes the channel for the one person in it." : `This deletes the channel for all ${principalCount} people in it.`} Nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings. This cannot be undone.`
 				: principalCount === null
-					? "We could not read who else is in this channel. If other people remain, they keep the channel and somebody who can add people has to add you back. If you are the only person left, leaving deletes it. Then nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files."
+					? "We could not read who else is in this channel. If other people remain, they keep the channel and somebody who can add people has to add you back. If you are the only person left, leaving deletes it. Then nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings."
 					: principalCount === 1
-						? "You are the only person in this channel, so leaving deletes it. Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone."
-						: `You stop seeing this channel and its messages here. If you are not the organization owner, you also lose access to its files. ${principalCount === 2 ? "The other person keeps it." : `The other ${principalCount - 1} people keep it.`} Somebody who can add people has to add you back.`;
+						? "You are the only person in this channel, so leaving deletes it. Nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings. This cannot be undone."
+						: `You stop seeing this channel and its messages here. Copies in Files follow their own sharing settings. ${principalCount === 2 ? "The other person keeps it." : `The other ${principalCount - 1} people keep it.`} Somebody who can add people has to add you back.`;
 
 	return (
 		<Dialog labelledBy={titleId} onClose={handle_close}>

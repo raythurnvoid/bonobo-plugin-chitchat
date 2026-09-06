@@ -22,6 +22,8 @@ function create_fake_host() {
 	const collections = new Map<string, Map<string, FakeDoc>>();
 	const files = new Map<string, string>();
 	const folders = new Map<string, { readOnly?: boolean; readScopeId?: string } | undefined>();
+	const folderNodeIds = new Map<string, string>();
+	let nextFolderId = 0;
 	const archivedPaths: string[] = [];
 	const occupiedFolderPaths = new Set<string>();
 	/** Scripted one-shot refusals by door path. */
@@ -78,6 +80,7 @@ function create_fake_host() {
 		collections,
 		files,
 		folders,
+		folderNodeIds,
 		archivedPaths,
 		occupiedFolderPaths,
 		refusals,
@@ -160,16 +163,25 @@ function create_fake_host() {
 			}
 			if (path === "/api/v1/files/write") {
 				fileWrites.push(body);
+				if (body.expectedParentNodeId !== undefined) {
+					const parentPath = String(body.path).slice(0, String(body.path).lastIndexOf("/"));
+					if (folderNodeIds.get(parentPath) !== body.expectedParentNodeId) {
+						return { status: 409, body: { message: "The parent folder changed" } };
+					}
+				}
 				files.set(body.path as string, body.content as string);
 				return { status: 200, body: { path: body.path, nodeId: `node-${body.path}`, contentType: "text/markdown" } };
 			}
 			if (path === "/api/v1/files/plugin-folders/ensure") {
 				if (occupiedFolderPaths.has(body.path as string)) {
-					return { status: 409, body: { message: "This path is used by an item this plugin does not own" } };
+					return { status: 409, body: { message: "This path is used by an item without this plugin's label" } };
 				}
 				const created = !folders.has(body.path as string);
-				folders.set(body.path as string, body.access as { readOnly?: boolean; readScopeId?: string } | undefined);
-				return { status: 200, body: { nodeId: `node-${body.path}`, path: body.path, created } };
+				if (created) {
+					folders.set(body.path as string, body.access as { readOnly?: boolean; readScopeId?: string } | undefined);
+					folderNodeIds.set(body.path as string, `folder-${++nextFolderId}`);
+				}
+				return { status: 200, body: { nodeId: folderNodeIds.get(body.path as string), path: body.path, created } };
 			}
 			if (path === "/api/v1/files/plugin-archive") {
 				const had = files.delete(body.path as string);
@@ -355,6 +367,60 @@ describe("message-send", () => {
 		expect(tail).toContain("hello");
 	});
 
+	test("a refused transcript keeps the stored key and an exact replay repairs only the file", async () => {
+		seed_public_channel();
+		const { tailPath } = seed_projection("chan-public", "general", "# general\n\nMember's extra text");
+		const send = { channelKey: "chan-public", text: "stored once", clientRequestId: "req-file-refused" };
+		fake.refusals.set("/api/v1/files/write", { status: 403, body: { message: "Plugin label is missing" } });
+
+		const sent = await invoke("message-send", send);
+		expect(sent.status).toBe(200);
+		expect(sent.body.transcriptUpdated).toBe(false);
+		expect(fake.collections.get("messages")!.get(sent.body.messageKey as string)!.value.text).toBe("stored once");
+		expect(fake.files.get(tailPath)).toBe("# general\n\nMember's extra text");
+
+		fake.refusals.set("/api/v1/files/write", { status: 409, body: { message: "This item is read-only" } });
+		const refusedReplay = await invoke("message-send", send);
+		expect(refusedReplay).toEqual({
+			status: 200,
+			body: { messageKey: sent.body.messageKey, replayed: true, transcriptUpdated: false },
+		});
+
+		const repaired = await invoke("message-send", send);
+		expect(repaired.body).toMatchObject({ messageKey: sent.body.messageKey, replayed: true });
+		expect(fake.collections.get("messages")!.size).toBe(1);
+		expect(fake.files.get(tailPath)).toContain("Member's extra text");
+		expect(fake.files.get(tailPath)!.split(`<!-- chitchat:msg:${sent.body.messageKey as string} -->`)).toHaveLength(2);
+	});
+
+	test("a cached root without the plugin label refuses before storing and does not choose a new root", async () => {
+		seed_public_channel();
+		seed_projection("chan-public");
+		fake.occupiedFolderPaths.add("/chitchat");
+
+		const sent = await invoke("message-send", { channelKey: "chan-public", text: "hi", clientRequestId: "req-root" });
+
+		expect(sent.status).toBe(409);
+		expect(fake.collections.get("messages")?.size ?? 0).toBe(0);
+		expect(fake.collections.get("requests")?.size ?? 0).toBe(0);
+		expect(fake.folders.size).toBe(0);
+		expect(fake.fileWrites).toHaveLength(0);
+	});
+
+	test.each([
+		{ status: 500, body: { message: "Unknown write result" }, message: "responded 500" },
+		{ status: 200, body: null, message: "the body was not JSON" },
+	])("an uncertain store response $status still escapes for exact retry", async ({ status, body, message }) => {
+		seed_public_channel();
+		seed_projection("chan-public");
+		fake.refusals.set("/api/v1/plugin-data/write-batch", { status, body });
+
+		await expect(
+			invoke("message-send", { channelKey: "chan-public", text: "hi", clientRequestId: "req-uncertain" }),
+		).rejects.toThrow(message);
+		expect(fake.fileWrites).toHaveLength(0);
+	});
+
 	test("a missing channel answers 404 and an archived channel answers 409", async () => {
 		const missing = await invoke("message-send", {
 			channelKey: "nope",
@@ -461,6 +527,30 @@ describe("message-send", () => {
 });
 
 describe("reply-send", () => {
+	test("a refused reply mirror preserves its stored key through refusal and repair on exact replay", async () => {
+		seed_public_channel();
+		const rootKey = minted_key("chan-public", 100);
+		fake.seed_doc("messages", rootKey, { text: "root", attachments: [], editedAt: null, deletedAt: null });
+		const { tailPath } = seed_projection("chan-public", "general", `# general\n\n<!-- chitchat:msg:${rootKey} -->\nroot`);
+		const original = fake.files.get(tailPath);
+		const input = { rootMessageKey: rootKey, text: "answer", clientRequestId: "req-refused-reply" };
+		fake.refusals.set("/api/v1/files/write", { status: 409, body: { message: "This item is read-only" } });
+
+		const sent = await invoke("reply-send", input);
+		expect(sent.status).toBe(200);
+		expect(sent.body.transcriptUpdated).toBe(false);
+		expect(fake.files.get(tailPath)).toBe(original);
+		expect(fake.collections.get("replies")!.get(sent.body.messageKey as string)!.value.text).toBe("answer");
+
+		fake.refusals.set("/api/v1/files/write", { status: 403, body: { message: "Plugin label is missing" } });
+		const replay = await invoke("reply-send", input);
+		expect(replay.body).toEqual({ messageKey: sent.body.messageKey, replayed: true, transcriptUpdated: false });
+		const repaired = await invoke("reply-send", input);
+		expect(repaired.status).toBe(200);
+		expect(fake.collections.get("replies")!.size).toBe(1);
+		expect(fake.files.get(tailPath)!.split(`<!-- chitchat:msg:${sent.body.messageKey as string} -->`)).toHaveLength(2);
+	});
+
 	test("nests the reply under its root, between the root and the next message", async () => {
 		seed_public_channel();
 		const rootKey = minted_key("chan-public", 100);
@@ -552,6 +642,24 @@ describe("message-edit and message-delete", () => {
 		return key;
 	}
 
+	test.each(["message-edit", "message-delete"])("%s returns the committed revision when folder ensure is refused", async (endpoint) => {
+		const key = seed_message("user_alice");
+		const original = fake.files.get("/chitchat/general.md");
+		fake.occupiedFolderPaths.add("/chitchat");
+
+		const changed = await invoke(endpoint, { messageKey: key, text: "corrected" });
+
+		expect(changed).toEqual({ status: 200, body: { transcriptUpdated: false, revision: 2 } });
+		const stored = fake.collections.get("messages")!.get(key)!;
+		expect(stored.revision).toBe(2);
+		if (endpoint === "message-edit") {
+			expect(stored.value.text).toBe("corrected");
+		} else {
+			expect(stored.value.deletedAt).not.toBeNull();
+		}
+		expect(fake.files.get("/chitchat/general.md")).toBe(original);
+	});
+
 	test("the author edits their message: doc updated and block rewritten with (edited)", async () => {
 		const key = seed_message("user_alice");
 
@@ -615,6 +723,22 @@ describe("message-edit and message-delete", () => {
 });
 
 describe("reaction-toggle", () => {
+	test("a refused transcript still returns the stored reaction key and revision", async () => {
+		seed_public_channel();
+		const key = minted_key("chan-public", 100);
+		fake.seed_doc("messages", key, { text: "root", attachments: [], editedAt: null, deletedAt: null });
+		const { tailPath } = seed_projection("chan-public", "general", `# general\n\n<!-- chitchat:msg:${key} -->\nroot`);
+		const original = fake.files.get(tailPath);
+		fake.refusals.set("/api/v1/files/write", { status: 409, body: { message: "This item is read-only" } });
+
+		const changed = await invoke("reaction-toggle", { targetKey: key, token: "heart", on: true });
+
+		const reactionKey = `${key}:heart:user_alice`;
+		expect(changed).toEqual({ status: 200, body: { transcriptUpdated: false, key: reactionKey, revision: 1 } });
+		expect(fake.collections.get("reactions")!.get(reactionKey)!.value).toEqual({ removed: false });
+		expect(fake.files.get(tailPath)).toBe(original);
+	});
+
 	test("toggling on writes the actor-keyed doc and renders the count; off removes it", async () => {
 		seed_public_channel();
 		const key = minted_key("chan-public", 100);
@@ -635,6 +759,35 @@ describe("reaction-toggle", () => {
 });
 
 describe("channel-manage", () => {
+	test("create and its replay keep the stored channel key when projection setup is refused", async () => {
+		const input = { action: "create", name: "general", clientRequestId: "req-create-refused" };
+		fake.refusals.set("/api/v1/files/plugin-folders/ensure", { status: 403, body: { message: "Permission denied" } });
+		const created = await invoke("channel-manage", input);
+		expect(created.status).toBe(200);
+		expect(created.body.transcriptUpdated).toBe(false);
+		expect(fake.collections.get("channels")!.get(created.body.channelKey as string)!.value.name).toBe("general");
+
+		fake.refusals.set("/api/v1/files/plugin-folders/ensure", { status: 403, body: { message: "Permission denied" } });
+		const replay = await invoke("channel-manage", input);
+		expect(replay).toEqual({
+			status: 200,
+			body: { channelKey: created.body.channelKey, replayed: true, transcriptUpdated: false },
+		});
+		expect(fake.collections.get("channels")!.size).toBe(1);
+	});
+
+	test("update keeps a stored rename when the transcript is refused, while explicit ensure reports refusal", async () => {
+		seed_public_channel();
+		seed_projection("chan-public");
+		fake.occupiedFolderPaths.add("/chitchat");
+
+		const updated = await invoke("channel-manage", { action: "update", channelKey: "chan-public", name: "renamed" });
+		expect(updated).toEqual({ status: 200, body: { transcriptUpdated: false } });
+		expect(fake.collections.get("channels")!.get("chan-public")!.value.name).toBe("renamed");
+		const ensured = await invoke("channel-manage", { action: "ensure", channelKey: "chan-public" });
+		expect(ensured.status).toBe(409);
+	});
+
 	test("create makes the doc, the projection, and the README row; a name twin gets a digest slug", async () => {
 		const first = await invoke("channel-manage", { action: "create", name: "general", clientRequestId: "req-c1" });
 		expect(first.status).toBe(200);
@@ -740,7 +893,137 @@ describe("channel-manage", () => {
 	});
 });
 
+describe("private transcript writes", () => {
+	const channelKey = "p/11111111-1111-1111-1111-111111111111";
+
+	async function ensure_private_channel() {
+		fake.seed_doc("channels", channelKey, { name: "secret", archivedAt: null });
+		expect((await invoke("channel-manage", { action: "ensure", channelKey })).status).toBe(200);
+		const state = fake.collections.get("channels")!.get(`${channelKey}:projection`)!.value;
+		const folderPath = state.folderPath as string;
+		return { folderPath, tailPath: `${folderPath}/${state.slug as string}.md` };
+	}
+
+	test("recreates missing cached folders with scoped access before writing a new tail", async () => {
+		const { folderPath, tailPath } = await ensure_private_channel();
+		const oldParentId = fake.folderNodeIds.get(folderPath);
+		fake.files.clear();
+		fake.folders.clear();
+		fake.folderNodeIds.clear();
+		fake.fileWrites.length = 0;
+		fake.calls.length = 0;
+
+		const sent = await invoke("message-send", { channelKey, text: "private text", clientRequestId: "req-recovered" });
+
+		expect(sent.status).toBe(200);
+		expect(fake.folders.get("/chitchat")).toEqual({ readOnly: true });
+		expect(fake.folders.get("/chitchat/private")).toEqual({ readOnly: true });
+		expect(fake.folders.get(folderPath)).toEqual({ readOnly: true, readScopeId: channelKey });
+		const parentId = fake.folderNodeIds.get(folderPath);
+		expect(parentId).not.toBe(oldParentId);
+		expect(fake.fileWrites).toHaveLength(1);
+		expect(fake.fileWrites[0]).toMatchObject({ path: tailPath, expectedParentNodeId: parentId });
+		expect(fake.files.get(tailPath)).toContain("private text");
+		expect(fake.calls.length).toBeLessThanOrEqual(20);
+		expect(fake.collections.get("channels")!.get(`${channelKey}:projection`)!.value).not.toHaveProperty("expectedParentNodeId");
+	});
+
+	test("repeated ensure keeps member-chosen sharing and an unlocked folder", async () => {
+		const { folderPath } = await ensure_private_channel();
+		fake.folders.set("/chitchat", { readOnly: false });
+		fake.folders.set(folderPath, { readOnly: false });
+		fake.calls.length = 0;
+
+		const sent = await invoke("message-send", { channelKey, text: "later update", clientRequestId: "req-manual-policy" });
+
+		expect(sent.status).toBe(200);
+		expect(fake.folders.get("/chitchat")).toEqual({ readOnly: false });
+		expect(fake.folders.get(folderPath)).toEqual({ readOnly: false });
+		expect(fake.calls).not.toContain("/api/v1/files/plugin-access/set");
+	});
+
+	test("a cached private folder without the plugin label refuses before storing", async () => {
+		const { folderPath } = await ensure_private_channel();
+		fake.occupiedFolderPaths.add(folderPath);
+		fake.fileWrites.length = 0;
+
+		const sent = await invoke("message-send", { channelKey, text: "private text", clientRequestId: "req-no-label" });
+
+		expect(sent.status).toBe(409);
+		expect(fake.collections.get("messages")?.size ?? 0).toBe(0);
+		expect(fake.fileWrites).toHaveLength(0);
+	});
+
+	test.each(["append", "reply", "edit", "rollover", "rename", "reconcile", "truncated reconcile", "replayed reply"])(
+		"%s sends the freshly ensured parent on every private file write",
+		async (operation) => {
+			const { folderPath, tailPath } = await ensure_private_channel();
+			const parentId = fake.folderNodeIds.get(folderPath);
+			// The bootstrap tail is private too. The README is the only public write in this run.
+			expect(fake.fileWrites.filter((write) => write.path === tailPath)).toEqual([
+				expect.objectContaining({ expectedParentNodeId: parentId }),
+			]);
+			const key = minted_key(channelKey, 100);
+			fake.seed_doc("messages", key, { text: "root", attachments: [], editedAt: null, deletedAt: null });
+			fake.files.set(tailPath, `${fake.files.get(tailPath)!}\n\n<!-- chitchat:msg:${key} -->\nroot`);
+			fake.fileWrites.length = 0;
+			fake.calls.length = 0;
+
+			let result;
+			if (operation === "reply" || operation === "replayed reply") {
+				const input = { rootMessageKey: key, text: "reply", clientRequestId: "req-parent-reply" };
+				if (operation === "replayed reply") {
+					fake.refusals.set("/api/v1/files/write", { status: 409, body: { message: "This item is read-only" } });
+					expect((await invoke("reply-send", input)).body.transcriptUpdated).toBe(false);
+					fake.calls.length = 0;
+				}
+				result = await invoke("reply-send", input);
+			} else if (operation === "edit") {
+				result = await invoke("message-edit", { messageKey: key, text: "edited" });
+			} else if (operation === "rename") {
+				result = await invoke("channel-manage", { action: "update", channelKey, name: "renamed" });
+			} else if (operation === "reconcile" || operation === "truncated reconcile") {
+				const count = operation === "reconcile" ? 7 : 301;
+				for (let index = 0; index < count; index += 1) {
+					fake.seed_doc("messages", minted_key(channelKey, 1000 + index), {
+						text: operation === "reconcile" ? "x".repeat(16_000) : `message ${index}`,
+						attachments: [], editedAt: null, deletedAt: null,
+					});
+				}
+				result = await invoke("reconcile", { channelKey });
+				if (operation === "reconcile") {
+					expect(result.body.files).toBe(2);
+				} else {
+					expect(result.body.truncated).toBe(true);
+				}
+			} else {
+				if (operation === "rollover") {
+					fake.files.set(tailPath, `${fake.files.get(tailPath)!}\n${"x".repeat(99_000)}`);
+				}
+				result = await invoke("message-send", { channelKey, text: "z".repeat(2000), clientRequestId: "req-parent-send" });
+			}
+
+			expect(result.status).toBe(200);
+			expect(fake.fileWrites.length).toBeGreaterThan(0);
+			for (const write of fake.fileWrites) {
+				expect(write.expectedParentNodeId).toBe(parentId);
+			}
+			expect(fake.calls.length).toBeLessThanOrEqual(20);
+		},
+	);
+});
+
 describe("reconcile", () => {
+	test("explicit reconcile reports a file refusal", async () => {
+		seed_public_channel();
+		seed_projection("chan-public");
+		fake.refusals.set("/api/v1/files/write", { status: 409, body: { message: "This item is read-only" } });
+
+		const reconciled = await invoke("reconcile", { channelKey: "chan-public" });
+
+		expect(reconciled).toEqual({ status: 409, body: { message: "This item is read-only" } });
+	});
+
 	test("rebuilds the full transcript from store docs and archives stale rolled files", async () => {
 		seed_public_channel();
 		const oldKey = minted_key("chan-public", 100);

@@ -12,12 +12,11 @@ import { chat_ANONYMOUS_MEMBER_LABEL, chat_REACTION_EMOJI } from "../chat-data";
 const MISSING_NAME = chat_ANONYMOUS_MEMBER_LABEL;
 
 /**
- * Copied from the host's `PRIVATE_DISCLOSURE`. The organization owner reads every scope and
- * every restricted file before any grant is consulted, so copy that says "private" must say
- * this too. The wording is the file header's, not the chat page's — keep them separate.
+ * File sharing starts with the channel's readers. A file manager can change it for later
+ * updates too. Keep this file-header wording separate from the chat-page disclosure.
  */
 const PRIVATE_DISCLOSURE =
-	"Only the people in this channel can read this file — and the organization owner, who can read everything in this workspace.";
+	"This copy starts with access for the channel's members and the organization owner. File managers can change its sharing, including who can read later updates.";
 
 /**
  * Rollover cap for one projected file, in UTF-8 bytes. The host engine used 600,000; the plugin
@@ -442,11 +441,13 @@ export function chatbe_readme_markdown(channels: { name: string; slug: string }[
 		"",
 		"These files are a derived copy of Chitchat channels in this workspace.",
 		"",
-		"- Edit chat in the Chitchat page, not in these files.",
-		"- Private channels appear under `private/`. Each channel folder is visible only to the people in that channel — and the organization owner, who can read everything in this workspace.",
-		"- Do not share those folders by hand. The plugin resets each folder's sharing to the channel's members.",
+		"- Edit chat in the Chitchat page. File edits do not change chat and may be replaced by later updates.",
+		"- Private channels appear under `private/`. New channel folders allow the channel's members and the organization owner to read them.",
+		"- File managers can change sharing. Later updates follow that sharing, even if channel membership changes.",
 		"- Author names are a snapshot written with each message. A rename shows up on later messages.",
-		"- The folder is read-only. The workspace agent can read these files with bash.",
+		"- New files and folders start locked. File managers can unlock them or apply their own lock to stop plugin writes.",
+		"- The `plugin-name` metadata label lets Chitchat update a file or reuse a folder. Removing it stops those operations. The `source` label is only a description.",
+		"- The workspace agent can read files it has access to with bash.",
 	];
 
 	const sorted = [...channels].sort((left, right) => left.name.localeCompare(right.name));

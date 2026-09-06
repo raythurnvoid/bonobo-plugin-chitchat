@@ -211,7 +211,7 @@ describe("chatbe_build_channel_markdown", () => {
 			[
 				"# general",
 				"",
-				"Private Chitchat channel. Only the people in this channel can read this file — and the organization owner, who can read everything in this workspace. This file is a derived copy. Edit chat in the Chitchat page, not here.",
+				"Private Chitchat channel. This copy starts with access for the channel's members and the organization owner. File managers can change its sharing, including who can read later updates. This file is a derived copy. Edit chat in the Chitchat page, not here.",
 				"",
 				"Daily talk",
 				"",
@@ -501,5 +501,9 @@ describe("chatbe_readme_markdown", () => {
 
 		expect(markdown.indexOf("- [general](./general.md)")).toBeLessThan(markdown.indexOf("- [zebra](./zebra.md)"));
 		expect(markdown).toContain("derived copy");
+		expect(markdown).toContain("Later updates follow that sharing, even if channel membership changes.");
+		expect(markdown).toContain("File managers can unlock them or apply their own lock");
+		expect(markdown).toContain("The `source` label is only a description.");
+		expect(markdown).not.toContain("resets each folder's sharing");
 	});
 });

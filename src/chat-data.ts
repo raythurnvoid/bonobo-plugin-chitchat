@@ -91,7 +91,7 @@ export const chat_PRIVATE_CHANNEL_COLLECTIONS = ["channels", "messages", "replie
  * disclosure, so this sentence travels with it.
  */
 export const chat_PRIVATE_CHANNEL_DISCLOSURE =
-	"Only the people added here can read it — and the organization owner, who can read everything in this workspace.";
+	"Only the people added here and the organization owner can read this channel. Its copies in Files have separate sharing settings. File managers can share those copies, including later updates, with other people.";
 
 /**
  * Channel keys are client-generated. Public channels use `put`; private channels use the atomic

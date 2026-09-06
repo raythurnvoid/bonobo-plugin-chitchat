@@ -17027,7 +17027,7 @@ var Yb = "p/",
 	fk = /^p\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
 	kh = ["channels", "messages", "replies", "reactions"],
 	nm =
-		"Only the people added here can read it — and the organization owner, who can read everything in this workspace.";
+		"Only the people added here and the organization owner can read this channel. Its copies in Files have separate sharing settings. File managers can share those copies, including later updates, with other people.";
 function dk(e) {
 	const n = crypto.randomUUID();
 	return e === "private" ? `${Yb}${n}` : n;
@@ -25848,13 +25848,13 @@ function hD(e) {
 				? ""
 				: e.action === "delete"
 					? i === null
-						? "We could not read how many people are in this channel. Deleting it will remove the channel for everyone who is in it. Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone."
-						: `${i === 1 ? "This deletes the channel for the one person in it." : `This deletes the channel for all ${i} people in it.`} Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone.`
+						? "We could not read how many people are in this channel. Deleting it will remove the channel for everyone who is in it. Nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings. This cannot be undone."
+						: `${i === 1 ? "This deletes the channel for the one person in it." : `This deletes the channel for all ${i} people in it.`} Nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings. This cannot be undone.`
 					: i === null
-						? "We could not read who else is in this channel. If other people remain, they keep the channel and somebody who can add people has to add you back. If you are the only person left, leaving deletes it. Then nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files."
+						? "We could not read who else is in this channel. If other people remain, they keep the channel and somebody who can add people has to add you back. If you are the only person left, leaving deletes it. Then nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings."
 						: i === 1
-							? "You are the only person in this channel, so leaving deletes it. Nobody will be able to open the channel again. The organization owner may still be able to read messages that were copied into archived files. This cannot be undone."
-							: `You stop seeing this channel and its messages here. If you are not the organization owner, you also lose access to its files. ${i === 2 ? "The other person keeps it." : `The other ${i - 1} people keep it.`} Somebody who can add people has to add you back.`;
+							? "You are the only person in this channel, so leaving deletes it. Nobody will be able to open the channel again. Copies in Files may still be readable under their sharing settings. This cannot be undone."
+							: `You stop seeing this channel and its messages here. Copies in Files follow their own sharing settings. ${i === 2 ? "The other person keeps it." : `The other ${i - 1} people keep it.`} Somebody who can add people has to add you back.`;
 	return (0, S.jsxs)(Wu, {
 		labelledBy: n,
 		onClose: v,

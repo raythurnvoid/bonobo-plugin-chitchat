@@ -56,10 +56,9 @@ import {
  * Markdown transcript files. A file update that fails or finds no block leaves the store
  * correct; the reconcile endpoint rebuilds the transcript from the store.
  *
- * Authorization model: the host verifies the acting member (`actorUserId`) and every store or
- * file door re-checks scope membership, so a non-member's call on a private channel fails at the
- * door and the refusal is relayed. The worker itself only adds the authorship rule: members may
- * edit and delete their own messages only.
+ * The host checks the acting member and each store scope. File doors use the current Files
+ * access rules, which a file manager can change. The worker also checks authorship: members
+ * may edit and delete their own messages only.
  */
 
 /** The host store door refuses values over this canonical-JSON size; pre-check for a clear message. */
@@ -220,7 +219,7 @@ async function files_read_or_null(ctx: Ctx, path: string) {
  * Every transcript write asks for the plugin-named lock. On a create that locks the new file;
  * on an update the door ignores the request and the existing lock stays.
  */
-function files_write(ctx: Ctx, path: string, content: string) {
+function files_write(ctx: Ctx, path: string, content: string, expectedParentNodeId?: string) {
 	return door(
 		ctx,
 		"/api/v1/files/write",
@@ -231,7 +230,7 @@ function files_write(ctx: Ctx, path: string, content: string) {
 		// guard looks that marker up to decide whether a block is already in the file, so with the
 		// markers gone it always decided "missing" and appended a second copy of the same message.
 		// The door reads this flag only when the write creates the file.
-		{ path, content, nonCollaborative: true, access: { readOnly: true } },
+		{ path, content, nonCollaborative: true, access: { readOnly: true }, expectedParentNodeId },
 	);
 }
 
@@ -437,7 +436,8 @@ async function ensure_root(ctx: Ctx): Promise<chatbe_RootState | Response> {
 		return existing;
 	}
 	if (existing !== null) {
-		return existing;
+		const ensured = await folders_ensure(ctx, existing.rootPath, { readOnly: true });
+		return ensured instanceof Response ? ensured : existing;
 	}
 
 	let rootPath = DEFAULT_ROOT_PATH;
@@ -446,7 +446,7 @@ async function ensure_root(ctx: Ctx): Promise<chatbe_RootState | Response> {
 		if (ensured.status !== 409) {
 			return ensured;
 		}
-		// `/chitchat` is used by an item this plugin does not own. Take a deterministic sibling.
+		// `/chitchat` is used by an item without this plugin's label. Take a deterministic sibling.
 		const digest = await chatbe_sha256_hex(ctx.rootDigestInput);
 		rootPath = `${DEFAULT_ROOT_PATH}-${digest.slice(0, 8)}`;
 		ensured = await folders_ensure(ctx, rootPath, { readOnly: true });
@@ -508,6 +508,7 @@ type ChannelProjection = {
 	rootState: chatbe_RootState;
 	state: chatbe_ChannelState;
 	stateLocation: { collection: string; key: string };
+	expectedParentNodeId?: string;
 };
 
 /**
@@ -527,31 +528,38 @@ async function ensure_channel(ctx: Ctx, channel: ChannelDoc): Promise<ChannelPro
 		return read;
 	}
 	const existingDoc = parse_stored_doc(read.document);
-	if (existingDoc !== null) {
-		const existingState = chatbe_channel_state_schema.safeParse(existingDoc.value);
-		if (existingState.success) {
-			return { rootState, state: existingState.data, stateLocation };
-		}
+	const existingState = existingDoc === null ? null : chatbe_channel_state_schema.safeParse(existingDoc.value);
+	if (existingState?.success && !chat_channel_is_private(channel.key)) {
+		return { rootState, state: existingState.data, stateLocation };
 	}
 
 	let slug: string;
 	let folderPath: string;
+	let expectedParentNodeId: string | undefined;
 	if (chat_channel_is_private(channel.key)) {
 		// A digest suffix keeps two same-named private channels in separate folders, because two
 		// channels sharing one ACL-bound folder would leak one channel to the other's members.
-		const digest = await chatbe_sha256_hex(channel.key);
-		slug = `${chatbe_slug_channel_name(channel.name)}-${digest.slice(0, 8)}`;
-		folderPath = `${rootState.rootPath}/private/${slug}`;
+		if (existingState?.success) {
+			slug = existingState.data.slug;
+			folderPath = existingState.data.folderPath;
+		} else {
+			const digest = await chatbe_sha256_hex(channel.key);
+			slug = `${chatbe_slug_channel_name(channel.name)}-${digest.slice(0, 8)}`;
+			folderPath = `${rootState.rootPath}/private/${slug}`;
+		}
 
 		const parent = await folders_ensure(ctx, `${rootState.rootPath}/private`, { readOnly: true });
 		if (parent instanceof Response) {
 			return parent;
 		}
-		// The channel's data scope id IS the channel key; binding it makes the folder readable by
-		// exactly the channel's members (and the organization owner).
+		// New folders use the channel's readers. Existing folders keep the member's Files policy.
 		const folder = await folders_ensure(ctx, folderPath, { readOnly: true, readScopeId: channel.key });
 		if (folder instanceof Response) {
 			return folder;
+		}
+		expectedParentNodeId = folder.nodeId;
+		if (existingState?.success) {
+			return { rootState, state: existingState.data, stateLocation, expectedParentNodeId };
 		}
 	} else {
 		const states = await list_public_channel_states(ctx);
@@ -591,14 +599,14 @@ async function ensure_channel(ctx: Ctx, channel: ChannelDoc): Promise<ChannelPro
 	};
 
 	// Keep an existing tail's content: `ensure_channel` may run because only the state doc was
-	// lost. A 409 answer would mean an unowned occupant, which files_write reports anyway.
+	// lost. The write door still checks the file's plugin label before changing it.
 	const existingTail = await files_read_or_null(ctx, chatbe_tail_path(state));
 	if (existingTail instanceof Response) {
 		return existingTail;
 	}
 	if (existingTail === null) {
 		const header = chatbe_channel_header(channel.name, channel.topic, chat_channel_is_private(channel.key));
-		const tail = await files_write(ctx, chatbe_tail_path(state), header);
+		const tail = await files_write(ctx, chatbe_tail_path(state), header, expectedParentNodeId);
 		if (tail instanceof Response) {
 			return tail;
 		}
@@ -608,7 +616,7 @@ async function ensure_channel(ctx: Ctx, channel: ChannelDoc): Promise<ChannelPro
 	if (stateWrite instanceof Response) {
 		return stateWrite;
 	}
-	return { rootState, state, stateLocation };
+	return { rootState, state, stateLocation, expectedParentNodeId };
 }
 
 /**
@@ -618,7 +626,7 @@ async function ensure_channel(ctx: Ctx, channel: ChannelDoc): Promise<ChannelPro
  * a small, documented deviation from the core splitter's header-less rollover files.
  */
 async function append_block(ctx: Ctx, projection: ChannelProjection, channel: ChannelDoc, block: string) {
-	const { state, stateLocation } = projection;
+	const { state, stateLocation, expectedParentNodeId } = projection;
 	const tailPath = chatbe_tail_path(state);
 	const header = chatbe_channel_header(channel.name, channel.topic, chat_channel_is_private(channel.key));
 
@@ -640,18 +648,18 @@ async function append_block(ctx: Ctx, projection: ChannelProjection, channel: Ch
 	const appended = `${content}\n\n${block}`;
 	if (chatbe_utf8_byte_size(appended) > chatbe_ROLLOVER_MAX_BYTES) {
 		const archivedPath = chatbe_rollover_path(state.folderPath, state.slug, state.tailIndex + 1);
-		const archived = await files_write(ctx, archivedPath, content);
+		const archived = await files_write(ctx, archivedPath, content, expectedParentNodeId);
 		if (archived instanceof Response) {
 			return archived;
 		}
-		const restarted = await files_write(ctx, tailPath, `${header}\n\n${block}`);
+		const restarted = await files_write(ctx, tailPath, `${header}\n\n${block}`, expectedParentNodeId);
 		if (restarted instanceof Response) {
 			return restarted;
 		}
 		state.tailIndex += 1;
 		stateChanged = true;
 	} else {
-		const written = await files_write(ctx, tailPath, appended);
+		const written = await files_write(ctx, tailPath, appended, expectedParentNodeId);
 		if (written instanceof Response) {
 			return written;
 		}
@@ -673,10 +681,11 @@ async function append_block(ctx: Ctx, projection: ChannelProjection, channel: Ch
  */
 async function update_block_in_transcript(
 	ctx: Ctx,
-	state: chatbe_ChannelState,
+	projection: ChannelProjection,
 	key: string,
 	edit: (content: string) => string | null,
 ): Promise<boolean | Response> {
+	const { state, expectedParentNodeId } = projection;
 	const paths = [chatbe_tail_path(state)];
 	for (let index = state.tailIndex; index >= 1 && paths.length < TRANSCRIPT_SCAN_MAX_FILES; index -= 1) {
 		paths.push(chatbe_rollover_path(state.folderPath, state.slug, index));
@@ -695,7 +704,7 @@ async function update_block_in_transcript(
 		if (edited === null) {
 			continue;
 		}
-		const written = await files_write(ctx, path, edited);
+		const written = await files_write(ctx, path, edited, expectedParentNodeId);
 		if (written instanceof Response) {
 			return written;
 		}
@@ -744,10 +753,11 @@ async function handle_message_send(ctx: Ctx, input: z.infer<typeof send_input_sc
 	}
 	if (replayed !== null) {
 		const repaired = await repair_replayed_block(ctx, replayed.messageKey);
-		if (repaired instanceof Response) {
-			return repaired;
-		}
-		return json_response(200, { messageKey: replayed.messageKey, replayed: true });
+		return json_response(200, {
+			messageKey: replayed.messageKey,
+			replayed: true,
+			...(repaired instanceof Response ? { transcriptUpdated: false } : {}),
+		});
 	}
 
 	const channel = await read_channel_doc(ctx, input.channelKey);
@@ -803,11 +813,7 @@ async function handle_message_send(ctx: Ctx, input: z.infer<typeof send_input_sc
 		return refuse(500, "Failed to render the sent message");
 	}
 	const appended = await append_block(ctx, projection, channel, render_block(doc, []));
-	if (appended instanceof Response) {
-		return appended;
-	}
-
-	return json_response(200, { messageKey });
+	return json_response(200, { messageKey, ...(appended instanceof Response ? { transcriptUpdated: false } : {}) });
 }
 
 const reply_input_schema = z.object({
@@ -826,10 +832,11 @@ async function handle_reply_send(ctx: Ctx, input: z.infer<typeof reply_input_sch
 	}
 	if (replayed !== null) {
 		const repaired = await repair_replayed_block(ctx, replayed.messageKey);
-		if (repaired instanceof Response) {
-			return repaired;
-		}
-		return json_response(200, { messageKey: replayed.messageKey, replayed: true });
+		return json_response(200, {
+			messageKey: replayed.messageKey,
+			replayed: true,
+			...(repaired instanceof Response ? { transcriptUpdated: false } : {}),
+		});
 	}
 
 	if (message_collection_for_key(input.rootMessageKey) !== "messages") {
@@ -896,14 +903,10 @@ async function handle_reply_send(ctx: Ctx, input: z.infer<typeof reply_input_sch
 		return refuse(500, "Failed to render the sent reply");
 	}
 	const block = render_block(doc, []);
-	const transcriptUpdated = await update_block_in_transcript(ctx, projection.state, input.rootMessageKey, (content) =>
+	const transcriptUpdated = await update_block_in_transcript(ctx, projection, input.rootMessageKey, (content) =>
 		chatbe_insert_reply_block(content, input.rootMessageKey, block),
 	);
-	if (transcriptUpdated instanceof Response) {
-		return transcriptUpdated;
-	}
-
-	return json_response(200, { messageKey: replyKey, transcriptUpdated });
+	return json_response(200, { messageKey: replyKey, transcriptUpdated: transcriptUpdated === true });
 }
 
 const edit_input_schema = z.object({
@@ -1021,7 +1024,7 @@ async function repair_replayed_block(ctx: Ctx, messageKey: string): Promise<null
 	if (rootKey === null) {
 		return null;
 	}
-	const inserted = await update_block_in_transcript(ctx, projection.state, rootKey, (content) =>
+	const inserted = await update_block_in_transcript(ctx, projection, rootKey, (content) =>
 		chatbe_insert_reply_block(content, rootKey, block),
 	);
 	return inserted instanceof Response ? inserted : null;
@@ -1045,7 +1048,7 @@ async function splice_updated_block(ctx: Ctx, doc: MessageDoc) {
 		return reactions;
 	}
 	const block = render_block(doc, reactions);
-	return update_block_in_transcript(ctx, projection.state, doc.key, (content) =>
+	return update_block_in_transcript(ctx, projection, doc.key, (content) =>
 		chatbe_splice_block(content, doc.key, block),
 	);
 }
@@ -1081,11 +1084,8 @@ async function handle_message_edit(ctx: Ctx, input: z.infer<typeof edit_input_sc
 		value: { ...loaded.doc.value, text: input.text, editedAt: ctx.now, mentions: input.mentions },
 	};
 	const transcriptUpdated = await splice_updated_block(ctx, updatedDoc);
-	if (transcriptUpdated instanceof Response) {
-		return transcriptUpdated;
-	}
 	// The page echoes the stored doc locally; the revision keeps its merge-forward store correct.
-	return json_response(200, { transcriptUpdated, revision: written.revision });
+	return json_response(200, { transcriptUpdated: transcriptUpdated === true, revision: written.revision });
 }
 
 async function handle_message_delete(ctx: Ctx, input: z.infer<typeof delete_input_schema>) {
@@ -1114,10 +1114,7 @@ async function handle_message_delete(ctx: Ctx, input: z.infer<typeof delete_inpu
 
 	const updatedDoc: MessageDoc = { ...loaded.doc, value: { ...loaded.doc.value, deletedAt: ctx.now } };
 	const transcriptUpdated = await splice_updated_block(ctx, updatedDoc);
-	if (transcriptUpdated instanceof Response) {
-		return transcriptUpdated;
-	}
-	return json_response(200, { transcriptUpdated, revision: written.revision });
+	return json_response(200, { transcriptUpdated: transcriptUpdated === true, revision: written.revision });
 }
 
 const reaction_input_schema = z.object({
@@ -1149,10 +1146,7 @@ async function handle_reaction_toggle(ctx: Ctx, input: z.infer<typeof reaction_i
 	}
 
 	const transcriptUpdated = await splice_updated_block(ctx, target);
-	if (transcriptUpdated instanceof Response) {
-		return transcriptUpdated;
-	}
-	return json_response(200, { transcriptUpdated, key: reactionKey, revision: written.revision });
+	return json_response(200, { transcriptUpdated: transcriptUpdated === true, key: reactionKey, revision: written.revision });
 }
 
 const channel_manage_input_schema = z.discriminatedUnion("action", [
@@ -1188,7 +1182,7 @@ async function refresh_channel_projection(ctx: Ctx, channel: ChannelDoc) {
 	if (projection instanceof Response) {
 		return projection;
 	}
-	const { state, stateLocation, rootState } = projection;
+	const { state, stateLocation, rootState, expectedParentNodeId } = projection;
 
 	if (state.name !== channel.name || state.topic !== channel.topic || state.archived !== channel.archived) {
 		if (state.name !== channel.name || state.topic !== channel.topic) {
@@ -1199,7 +1193,7 @@ async function refresh_channel_projection(ctx: Ctx, channel: ChannelDoc) {
 			}
 			if (tail !== null) {
 				const header = chatbe_channel_header(channel.name, channel.topic, chat_channel_is_private(channel.key));
-				const written = await files_write(ctx, tailPath, chatbe_replace_header(tail.content, header));
+				const written = await files_write(ctx, tailPath, chatbe_replace_header(tail.content, header), expectedParentNodeId);
 				if (written instanceof Response) {
 					return written;
 				}
@@ -1243,10 +1237,11 @@ async function handle_channel_manage(ctx: Ctx, input: z.infer<typeof channel_man
 				return channel;
 			}
 			const ensured = await ensure_channel(ctx, channel);
-			if (ensured instanceof Response) {
-				return ensured;
-			}
-			return json_response(200, { channelKey: replayed.messageKey, replayed: true });
+			return json_response(200, {
+				channelKey: replayed.messageKey,
+				replayed: true,
+				...(ensured instanceof Response ? { transcriptUpdated: false } : {}),
+			});
 		}
 
 		// Public only. A private channel needs its data scope, which only the page's user-door
@@ -1279,10 +1274,7 @@ async function handle_channel_manage(ctx: Ctx, input: z.infer<typeof channel_man
 			archived: false,
 			archivedAt: null,
 		});
-		if (ensured instanceof Response) {
-			return ensured;
-		}
-		return json_response(200, { channelKey });
+		return json_response(200, { channelKey, ...(ensured instanceof Response ? { transcriptUpdated: false } : {}) });
 	}
 
 	const channel = await read_channel_doc(ctx, input.channelKey);
@@ -1318,10 +1310,7 @@ async function handle_channel_manage(ctx: Ctx, input: z.infer<typeof channel_man
 	}
 
 	const refreshed = await refresh_channel_projection(ctx, updated);
-	if (refreshed instanceof Response) {
-		return refreshed;
-	}
-	return json_response(200, {});
+	return json_response(200, refreshed instanceof Response ? { transcriptUpdated: false } : {});
 }
 
 const reconcile_input_schema = z.object({
@@ -1358,7 +1347,7 @@ async function handle_reconcile(ctx: Ctx, input: z.infer<typeof reconcile_input_
 	if (projection instanceof Response) {
 		return projection;
 	}
-	const { state, stateLocation } = projection;
+	const { state, stateLocation, expectedParentNodeId } = projection;
 
 	const collect = async (collection: string, maxPages: number) => {
 		const documents: unknown[] = [];
@@ -1460,7 +1449,7 @@ async function handle_reconcile(ctx: Ctx, input: z.infer<typeof reconcile_input_
 		// Too much history for one run: rewrite only the tail with the newest blocks that fit,
 		// leave rolled files alone, and say so.
 		const files = chatbe_split_rollover({ header, blocks, maxBytes: chatbe_ROLLOVER_MAX_BYTES });
-		const written = await files_write(ctx, chatbe_tail_path(state), files[files.length - 1]!);
+		const written = await files_write(ctx, chatbe_tail_path(state), files[files.length - 1]!, expectedParentNodeId);
 		if (written instanceof Response) {
 			return written;
 		}
@@ -1470,12 +1459,17 @@ async function handle_reconcile(ctx: Ctx, input: z.infer<typeof reconcile_input_
 	const files = chatbe_split_rollover({ header, blocks, maxBytes: chatbe_ROLLOVER_MAX_BYTES });
 	// `files` is oldest-first; the newest becomes the tail, the rest the numbered rolled files.
 	for (let index = 0; index < files.length - 1; index += 1) {
-		const written = await files_write(ctx, chatbe_rollover_path(state.folderPath, state.slug, index + 1), files[index]!);
+		const written = await files_write(
+			ctx,
+			chatbe_rollover_path(state.folderPath, state.slug, index + 1),
+			files[index]!,
+			expectedParentNodeId,
+		);
 		if (written instanceof Response) {
 			return written;
 		}
 	}
-	const tailWritten = await files_write(ctx, chatbe_tail_path(state), files[files.length - 1]!);
+	const tailWritten = await files_write(ctx, chatbe_tail_path(state), files[files.length - 1]!, expectedParentNodeId);
 	if (tailWritten instanceof Response) {
 		return tailWritten;
 	}
