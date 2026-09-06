@@ -64,10 +64,11 @@ reason.
 After a confirmed store write, a definite transcript refusal returns success with
 `transcriptUpdated: false`. Sends keep their stored message key, edits and reactions keep their
 stored revision, and exact request replays keep the original key and `replayed: true`. A later
-replay or reconcile can retry the transcript after access is restored. A folder ensure failure
-before a send's store write still refuses the send. Explicit ensure and reconcile report their
-own failures. A 5xx, unreadable response, or network failure remains an uncertain result;
-the page must keep the same request ID when it retries.
+replay or reconcile can retry the transcript after access is restored. A definite folder ensure
+refusal still lets a send or reply try its source write. A confirmed source write returns success
+with `transcriptUpdated: false` and skips transcript writes. A refused source write keeps its own
+failure. Explicit ensure and reconcile report their own failures. A 5xx, unreadable response,
+or network failure remains an uncertain result; the page must keep the same request ID when it retries.
 
 The page calls these with `client.fetchJson("/api/v1/plugin-backend/invoke", { endpoint, input })`,
 wrapped in `src/chat-invoke.ts`: it waits out the held-back answers (409 is the serialization lock,

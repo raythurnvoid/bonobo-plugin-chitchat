@@ -393,16 +393,17 @@ describe("message-send", () => {
 		expect(fake.files.get(tailPath)!.split(`<!-- chitchat:msg:${sent.body.messageKey as string} -->`)).toHaveLength(2);
 	});
 
-	test("a cached root without the plugin label refuses before storing and does not choose a new root", async () => {
+	test("a cached root without the plugin label keeps the source send and does not choose a new root", async () => {
 		seed_public_channel();
 		seed_projection("chan-public");
 		fake.occupiedFolderPaths.add("/chitchat");
 
 		const sent = await invoke("message-send", { channelKey: "chan-public", text: "hi", clientRequestId: "req-root" });
 
-		expect(sent.status).toBe(409);
-		expect(fake.collections.get("messages")?.size ?? 0).toBe(0);
-		expect(fake.collections.get("requests")?.size ?? 0).toBe(0);
+		expect(sent.status).toBe(200);
+		expect(sent.body.transcriptUpdated).toBe(false);
+		expect(fake.collections.get("messages")!.get(sent.body.messageKey as string)!.value.text).toBe("hi");
+		expect(fake.collections.get("requests")!.get("req-root")!.value.messageKey).toBe(sent.body.messageKey);
 		expect(fake.folders.size).toBe(0);
 		expect(fake.fileWrites).toHaveLength(0);
 	});
@@ -942,16 +943,106 @@ describe("private transcript writes", () => {
 		expect(fake.calls).not.toContain("/api/v1/files/plugin-access/set");
 	});
 
-	test("a cached private folder without the plugin label refuses before storing", async () => {
+	test("a cached private folder without the plugin label keeps the source send", async () => {
 		const { folderPath } = await ensure_private_channel();
 		fake.occupiedFolderPaths.add(folderPath);
 		fake.fileWrites.length = 0;
 
 		const sent = await invoke("message-send", { channelKey, text: "private text", clientRequestId: "req-no-label" });
 
-		expect(sent.status).toBe(409);
-		expect(fake.collections.get("messages")?.size ?? 0).toBe(0);
+		expect(sent.status).toBe(200);
+		expect(sent.body.transcriptUpdated).toBe(false);
+		expect(fake.collections.get("messages")!.get(sent.body.messageKey as string)!.value.text).toBe("private text");
 		expect(fake.fileWrites).toHaveLength(0);
+	});
+
+	test.each([
+		["message-send", "fresh"],
+		["message-send", "cached"],
+		["reply-send", "fresh"],
+		["reply-send", "cached"],
+	] as const)("%s stores once after a %s private folder ensure refusal", async (endpoint, projection) => {
+		if (projection === "cached") {
+			await ensure_private_channel();
+		} else {
+			fake.seed_doc("channels", channelKey, { name: "secret", archivedAt: null });
+			fake.seed_doc("projection", "__root__", { rootPath: "/chitchat", readmePath: "/chitchat/README.md" });
+		}
+		const rootKey = minted_key(channelKey, 100);
+		if (endpoint === "reply-send") {
+			fake.seed_doc("messages", rootKey, { text: "root", attachments: [], editedAt: null, deletedAt: null });
+		}
+		fake.actor = "user_bob";
+		fake.fileWrites.length = 0;
+		fake.calls.length = 0;
+		const filesBefore = [...fake.files];
+		const original = fake.handle;
+		vi.spyOn(fake, "handle").mockImplementation((path, body) => {
+			if (
+				path === "/api/v1/files/plugin-folders/ensure" &&
+				typeof body.path === "string" &&
+				body.path.startsWith("/chitchat/private/")
+			) {
+				fake.calls.push(path);
+				return { status: 403, body: { message: "Permission denied" } };
+			}
+			return original(path, body);
+		});
+		const input = {
+			...(endpoint === "message-send" ? { channelKey } : { rootMessageKey: rootKey }),
+			text: "stored once",
+			clientRequestId: "req-private-ensure",
+		};
+
+		const sent = await invoke(endpoint, input);
+		expect(sent.status).toBe(200);
+		expect(sent.body.transcriptUpdated).toBe(false);
+		const collection = endpoint === "message-send" ? "messages" : "replies";
+		const messageKey = sent.body.messageKey as string;
+		expect(fake.collections.get(collection)!.get(messageKey)).toMatchObject({
+			value: { text: "stored once" },
+			createdBy: "user_bob",
+			revision: 1,
+		});
+		expect(fake.calls.indexOf("/api/v1/files/plugin-folders/ensure")).toBeLessThan(
+			fake.calls.indexOf("/api/v1/plugin-data/write-batch"),
+		);
+
+		const replay = await invoke(endpoint, input);
+		expect(replay).toEqual({ status: 200, body: { messageKey, replayed: true, transcriptUpdated: false } });
+		expect(fake.calls.filter((path) => path === "/api/v1/plugin-data/write-batch")).toHaveLength(1);
+		expect(fake.collections.get(collection)!.size).toBe(1);
+		expect(fake.collections.get(collection)!.get(messageKey)!.revision).toBe(1);
+		expect(fake.collections.get("requests")!.get(input.clientRequestId)).toMatchObject({
+			value: { messageKey },
+			revision: 1,
+		});
+
+		fake.refusals.set("/api/v1/plugin-data/write-batch", { status: 403, body: { message: "Source write denied" } });
+		const denied = await invoke(endpoint, { ...input, clientRequestId: "req-denied-source" });
+		expect(denied).toEqual({ status: 403, body: { message: "Source write denied" } });
+		expect(fake.collections.get(collection)!.size).toBe(1);
+		expect(fake.collections.get("requests")!.has("req-denied-source")).toBe(false);
+		expect(fake.fileWrites).toHaveLength(0);
+		expect([...fake.files]).toEqual(filesBefore);
+	});
+
+	test.each(["message-send", "reply-send"])("%s keeps an uncertain ensure result before the source write", async (endpoint) => {
+		await ensure_private_channel();
+		const rootKey = minted_key(channelKey, 100);
+		fake.seed_doc("messages", rootKey, { text: "root", attachments: [], editedAt: null, deletedAt: null });
+		fake.calls.length = 0;
+		fake.refusals.set("/api/v1/files/plugin-folders/ensure", { status: 500, body: { message: "Unknown ensure result" } });
+
+		await expect(
+			invoke(endpoint, {
+				...(endpoint === "message-send" ? { channelKey } : { rootMessageKey: rootKey }),
+				text: "private text",
+				clientRequestId: "req-uncertain-ensure",
+			}),
+		).rejects.toThrow("responded 500");
+		expect(fake.calls).not.toContain("/api/v1/plugin-data/write-batch");
+		expect(fake.collections.get("requests")?.has("req-uncertain-ensure") ?? false).toBe(false);
 	});
 
 	test.each(["append", "reply", "edit", "rollover", "rename", "reconcile", "truncated reconcile", "replayed reply"])(

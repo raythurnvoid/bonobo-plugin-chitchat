@@ -5635,7 +5635,6 @@ async function handle_message_send(ctx, input) {
 	if (channel instanceof Response) return channel;
 	if (channel.archived) return refuse(409, "This channel is archived");
 	const projection = await ensure_channel(ctx, channel);
-	if (projection instanceof Response) return projection;
 	const messageKey = mint_appended_key(`${input.channelKey}:`, ctx.now);
 	const value = {
 		text: input.text,
@@ -5666,6 +5665,11 @@ async function handle_message_send(ctx, input) {
 		},
 	]);
 	if (written instanceof Response) return written;
+	if (projection instanceof Response)
+		return json_response(200, {
+			messageKey,
+			transcriptUpdated: false,
+		});
 	const doc = parse_message_doc({
 		key: messageKey,
 		value,
@@ -5710,7 +5714,6 @@ async function handle_reply_send(ctx, input) {
 	if (channel instanceof Response) return channel;
 	if (channel.archived) return refuse(409, "This channel is archived");
 	const projection = await ensure_channel(ctx, channel);
-	if (projection instanceof Response) return projection;
 	const replyKey = mint_appended_key(`${input.rootMessageKey}:`, ctx.now);
 	const value = {
 		text: input.text,
@@ -5741,6 +5744,11 @@ async function handle_reply_send(ctx, input) {
 		},
 	]);
 	if (written instanceof Response) return written;
+	if (projection instanceof Response)
+		return json_response(200, {
+			messageKey: replyKey,
+			transcriptUpdated: false,
+		});
 	const doc = parse_message_doc({
 		key: replyKey,
 		value,

@@ -769,9 +769,6 @@ async function handle_message_send(ctx: Ctx, input: z.infer<typeof send_input_sc
 	}
 
 	const projection = await ensure_channel(ctx, channel);
-	if (projection instanceof Response) {
-		return projection;
-	}
 
 	const messageKey = mint_appended_key(`${input.channelKey}:`, ctx.now);
 	const value: Record<string, unknown> = {
@@ -800,6 +797,9 @@ async function handle_message_send(ctx: Ctx, input: z.infer<typeof send_input_sc
 	]);
 	if (written instanceof Response) {
 		return written;
+	}
+	if (projection instanceof Response) {
+		return json_response(200, { messageKey, transcriptUpdated: false });
 	}
 
 	const doc = parse_message_doc({
@@ -861,9 +861,6 @@ async function handle_reply_send(ctx: Ctx, input: z.infer<typeof reply_input_sch
 	}
 
 	const projection = await ensure_channel(ctx, channel);
-	if (projection instanceof Response) {
-		return projection;
-	}
 
 	const replyKey = mint_appended_key(`${input.rootMessageKey}:`, ctx.now);
 	const value: Record<string, unknown> = {
@@ -890,6 +887,9 @@ async function handle_reply_send(ctx: Ctx, input: z.infer<typeof reply_input_sch
 	]);
 	if (written instanceof Response) {
 		return written;
+	}
+	if (projection instanceof Response) {
+		return json_response(200, { messageKey: replyKey, transcriptUpdated: false });
 	}
 
 	const doc = parse_message_doc({
