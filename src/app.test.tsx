@@ -954,10 +954,13 @@ describe("ChannelActionDialog", () => {
 });
 
 describe("ChatErrorBoundary", () => {
-	test("contains a view failure and keeps the host app recovery copy", () => {
+	test("retries a view failure without navigating the plugin frame", () => {
 		vi.spyOn(console, "error").mockImplementation(() => {});
-		function FailedView(): never {
-			throw new Error("A query could not render");
+		const reload = vi.spyOn(window.location, "reload").mockImplementation(() => {});
+		let failed = true;
+		function FailedView() {
+			if (failed) throw new Error("A query could not render");
+			return <p>Recovered chat</p>;
 		}
 		render(
 			<ChatErrorBoundary client={client()}>
@@ -965,7 +968,11 @@ describe("ChatErrorBoundary", () => {
 			</ChatErrorBoundary>,
 		);
 		expect(screen.getByRole("alert").textContent).toContain("Press is still available.");
-		expect(screen.getByRole("button", { name: "Reload Chitchat" })).toBeTruthy();
+		failed = false;
+		fireEvent.click(screen.getByRole("button", { name: /Chitchat/ }));
+		expect(reload).not.toHaveBeenCalled();
+		expect(screen.getByText("Recovered chat")).toBeTruthy();
+		expect(screen.queryByRole("alert")).toBeNull();
 	});
 });
 

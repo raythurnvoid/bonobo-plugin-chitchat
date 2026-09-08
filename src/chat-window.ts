@@ -1,6 +1,6 @@
 import { useQueries, useQuery } from "convex/react";
 import type { PaginationResult } from "convex/server";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../convex/_generated/api";
 import type { Doc, Id } from "../convex/_generated/dataModel";
 
@@ -31,22 +31,29 @@ export function use_chat_window(props: {
 	const nextPageId = useRef(0);
 	const pageCache = useRef(new Map<number, PaginationResult<Doc<"messages">>>());
 	const retained = useRef<{ head: Head | null; rows: Doc<"messages">[] }>({ head: null, rows: [] });
-	const queries = Object.fromEntries(
-		(props.enabled && observedHead !== null ? (window?.pages ?? []) : []).map((page) => [
-			String(page.id),
-			{
-				query: replies ? api.messages.list_replies : api.messages.list_roots,
-				args: {
-					...props.target,
-					anchorSequence: window!.anchor,
-					paginationOpts: {
-						numItems: 50,
-						cursor: page.cursor,
-						...(page.endCursor ? { endCursor: page.endCursor } : {}),
+	const targetId = "rootMessageId" in props.target ? props.target.rootMessageId : props.target.channelId;
+	const queriesEnabled = props.enabled && observedHead !== null;
+	// Convex useQueries needs the same descriptor object until its inputs change.
+	const queries = useMemo(
+		() =>
+			Object.fromEntries(
+				(queriesEnabled ? (window?.pages ?? []) : []).map((page) => [
+					String(page.id),
+					{
+						query: replies ? api.messages.list_replies : api.messages.list_roots,
+						args: {
+							...(replies ? { rootMessageId: targetId } : { channelId: targetId }),
+							anchorSequence: window!.anchor,
+							paginationOpts: {
+								numItems: 50,
+								cursor: page.cursor,
+								...(page.endCursor ? { endCursor: page.endCursor } : {}),
+							},
+						},
 					},
-				},
-			},
-		]),
+				]),
+			),
+		[queriesEnabled, window, replies, targetId],
 	);
 	const results = useQueries(queries) as Record<string, PaginationResult<Doc<"messages">> | Error | undefined>;
 	const head = observedHead === undefined && props.retain ? retained.current.head : (observedHead ?? null);
