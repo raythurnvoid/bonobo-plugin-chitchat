@@ -18,13 +18,14 @@ export function use_chat_window(props: {
 }) {
 	const replies = "rootMessageId" in props.target;
 	const byteLimit = WINDOW_BYTES - (replies ? 32 * 1024 : 0);
+	const subscribed = props.enabled || props.retain;
 	const rootHead = useQuery(
 		api.messages.latest_roots,
-		props.enabled && "channelId" in props.target ? props.target : "skip",
+		subscribed && "channelId" in props.target ? props.target : "skip",
 	);
 	const replyHead = useQuery(
 		api.messages.latest_replies,
-		props.enabled && "rootMessageId" in props.target ? props.target : "skip",
+		subscribed && "rootMessageId" in props.target ? props.target : "skip",
 	);
 	const observedHead = replies ? replyHead : rootHead;
 	const [window, setWindow] = useState<Window | null>(null);
@@ -32,7 +33,7 @@ export function use_chat_window(props: {
 	const pageCache = useRef(new Map<number, PaginationResult<Doc<"messages">>>());
 	const retained = useRef<{ head: Head | null; rows: Doc<"messages">[] }>({ head: null, rows: [] });
 	const targetId = "rootMessageId" in props.target ? props.target.rootMessageId : props.target.channelId;
-	const queriesEnabled = props.enabled && observedHead !== null;
+	const queriesEnabled = subscribed && (observedHead !== null || props.retain);
 	// Convex useQueries needs the same descriptor object until its inputs change.
 	const queries = useMemo(
 		() =>
@@ -56,10 +57,12 @@ export function use_chat_window(props: {
 		[queriesEnabled, window, replies, targetId],
 	);
 	const results = useQueries(queries) as Record<string, PaginationResult<Doc<"messages">> | Error | undefined>;
-	const head = observedHead === undefined && props.retain ? retained.current.head : (observedHead ?? null);
+	// A verified renewal briefly refuses the old JWT. Keep its rows and subscriptions until the new JWT arrives.
+	const head = props.retain ? retained.current.head : (observedHead ?? null);
+	const denied = observedHead === null && !props.retain;
 	const activeIds = new Set(window?.pages.map((page) => page.id));
 	for (const id of pageCache.current.keys()) {
-		if (!activeIds.has(id) || observedHead === null || (!props.enabled && !props.retain)) pageCache.current.delete(id);
+		if (!activeIds.has(id) || denied || !subscribed) pageCache.current.delete(id);
 	}
 	const pages =
 		window?.pages.map((descriptor) => {
@@ -75,7 +78,7 @@ export function use_chat_window(props: {
 			page.result !== undefined && !(page.result instanceof Error),
 	);
 	const loadedRows = window === null ? (head?.messages ?? []) : readyPages.flatMap((page) => page.result.page);
-	const rows = observedHead === null ? [] : props.enabled ? loadedRows : props.retain ? retained.current.rows : [];
+	const rows = props.retain ? retained.current.rows : denied ? [] : props.enabled ? loadedRows : [];
 	const bytes = new TextEncoder().encode(JSON.stringify({ rows, head })).byteLength;
 	const lastPage = readyPages.at(-1);
 	const loading =
@@ -165,14 +168,13 @@ export function use_chat_window(props: {
 	};
 	return {
 		rows,
-		denied: observedHead === null,
+		denied,
 		loading,
-		error:
-			observedHead === null
-				? "Messages are unavailable. Your access may have changed."
-				: error instanceof Error
-					? error.message
-					: null,
+		error: denied
+			? "Messages are unavailable. Your access may have changed."
+			: error instanceof Error
+				? error.message
+				: null,
 		sequence: head?.sequence ?? 0,
 		atLatest: window === null,
 		hasOlder: window === null ? (head?.messages.at(-1)?.sequence ?? 0) > 1 : !!lastPage && !lastPage.result.isDone,

@@ -1187,11 +1187,11 @@ export type ChannelViewProps = {
 export function ThreadPanel(props: ChannelViewProps & { rootMessageId: Id<"messages">; onClose: () => void }) {
 	const session = use_chat_session();
 	const enabled = session.ready && props.channel !== null;
-	const root = useQuery(api.messages.get, enabled ? { messageId: props.rootMessageId } : "skip");
+	const root = useQuery(api.messages.get, enabled || session.refreshing ? { messageId: props.rootMessageId } : "skip");
 	const retainedRoot = useRef(root);
 	if (root) retainedRoot.current = root;
 	if (!enabled && !session.refreshing) retainedRoot.current = null;
-	const shownRoot = root ?? (session.refreshing ? retainedRoot.current : null);
+	const shownRoot = session.refreshing ? retainedRoot.current : root;
 	const window = use_chat_window({
 		target: { rootMessageId: props.rootMessageId },
 		enabled: enabled && root !== null,

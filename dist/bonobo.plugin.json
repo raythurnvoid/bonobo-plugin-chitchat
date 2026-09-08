@@ -2,7 +2,7 @@
 	"schemaVersion": 1,
 	"name": "chitchat",
 	"displayName": "Chitchat",
-	"version": "0.8.1",
+	"version": "0.8.2",
 	"description": "Team chat inside Bonobo Senate Press. Use your Press account and workspace with channels, threads, reactions, file attachments, unread and mention badges, and activity views. Chitchat has its own Convex database and live connections. A connected service keeps Markdown transcript copies in Press Files with current sharing and write permissions.",
 	"compatibility": {
 		"bonoboPluginRuntime": "1"
@@ -42,8 +42,8 @@
 		},
 		{
 			"path": "dist/frontend/assets/index.js",
-			"sha256": "sha256:a6f2850612217d408df4fc09f6f54ee84e68fd95216cdd428c42a29d2b0ce3f8",
-			"bytes": 755297,
+			"sha256": "sha256:44508ca13c01faf905d738a86c2f4229d08610fb315462393ff1071445f9c984",
+			"bytes": 755661,
 			"contentType": "application/javascript"
 		},
 		{

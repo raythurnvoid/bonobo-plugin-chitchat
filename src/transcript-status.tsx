@@ -115,7 +115,8 @@ export function TranscriptStatus(props: { client: BonoboClient; channelId: Id<"c
 						<summary>Transcript details</summary>
 						{status.folderPath ? (
 							<p>
-								Folder in Press Files: <code>{status.folderPath}</code>
+								{status.folderNodeId ? "Folder in Press Files" : "Planned folder in Press Files"}:{" "}
+								<code>{status.folderPath}</code>
 							</p>
 						) : null}
 						{status.readerMode === "manual" ? <p>Files sharing is managed in Press.</p> : null}
@@ -132,8 +133,9 @@ export function TranscriptStatus(props: { client: BonoboClient; channelId: Id<"c
 						{status.indexError ? <p role="alert">{status.indexError}</p> : null}
 						{status.status === "blocked" && status.folderPath ? (
 							<p>
-								If folder access is missing, open it in Press Files and allow the Chitchat service account to write
-								there. Then reconnect.
+								{status.folderNodeId
+									? "If folder access is missing, open this folder in Press Files. Give the Chitchat service account Can manage, then reconnect."
+									: "If permissions blocked setup, ask a workspace admin to connect. Both the person connecting and the Chitchat service account need Can manage on the parent folder or workspace to create the locked folder."}
 							</p>
 						) : null}
 						{status.canReconcile ? (

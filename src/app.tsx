@@ -496,10 +496,13 @@ export function App(props: { client: BonoboClient }) {
 		replySequence: number;
 	} | null>(null);
 	const selectedId = selection?.kind === "channel" ? selection.id : null;
-	const selected = useQuery(api.channels.get, session.ready && selectedId ? { channelId: selectedId } : "skip");
+	const selected = useQuery(
+		api.channels.get,
+		(session.ready || session.refreshing) && selectedId ? { channelId: selectedId } : "skip",
+	);
 	const selectedPermissions = useQuery(
 		api.channels.permissions,
-		session.ready && selectedId ? { channelId: selectedId } : "skip",
+		(session.ready || session.refreshing) && selectedId ? { channelId: selectedId } : "skip",
 	);
 	const [previousSelected, setPreviousSelected] = useState<Doc<"channels"> | null>(null);
 	if (selected && selected !== previousSelected) setPreviousSelected(selected);

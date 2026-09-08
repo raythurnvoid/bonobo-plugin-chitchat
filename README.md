@@ -57,7 +57,11 @@ Inside the new root, the existing layout and format remain:
 - Each file stays within 100,000 UTF-8 bytes. The current rollover scheme is retained.
 - Message markers, UTC dates, saved author names, two-space reply indentation, edit/delete flags, attachment names, and reaction lines keep their existing format. Signed download URLs are never stored.
 
-Connect Files from the channel's transcript status. The server exchanges and seals a Files-only grant for the exact new root. Grants are encrypted before storage. Private setup creates an empty restricted folder first. If the Chitchat service account needs write access, grant that exact account access in Press Files, then reconnect.
+Connect Files from the channel's transcript status. The server exchanges and seals a Files-only grant for the exact new root. Grants are encrypted before storage.
+
+A workspace admin must make the first connection. Both the connecting person and the exact Chitchat service account need **Can manage** on the workspace to create the initial locked root. Creating later locked folders needs **Can manage** on their parent folder or workspace. **Can write** alone cannot set their locks.
+
+After the root and `private` container exist, reduce the account's broad access where possible. Keep the workspace **Can write** permission needed for ordinary file writes, and **Can manage** on the exact generated root and `private` container. Normal folder grants do not pass to other folders or files. Private setup first creates an empty restricted channel folder; give the exact Chitchat service account **Can manage** on each private channel folder, then reconnect. That permission lets Chitchat update both the transcript and its readers. The connecting person must also keep the Files permissions needed for each operation. Setup never grants account permissions automatically.
 
 Transcript jobs are ordered per channel. Work claims, immutable source input, staged output, target IDs, write revisions, operation IDs, and checkpoints survive retries. A host transaction rechecks current access, labels, parent identity, file revision, and writer generation when publishing. A lost response can be checked without publishing twice.
 

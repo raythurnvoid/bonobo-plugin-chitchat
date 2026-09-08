@@ -316,6 +316,35 @@ afterEach(() => {
 });
 
 describe("App", () => {
+	test("keeps an inline edit and its subscriptions during a verified token refresh", async () => {
+		fake.messages = [message((fake.channels[0] as Doc<"channels">)._id, { authorHostUserId: "alice" })];
+		render(<App client={client()} />);
+		fireEvent.click(screen.getByRole("button", { name: "#general" }));
+		await screen.findByRole("log", { name: "Messages in #general" });
+		fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+		fireEvent.change(screen.getByLabelText("Edit message"), { target: { value: "Keep this unsaved edit" } });
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		fake.session.canSend = false;
+		fake.overrides.set("channels:get", null);
+		fake.overrides.set("messages:latest_roots", null);
+		publish();
+		expect(queries("channels:get")).toHaveLength(1);
+		expect(queries("messages:latest_roots")).toHaveLength(1);
+		expect((screen.getByLabelText("Edit message") as HTMLTextAreaElement).value).toBe("Keep this unsaved edit");
+		expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true);
+		fake.overrides.clear();
+		fake.session.ready = true;
+		fake.session.refreshing = false;
+		fake.session.canSend = true;
+		publish();
+		expect((screen.getByLabelText("Edit message") as HTMLTextAreaElement).value).toBe("Keep this unsaved edit");
+		fake.overrides.set("channels:get", null);
+		fake.overrides.set("messages:latest_roots", null);
+		publish();
+		expect(screen.queryByLabelText("Edit message")).toBeNull();
+		expect(document.body.textContent).not.toContain("Message in general");
+	});
 	test("pages public and private channels with bounded read subscriptions", () => {
 		fake.channels = Array.from({ length: 121 }, (_, index) => channel(`public-${index + 1}`)).concat(
 			Array.from({ length: 61 }, (_, index) => channel(`private-${index + 1}`, { visibility: "private" })),
@@ -983,6 +1012,7 @@ describe("TranscriptStatus", () => {
 			canConnect: true,
 			canReconcile: true,
 			folderPath: "/fresh-transcripts/general",
+			folderNodeId: "folder-general",
 			readerMode: "manual",
 			error: "A file marker is missing",
 			indexStatus: "ready",
@@ -1006,6 +1036,30 @@ describe("TranscriptStatus", () => {
 		expect(screen.getByText("A file marker is missing")).toBeTruthy();
 		expect(screen.getByText("Files sharing is managed in Press.")).toBeTruthy();
 		expect(screen.getByText("/fresh-transcripts/general")).toBeTruthy();
+	});
+	test("explains initial permissions without asking to open a folder that does not exist", () => {
+		render_status();
+		fake.overrides.set(
+			"transcripts:status",
+			status({ folderNodeId: null, canReconcile: false, readerMode: "unconfigured", error: "Permission denied" }),
+		);
+		publish();
+		fireEvent.click(screen.getByText("Transcript details"));
+		expect(screen.getByText(/Planned folder in Press Files/)).toBeTruthy();
+		expect(screen.getByText(/If permissions blocked setup, ask a workspace admin to connect/)).toBeTruthy();
+		expect(
+			screen.getByText(/Both the person connecting and the Chitchat service account need Can manage/),
+		).toBeTruthy();
+		expect(document.body.textContent).not.toContain("open this folder");
+		expect(fake.action).not.toHaveBeenCalled();
+		expect(fake.mutation).not.toHaveBeenCalled();
+	});
+	test("asks for Can manage on an existing folder so private readers can be updated", () => {
+		render_status();
+		fireEvent.click(screen.getByText("Transcript details"));
+		expect(screen.getByText(/Give the Chitchat service account Can manage, then reconnect/)).toBeTruthy();
+		expect(document.body.textContent).not.toContain("Planned folder");
+		expect(document.body.textContent).not.toContain("ask a workspace admin to connect");
 	});
 	test("can retry a blocked channel index while the channel copy is saved", async () => {
 		render_status();
