@@ -1689,7 +1689,7 @@ function PendingRow(props: { pending: PendingSend; onRetry: () => void }) {
 			</span>
 			<div className="message-head">
 				<span className="message-author">You</span>
-				<span className="message-time">{props.pending.status === "sending" ? "Sending…" : "Not sent"}</span>
+				<span className="message-time">{props.pending.status === "sending" ? "Sending…" : "Not confirmed"}</span>
 			</div>
 			<p className="message-text">{props.pending.text}</p>
 			{props.pending.attachments.length > 0 ? (

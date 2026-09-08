@@ -475,9 +475,8 @@ describe("message-send", () => {
 		fake.refusals.set("/api/v1/plugin-data/read", { status: 500, body: { message: "Internal server error" } });
 
 		// The host answers the page 502 for a run that threw, and the page treats that as an
-		// unknown outcome and replays with the same clientRequestId. Relaying the 500 as this
-		// run's own status would instead tell the page the write definitely failed, which nobody
-		// knows.
+		// unknown outcome and replays with the same clientRequestId. The worker must stop here
+		// before later steps can treat the host-door result as a confirmed write.
 		await expect(
 			invoke("message-send", { channelKey: "chan-public", text: "hi", clientRequestId: "req-5xx" }),
 		).rejects.toThrow("/api/v1/plugin-data/read responded 500");

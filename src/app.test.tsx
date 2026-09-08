@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { BonoboClient, BonoboTheme } from "bonobo-plugin-sdk/frontend";
 import { StrictMode } from "react";
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { App, ChatErrorBoundary } from "./app";
 import {
 	chat_ANONYMOUS_MEMBER_LABEL,
@@ -385,14 +385,15 @@ type WriteResult = { _yay: { key: string; revision: number } } | { _nay: { name?
 type PutOpts = { collection: string; key: string; value: Record<string, unknown>; expectedRevision?: number };
 type InvokeOpts = { endpoint: string; input: Record<string, unknown> };
 type InvokeAnswer =
-	| { status: 200; body: { runId: string; pluginStatus: number; output: string; outputTruncated: boolean } }
+	| { status: 200; body: { runId: string; pluginStatus: number; output: string } }
+	| { status: 502; body: { message: string; runId: string; code?: "response_too_large" } }
 	| { status: 400 | 401 | 403 | 404 | 409 | 413 | 429; body: { message: string; retryAfterMs?: number } };
 
 /** Wraps a backend answer the way the invoke route delivers a finished run: the body as JSON text. */
 function invoke_ok(body: Record<string, unknown>, pluginStatus = 200): InvokeAnswer {
 	return {
 		status: 200,
-		body: { runId: "run1", pluginStatus, output: JSON.stringify(body), outputTruncated: false },
+		body: { runId: "run1", pluginStatus, output: JSON.stringify(body) },
 	};
 }
 
@@ -2141,7 +2142,7 @@ test("an in-flight top-level send blocks a channel switch, and a late failure ke
 
 	// A definite refusal, not a lost answer: unavailable would replay silently instead of failing.
 	await act(async () => {
-		ack.resolve(invoke_refused(500, "late top-level failed"));
+		ack.resolve(invoke_refused(403, "late top-level failed"));
 		await Promise.resolve();
 	});
 	const failedRow = screen.getByText("late top-level send").closest(".message") as HTMLElement;
@@ -2206,6 +2207,109 @@ test("an unavailable send retry timer stops when the page unmounts", async () =>
 });
 
 // #endregion send flow
+
+describe("backend send responses", () => {
+	test.each(["message-send", "reply-send"])("%s keeps a size failure for manual retry with the same request", async (endpoint) => {
+		const h = make_harness();
+		await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+		const root = message_doc(1_000, { rand: "root", text: "thread root" });
+		h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+		await screen.findByText("thread root");
+		if (endpoint === "reply-send") {
+			fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+			await screen.findByRole("region", { name: "Thread" });
+		}
+		const input = composer_box(endpoint === "reply-send" ? "Reply in thread" : "Message #general");
+		h.raw.invoke.mockResolvedValueOnce({
+			status: 502,
+			body: { code: "response_too_large", message: "Response is too large", runId: "run1" },
+		});
+		vi.useFakeTimers();
+		try {
+			type_in_composer(input, "keep this exact message");
+			await act(async () => {
+				fireEvent.keyDown(input, { key: "Enter" });
+			});
+			const first = invoke_calls(h, endpoint)[0]!;
+			expect(first.input.text).toBe("keep this exact message");
+			const row = screen.getByText("keep this exact message").closest(".message") as HTMLElement;
+			expect(within(row).getByRole("alert").textContent).toContain(
+				"The backend response was too large. Your changes may already be saved.",
+			);
+			expect(within(row).getByText("Not confirmed")).toBeTruthy();
+			expect(screen.getByRole("button", { name: "#random" }).hasAttribute("disabled")).toBe(false);
+			if (endpoint === "reply-send") {
+				expect(screen.getByRole("button", { name: "Close thread" }).hasAttribute("disabled")).toBe(false);
+			}
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(60_000);
+			});
+			expect(invoke_calls(h, endpoint)).toHaveLength(1);
+			expect(screen.getByText("keep this exact message")).toBeTruthy();
+			const retry = within(row).getByRole("button", { name: "Retry sending message" });
+			retry.focus();
+			expect(document.activeElement).toBe(retry);
+			await act(async () => {
+				fireEvent.click(retry);
+			});
+			const calls = invoke_calls(h, endpoint);
+			expect(calls).toHaveLength(2);
+			expect(calls[1]!.input).toEqual(first.input);
+			expect(screen.getAllByText("keep this exact message")).toHaveLength(1);
+			expect(screen.queryByText("Not confirmed")).toBeNull();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test.each(["message-send", "reply-send"])("%s retries a plugin 500 after the stored message arrives", async (endpoint) => {
+		const h = make_harness();
+		await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
+		const root = message_doc(1_000, { rand: "root", text: "thread root" });
+		h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([root]));
+		await screen.findByText("thread root");
+		if (endpoint === "reply-send") {
+			fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+			await screen.findByRole("region", { name: "Thread" });
+		}
+		await wait_for_feeds(h);
+		const input = composer_box(endpoint === "reply-send" ? "Reply in thread" : "Message #general");
+		const answer = deferred<InvokeAnswer>();
+		h.raw.invoke.mockReturnValueOnce(answer.promise);
+		vi.useFakeTimers();
+		try {
+			type_in_composer(input, "save only once");
+			await act(async () => {
+				fireEvent.keyDown(input, { key: "Enter" });
+			});
+			const first = invoke_calls(h, endpoint)[0]!;
+			const stored = message_doc(50_000, { rand: "sent", text: "save only once", createdBy: "user_me" });
+			// The watch can deliver a committed write before the request returns an error.
+			if (endpoint === "reply-send") {
+				h.find_changes("replies")!.onUpdate(
+					watch_update([{ ...stored, collection: "replies", key: `${root.key}:${inv(50_000)}:sent` }]),
+				);
+			} else {
+				h.find_window("messages", `${CH1_KEY}:`)!.onUpdate(window_update([stored, root]));
+			}
+			await act(async () => {
+				answer.resolve(invoke_refused(500, "Failed after saving"));
+			});
+			expect(screen.queryByRole("button", { name: "Retry sending message" })).toBeNull();
+			expect(screen.getByRole("button", { name: "#random" }).hasAttribute("disabled")).toBe(true);
+			await act(async () => {
+				await vi.advanceTimersByTimeAsync(1_000);
+			});
+			const calls = invoke_calls(h, endpoint);
+			expect(calls).toHaveLength(2);
+			expect(calls[1]!.input).toEqual(first.input);
+			expect(screen.getAllByText("save only once")).toHaveLength(1);
+			expect(screen.getByRole("button", { name: "#random" }).hasAttribute("disabled")).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
 
 // #region announcer
 
@@ -3661,7 +3765,7 @@ test("an in-flight reply blocks a thread switch, and a late failure keeps Retry 
 
 	// A definite refusal, not a lost answer: unavailable would replay silently instead of failing.
 	await act(async () => {
-		ack.resolve(invoke_refused(500, "late reply failed"));
+		ack.resolve(invoke_refused(403, "late reply failed"));
 		await Promise.resolve();
 	});
 	expect(await within(panel).findByRole("button", { name: "Retry sending message" })).toBeTruthy();

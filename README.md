@@ -74,12 +74,17 @@ The page calls these with `client.fetchJson("/api/v1/plugin-backend/invoke", { e
 wrapped in `src/chat-invoke.ts`: it waits out the held-back answers (409 is the serialization lock,
 429 the invoke rate bucket, and both may carry `retryAfterMs`), maps the relayed JSON into the
 `_yay`/`_nay` shape the write machinery speaks, and keeps `unavailable` as a
-replay-with-same-client-request-id case exactly like the old append door. Four answers become
-`unavailable`, because the run may have happened in all four: a 5xx, a body that is not JSON, a
-refused session refresh, and a network failure. Since SDK 0.18.0 only the last two throw — the first
-two now resolve like any other answer, so `chat_invoke_backend` checks `status >= 500 || body === null`
-itself, before the branches that map a status to a refusal. Do not remove that check: without it a
-502 reads as "the write definitely failed", which nobody knows. Because of this,
+replay-with-same-client-request-id case exactly like the old append door. Both host and plugin 5xx
+responses are `unavailable`: the backend may already have saved the message and its request receipt.
+A failed session refresh, network failure, or invalid successful answer has the same uncertain result.
+Every successful Chitchat endpoint must return a JSON object; an empty 204, invalid JSON, null,
+arrays, and scalar values do not confirm success.
+
+The host's `response_too_large` code is different. The page stops automatic retries and says,
+"The backend response was too large. Your changes may already be saved." It keeps the message,
+attachments, and original request ID in a `Not confirmed` row. Manual Retry uses that same ID.
+Plugin 4xx responses keep their own refusal messages.
+
 `userWritableCollections` narrows the user-write door to `channels` + `cursors`; the store refuses a
 page write to `messages`, `replies`, or `reactions`. `channels` stays user-writable because private
 create writes the channel document from the page via `user_manage_scope` (`create_with_document`) — a

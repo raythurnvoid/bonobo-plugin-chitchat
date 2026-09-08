@@ -16,7 +16,7 @@ function make_client(fetchJson: unknown, expiresAt = Date.now() + 60 * 60 * 1_00
 function run_finished(body: Record<string, unknown>, pluginStatus = 200) {
 	return {
 		status: 200,
-		body: { runId: "run1", pluginStatus, output: JSON.stringify(body), outputTruncated: false },
+		body: { runId: "run1", pluginStatus, output: JSON.stringify(body) },
 	};
 }
 
@@ -95,6 +95,9 @@ describe("chat_invoke_backend", () => {
 				{},
 			);
 
+		expect(await relayed(400, "This input is invalid")).toEqual({
+			_nay: { name: "refused", message: "This input is invalid" },
+		});
 		expect(await relayed(409, "This message changed")).toEqual({
 			_nay: { name: "conflict", message: "This message changed" },
 		});
@@ -105,6 +108,52 @@ describe("chat_invoke_backend", () => {
 		expect(await relayed(403, "This plugin has used its 10000 document slots")).toEqual({
 			_nay: { name: "refused", message: "This plugin has used its 10000 document slots" },
 		});
+	});
+
+	test.each([
+		{ output: "not JSON", pluginStatus: 200 },
+		{ output: "null", pluginStatus: 200 },
+		{ output: "[]", pluginStatus: 200 },
+		{ output: '"hello"', pluginStatus: 200 },
+		{ output: "42", pluginStatus: 200 },
+		{ output: "true", pluginStatus: 200 },
+		{ output: "", pluginStatus: 204 },
+		{ output: "{}", pluginStatus: 204 },
+	])("keeps an invalid successful endpoint answer uncertain ($pluginStatus, $output)", async ({ output, pluginStatus }) => {
+		const fetchJson = vi.fn().mockResolvedValue({ status: 200, body: { runId: "run1", pluginStatus, output } });
+
+		expect(await chat_invoke_backend(make_client(fetchJson), "message-send", {})).toEqual({
+			_nay: { name: "unavailable", message: "The Chitchat backend returned an invalid response" },
+		});
+	});
+
+	test("accepts an empty object from an endpoint that has no result fields", async () => {
+		const fetchJson = vi.fn().mockResolvedValue(run_finished({}));
+
+		expect(await chat_invoke_backend(make_client(fetchJson), "reconcile", {})).toEqual({ _yay: {} });
+	});
+
+	test("keeps a plugin 500 uncertain and preserves its message", async () => {
+		const fetchJson = vi.fn().mockResolvedValue(run_finished({ message: "Failed after saving the message" }, 500));
+
+		expect(await chat_invoke_backend(make_client(fetchJson), "message-send", {})).toEqual({
+			_nay: { name: "unavailable", message: "Failed after saving the message" },
+		});
+	});
+
+	test("stops automatic retry for the host response-size failure", async () => {
+		const fetchJson = vi.fn().mockResolvedValue({
+			status: 502,
+			body: { code: "response_too_large", message: "Response is too large", runId: "run1" },
+		});
+
+		expect(await chat_invoke_backend(make_client(fetchJson), "message-send", {})).toEqual({
+			_nay: {
+				name: "response_too_large",
+				message: "The backend response was too large. Your changes may already be saved.",
+			},
+		});
+		expect(fetchJson).toHaveBeenCalledTimes(1);
 	});
 
 	test("turns a thrown answer into an uncertain outcome", async () => {

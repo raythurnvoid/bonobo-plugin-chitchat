@@ -7,7 +7,7 @@ import { chat_get_error_message, type chat_BackendEndpointId } from "./chat-data
  * backend's relayed JSON, and maps everything into the `_yay`/`_nay` shape the page's write
  * machinery already speaks. A 5xx, an answer that did not parse, and a thrown call all become
  * `unavailable` — the run may have happened, so callers replay with the same `clientRequestId`,
- * exactly like the old append door.
+ * exactly like the old append door. A response-size failure needs manual retry instead.
  */
 
 const BUSY_RETRY_MAX_CALLS = 3;
@@ -46,6 +46,16 @@ export async function chat_invoke_backend(
 	try {
 		for (let call = 1; ; call += 1) {
 			const answer = await client.fetchJson("/api/v1/plugin-backend/invoke", { endpoint, input });
+
+			// A repeat can hit the same size limit after the backend already saved its changes.
+			if (answer.status === 502 && answer.body?.code === "response_too_large") {
+				return {
+					_nay: {
+						name: "response_too_large",
+						message: "The backend response was too large. Your changes may already be saved.",
+					},
+				};
+			}
 
 			// Nobody knows whether the run happened: the host failed (5xx, including this route's
 			// own 502), or the answer did not parse. Callers replay with the same
@@ -97,16 +107,27 @@ export async function chat_invoke_backend(
 			} catch {
 				body = null;
 			}
-			const bodyRecord = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+			const bodyRecord =
+				typeof body === "object" && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
 
 			if (answer.body.pluginStatus >= 200 && answer.body.pluginStatus < 300) {
+				// Chitchat endpoints promise a JSON object, even when they have no result fields.
+				if (bodyRecord === null || answer.body.pluginStatus === 204) {
+					return {
+						_nay: { name: "unavailable", message: "The Chitchat backend returned an invalid response" },
+					};
+				}
 				return { _yay: bodyRecord };
 			}
 
 			const message =
-				typeof bodyRecord.message === "string" && bodyRecord.message !== ""
+				typeof bodyRecord?.message === "string" && bodyRecord.message !== ""
 					? bodyRecord.message
-					: `The Chitchat backend refused this call (${answer.body.pluginStatus})`;
+					: `The Chitchat backend ${answer.body.pluginStatus >= 500 ? "failed" : "refused this call"} (${answer.body.pluginStatus})`;
+			// A plugin can save the message and its request receipt before it returns an error.
+			if (answer.body.pluginStatus >= 500) {
+				return { _nay: { name: "unavailable", message } };
+			}
 			// 409 keeps the name the page's conflict handling listens for; 413 marks both
 			// too-large states (the 16 KiB store cap relayed by the backend, like the 32 KiB
 			// pre-check above).
