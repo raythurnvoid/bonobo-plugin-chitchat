@@ -1141,6 +1141,47 @@ describe("transcript readers", () => {
 });
 
 describe("transcript grants", () => {
+	test.each([false, true])("reconnect keeps an idle synced channel ready (private: %s)", async (isPrivate) => {
+		const { t, alice, channelId, remote, send, drain, reconnect } = await fixture(isPrivate);
+		await send("Saved before reconnect");
+		await drain();
+		const writes = remote.writes();
+		expect((await reconnect()).error).toBeNull();
+		const status = await alice.query(api.transcripts.status, { channelId });
+		expect(status?.status).toBe("ready");
+		expect(status?.appliedSequence).toBe(status?.desiredSequence);
+		expect(remote.writes()).toBe(writes);
+		const completed = await t.run(async (ctx) => {
+			const destination = (await ctx.db.query("transcript_destinations").first())!;
+			return (await ctx.db.get("transcript_runs", destination.runId!))!;
+		});
+		expect(completed.phase).toBe("complete");
+		for (let step = 0; step < 20; step++)
+			await t.mutation(internal.transcripts_cleanup.channel, { channelId, throughCreatedAt: completed._creationTime });
+		expect(await t.run(async (ctx) => (await ctx.db.query("transcript_destinations").first())?.runId)).toBeNull();
+		expect((await reconnect()).error).toBeNull();
+		expect((await alice.query(api.transcripts.status, { channelId }))?.status).toBe("ready");
+		expect(remote.writes()).toBe(writes);
+	});
+
+	test.each(["queued", "rebuild"] as const)("reconnect leaves %s transcript work pending", async (kind) => {
+		const { t, alice, channelId, channel, remote, send, drain, reconnect } = await fixture();
+		await send("Saved before reconnect");
+		await drain();
+		if (kind === "queued") await send("Still waiting to sync");
+		else await alice.mutation(api.transcripts.reconcile, { channelId, clientRequestId: "rebuild-before-connect" });
+		const before = await t.run(async (ctx) => await ctx.db.query("transcript_destinations").first());
+		expect((await reconnect()).error).toBeNull();
+		expect((await alice.query(api.transcripts.status, { channelId }))?.status).toBe("pending");
+		const after = await t.run(async (ctx) => await ctx.db.query("transcript_destinations").first());
+		expect(after?.runId).toBe(before?.runId);
+		await drain();
+		const status = await alice.query(api.transcripts.status, { channelId });
+		expect(status?.status).toBe("ready");
+		if (kind === "queued")
+			expect(remote.files.get(`${ROOT}/${channel.transcriptSlug}.md`)?.content).toContain("Still waiting to sync");
+	});
+
 	test("a late refusal from the previous index sponsor cannot block the new connection", async () => {
 		const { t, alice, remote, reconnect } = await fixture();
 		const index = (await t.run(async (ctx) => await ctx.db.query("transcript_indexes").first()))!;

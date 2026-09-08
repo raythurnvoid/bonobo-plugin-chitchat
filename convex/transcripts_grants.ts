@@ -245,9 +245,20 @@ export const save_destination = internalMutation({
 			.query("transcript_channels")
 			.withIndex("by_channel", (q) => q.eq("channelId", channel._id))
 			.unique();
+		const [run, readerRun] = await Promise.all([
+			current?.runId ? ctx.db.get("transcript_runs", current.runId) : null,
+			current?.readerRunId ? ctx.db.get("transcript_runs", current.readerRunId) : null,
+		]);
+		// A new grant adds no transcript work when the existing destination is already synced.
 		if (state)
 			await ctx.db.patch("transcript_channels", state._id, {
-				status: "pending",
+				status:
+					current &&
+					(!run || run.phase === "complete") &&
+					(!readerRun || readerRun.phase === "complete") &&
+					state.appliedSequence === state.desiredSequence
+						? "ready"
+						: "pending",
 				error: null,
 				nextAttemptAt: Date.now(),
 			});
