@@ -48,7 +48,7 @@ export async function chat_invoke_backend(
 			const answer = await client.fetchJson("/api/v1/plugin-backend/invoke", { endpoint, input });
 
 			// A repeat can hit the same size limit after the backend already saved its changes.
-			if (answer.status === 502 && answer.body?.code === "response_too_large") {
+			if (answer.status === 500 && answer.body?.code === "response_too_large") {
 				return {
 					_nay: {
 						name: "response_too_large",
@@ -58,10 +58,10 @@ export async function chat_invoke_backend(
 			}
 
 			// Nobody knows whether the run happened: the host failed (5xx, including this route's
-			// own 502), or the answer did not parse. Callers replay with the same
+			// own 500), or the answer did not parse. Callers replay with the same
 			// `clientRequestId`, exactly like the old append door. Since SDK 0.18.0 these resolve
 			// like any other answer, so this branch has to come before the status checks below —
-			// without it a 502 would read as a plain refusal, which says the run definitely did
+			// without it a 5xx would read as a plain refusal, which says the run definitely did
 			// not happen.
 			if (answer.status >= 500 || answer.body === null) {
 				return {

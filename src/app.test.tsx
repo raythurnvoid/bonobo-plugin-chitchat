@@ -386,7 +386,7 @@ type PutOpts = { collection: string; key: string; value: Record<string, unknown>
 type InvokeOpts = { endpoint: string; input: Record<string, unknown> };
 type InvokeAnswer =
 	| { status: 200; body: { runId: string; pluginStatus: number; output: string } }
-	| { status: 502; body: { message: string; runId: string; code?: "response_too_large" } }
+	| { status: 500; body: { message: string; runId: string; code?: "response_too_large" } }
 	| { status: 400 | 401 | 403 | 404 | 409 | 413 | 429; body: { message: string; retryAfterMs?: number } };
 
 /** Wraps a backend answer the way the invoke route delivers a finished run: the body as JSON text. */
@@ -2209,7 +2209,7 @@ test("an unavailable send retry timer stops when the page unmounts", async () =>
 // #endregion send flow
 
 describe("backend send responses", () => {
-	test.each(["message-send", "reply-send"])("%s keeps a size failure for manual retry with the same request", async (endpoint) => {
+	test.each(["message-send", "reply-send"])("%s keeps an HTTP 500 size failure for manual retry with the same request", async (endpoint) => {
 		const h = make_harness();
 		await boot(h, [channel_doc(CH1_KEY, "general"), channel_doc(CH2_KEY, "random")]);
 		const root = message_doc(1_000, { rand: "root", text: "thread root" });
@@ -2221,7 +2221,7 @@ describe("backend send responses", () => {
 		}
 		const input = composer_box(endpoint === "reply-send" ? "Reply in thread" : "Message #general");
 		h.raw.invoke.mockResolvedValueOnce({
-			status: 502,
+			status: 500,
 			body: { code: "response_too_large", message: "Response is too large", runId: "run1" },
 		});
 		vi.useFakeTimers();

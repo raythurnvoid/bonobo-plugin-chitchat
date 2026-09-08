@@ -474,7 +474,7 @@ describe("message-send", () => {
 		seed_public_channel();
 		fake.refusals.set("/api/v1/plugin-data/read", { status: 500, body: { message: "Internal server error" } });
 
-		// The host answers the page 502 for a run that threw, and the page treats that as an
+		// The host answers the page 500 for a run that threw, and the page treats that as an
 		// unknown outcome and replays with the same clientRequestId. The worker must stop here
 		// before later steps can treat the host-door result as a confirmed write.
 		await expect(

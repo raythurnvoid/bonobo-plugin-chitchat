@@ -141,9 +141,9 @@ describe("chat_invoke_backend", () => {
 		});
 	});
 
-	test("stops automatic retry for the host response-size failure", async () => {
+	test("stops automatic retry for the host HTTP 500 response-size failure", async () => {
 		const fetchJson = vi.fn().mockResolvedValue({
-			status: 502,
+			status: 500,
 			body: { code: "response_too_large", message: "Response is too large", runId: "run1" },
 		});
 
@@ -173,6 +173,9 @@ describe("chat_invoke_backend", () => {
 		const answered = async (answer: unknown) =>
 			chat_invoke_backend(make_client(vi.fn().mockResolvedValue(answer)), "message-send", {});
 
+		expect(await answered({ status: 500, body: { message: "Plugin backend failed", runId: "run1" } })).toEqual({
+			_nay: { name: "unavailable", message: "The Chitchat backend did not answer (500)" },
+		});
 		expect(await answered({ status: 502, body: { message: "Plugin backend failed", runId: "run1" } })).toEqual({
 			_nay: { name: "unavailable", message: "The Chitchat backend did not answer (502)" },
 		});

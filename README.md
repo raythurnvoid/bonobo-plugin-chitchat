@@ -80,7 +80,7 @@ A failed session refresh, network failure, or invalid successful answer has the 
 Every successful Chitchat endpoint must return a JSON object; an empty 204, invalid JSON, null,
 arrays, and scalar values do not confirm success.
 
-The host's `response_too_large` code is different. The page stops automatic retries and says,
+The host's HTTP 500 with `response_too_large` is different. The page stops automatic retries and says,
 "The backend response was too large. Your changes may already be saved." It keeps the message,
 attachments, and original request ID in a `Not confirmed` row. Manual Retry uses that same ID.
 Plugin 4xx responses keep their own refusal messages.

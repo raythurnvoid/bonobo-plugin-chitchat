@@ -17383,7 +17383,7 @@ async function Za(e, n, i) {
 	try {
 		for (let u = 1; ; u += 1) {
 			const s = await e.fetchJson("/api/v1/plugin-backend/invoke", { endpoint: n, input: i });
-			if (s.status === 502 && s.body?.code === "response_too_large")
+			if (s.status === 500 && s.body?.code === "response_too_large")
 				return {
 					_nay: {
 						name: "response_too_large",

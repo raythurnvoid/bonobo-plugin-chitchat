@@ -5197,7 +5197,7 @@ function relay_refusal(answer) {
  *
  * The host resolves every answer since SDK 0.18.0, so this is where the decision lives. A 5xx, or
  * a body that did not parse, means nobody knows whether the write happened. The throw escapes
- * `worker.fetch`, the host answers the page 502, and the page treats that as an unknown outcome
+ * `worker.fetch`, the host answers the page 500, and the page treats that as an unknown outcome
  * and replays with the same `clientRequestId`. An uncertain host-door result stops this worker
  * before later steps can treat the write as confirmed.
  */
