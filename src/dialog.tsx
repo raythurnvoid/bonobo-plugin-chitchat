@@ -6,6 +6,8 @@ const FOCUSABLE_SELECTOR =
 
 type Dialog_Props = {
 	labelledBy: string;
+	accessUnavailable?: boolean;
+	onReconnect?: () => void;
 	onClose: () => void;
 	children: ReactNode;
 };
@@ -35,16 +37,8 @@ export function Dialog(props: Dialog_Props) {
 		};
 	}, []);
 
-	// Preact can destroy the control the person is standing on while the dialog stays open, and focus
-	// then falls to the document body. Its child matching treats an old child that rendered as null as
-	// a match before it compares keys, so a section appearing in the middle of the dialog can shift
-	// the actions row onto one of those empty slots. The real row is then unmounted and built again.
-	// Escape stops working too, because the handler below lives on the panel. Keys on the children do
-	// not prevent it. Measured in the people dialog, where the roster arriving destroyed the focused
-	// Close button.
-	//
-	// Only a focus that landed nowhere is repaired. A person clicking something always lands on an
-	// element, and pulling focus back from that would fight them instead of helping.
+	// A roster or access update can remove the focused control. Restore focus only if it
+	// fell to the body; keep a person's deliberate focus on another control.
 	useEffect(() => {
 		const panel = panelRef.current;
 		if (!panel) {
@@ -106,10 +100,26 @@ export function Dialog(props: Dialog_Props) {
 				role="dialog"
 				tabIndex={-1}
 				aria-modal="true"
-				aria-labelledby={props.labelledBy}
+				aria-labelledby={props.accessUnavailable ? undefined : props.labelledBy}
+				aria-label={props.accessUnavailable ? "Channel access is unavailable" : undefined}
 				onKeyDown={handle_key_down}
 			>
-				{props.children}
+				{props.accessUnavailable ? (
+					<>
+						<h2 className="dialog-title">Channel access is unavailable</h2>
+						<p>Your changes are kept. Reconnect to continue.</p>
+						<div className="dialog-actions">
+							<button type="button" className="button" onClick={props.onClose}>
+								Close
+							</button>
+							<button type="button" className="button" onClick={props.onReconnect}>
+								Reconnect
+							</button>
+						</div>
+					</>
+				) : (
+					props.children
+				)}
 			</div>
 		</div>
 	);

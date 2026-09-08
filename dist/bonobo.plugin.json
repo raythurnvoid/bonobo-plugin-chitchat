@@ -2,25 +2,10 @@
 	"schemaVersion": 1,
 	"name": "chitchat",
 	"displayName": "Chitchat",
-	"version": "0.7.9",
-	"description": "Team chat for the workspace: channels, one-level threads, reactions, workspace-file attachments, unread and mention badges, and Unreads, Threads, and Activity views. Messages live in the plugin's own document store, and a backend projects each channel into read-only Markdown transcript files.",
+	"version": "0.8.0",
+	"description": "Team chat inside Bonobo Senate Press. Use your Press account and workspace with channels, threads, reactions, file attachments, unread and mention badges, and activity views. Chitchat has its own Convex database and live connections. A connected service keeps Markdown transcript copies in Press Files with current sharing and write permissions.",
 	"compatibility": {
 		"bonoboPluginRuntime": "1"
-	},
-	"backend": {
-		"entry": "dist/backend/worker.js",
-		"moduleName": "plugin.js",
-		"compatibilityDate": "2026-07-01",
-		"compatibilityFlags": ["nodejs_compat"],
-		"endpoints": [
-			{ "id": "message-send", "path": "/messages/send", "serialization": "installation" },
-			{ "id": "message-edit", "path": "/messages/edit", "serialization": "installation" },
-			{ "id": "message-delete", "path": "/messages/delete", "serialization": "installation" },
-			{ "id": "reply-send", "path": "/replies/send", "serialization": "installation" },
-			{ "id": "reaction-toggle", "path": "/reactions/toggle", "serialization": "installation" },
-			{ "id": "channel-manage", "path": "/channels/manage", "serialization": "installation" },
-			{ "id": "reconcile", "path": "/reconcile", "serialization": "installation" }
-		]
 	},
 	"events": [],
 	"pages": [
@@ -34,25 +19,21 @@
 		}
 	],
 	"capabilities": [
-		"plugin.data.read",
-		"plugin.data.user-write",
-		"plugin.data.write",
-		"plugin.backend.invoke",
+		"plugin.service.connect",
+		"ui.outbound.fetch",
 		"workspace.files.read",
 		"workspace.files.write",
 		"workspace.files.own-write",
 		"workspace.files.own-access",
 		"workspace.members.read"
 	],
-	"userWritableCollections": ["channels", "cursors"],
 	"outboundOrigins": [],
+	"uiOutboundOrigins": [
+		"https://exuberant-hippopotamus-790.convex.cloud",
+		"https://exuberant-hippopotamus-790.convex.site",
+		"wss://exuberant-hippopotamus-790.convex.cloud"
+	],
 	"files": [
-		{
-			"path": "dist/backend/worker.js",
-			"sha256": "sha256:574764d33227648b93facd1345186004eeca7ed989be9667ca8af08940ad1006",
-			"bytes": 201777,
-			"contentType": "application/javascript"
-		},
 		{
 			"path": "dist/frontend/index.html",
 			"sha256": "sha256:1653fab1e267481bb020915f2939771a17633d4febbfa0b619605bb96c5e5e07",
@@ -61,14 +42,14 @@
 		},
 		{
 			"path": "dist/frontend/assets/index.js",
-			"sha256": "sha256:7583c4b3e184cbddd0c3b450648c035a8fad00ca05d0ed390a9ded1cf79e6c05",
-			"bytes": 795815,
+			"sha256": "sha256:acdc87616401e6accade300460a53ed008312e286bbaca6ee3399929f914cfd5",
+			"bytes": 755019,
 			"contentType": "application/javascript"
 		},
 		{
 			"path": "dist/frontend/assets/index.css",
-			"sha256": "sha256:f4559dd6594f894dda0bead5ddf39d24dfc74251e1f88db7420a0c506b5ebc10",
-			"bytes": 44253,
+			"sha256": "sha256:56b3dacc55748805d4a390048b2ea59046904c99670446f0f6dba2d31341858c",
+			"bytes": 45016,
 			"contentType": "text/css"
 		}
 	]

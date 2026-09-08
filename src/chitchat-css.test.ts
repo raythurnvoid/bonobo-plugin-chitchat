@@ -110,8 +110,8 @@ describe("chitchat.css reveal reaches every action button", () => {
 		// The palette items live two levels inside the cluster and declare no pointer-events of
 		// their own. A reveal selector naming `.button` would leave them dead: keyboard cannot
 		// substitute for the check, because focus() + Enter dispatches a click with no hit test.
-		const reveals = [...css.matchAll(/\.message:(?:hover|focus-within) \.message-actions([^,{]*)[,{]/gu)].map(
-			(match) => match[1]!.trim(),
+		const reveals = [...css.matchAll(/\.message:(?:hover|focus-within) \.message-actions([^,{]*)[,{]/gu)].map((match) =>
+			match[1]!.trim(),
 		);
 		const clusterButtons = ["message-action", "reaction-palette-item"];
 		const uncovered = clusterButtons.filter(

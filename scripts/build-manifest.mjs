@@ -22,6 +22,7 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MAX_REVIEW_LINE_LENGTH = 1_000;
 const MAX_FILE_BYTES = 900_000;
 const MAX_FILES = 64;
+const MAX_ARTIFACT_BYTES = 16 * 1024 * 1024;
 
 function fail(message) {
 	console.error(`build-manifest: ${message}`);
@@ -83,6 +84,7 @@ if (manifest.files.length > MAX_FILES) {
 
 // Manifest: recompute files[] sha256/bytes from the files on disk.
 let manifestText = originalManifestText;
+let artifactBytes = 0;
 for (const file of manifest.files) {
 	let fileBytes;
 	try {
@@ -93,6 +95,10 @@ for (const file of manifest.files) {
 	// Publishing rejects files over its per-file cap, so fail the build first.
 	if (fileBytes.byteLength > MAX_FILE_BYTES) {
 		fail(`Manifest file is ${fileBytes.byteLength} bytes (cap ${MAX_FILE_BYTES}): "${file.path}"`);
+	}
+	artifactBytes += fileBytes.byteLength;
+	if (artifactBytes > MAX_ARTIFACT_BYTES) {
+		fail(`Manifest files exceed the ${MAX_ARTIFACT_BYTES}-byte total limit`);
 	}
 	// Publishing rejects unreadably long source lines, so fail the build before this artifact can be released.
 	if (
