@@ -1,5 +1,6 @@
 import type { KeyboardEvent, ReactNode } from "react";
 import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 
 const FOCUSABLE_SELECTOR =
 	'button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
@@ -33,7 +34,16 @@ export function Dialog(props: Dialog_Props) {
 		const initial = panel === null ? null : dialog_initial_focus_target(panel);
 		initial?.focus();
 		return () => {
-			opener?.focus();
+			queueMicrotask(() => {
+				if (opener?.isConnected && opener !== document.body && !opener.closest("[inert]")) {
+					opener.focus();
+					if (document.activeElement === opener) return;
+				}
+				// Resizing can cover the opener while the modal stays open.
+				const thread = document.querySelector<HTMLElement>(".thread");
+				const back = thread?.querySelector<HTMLButtonElement>(".thread-head button:not([disabled])");
+				(back ?? thread)?.focus();
+			});
 		};
 	}, []);
 
@@ -52,9 +62,12 @@ export function Dialog(props: Dialog_Props) {
 			dialog_initial_focus_target(panel).focus();
 		};
 
-		// focusout runs while the node is being removed, before the replacement is in place, so the
-		// check waits for the render to finish.
-		const handle_focus_out = () => queueMicrotask(restore_lost_focus);
+		const handle_focus_out = (event: FocusEvent) => {
+			// A normal pointer focus move briefly exposes body too. Do not steal its intended target.
+			if (event.relatedTarget !== null) return;
+			// Removed controls need their replacement to render before focus can be restored.
+			queueMicrotask(restore_lost_focus);
+		};
 		panel.addEventListener("focusout", handle_focus_out);
 		return () => panel.removeEventListener("focusout", handle_focus_out);
 	}, []);
@@ -92,7 +105,8 @@ export function Dialog(props: Dialog_Props) {
 		}
 	};
 
-	return (
+	// A global modal must stay outside a covered pane's inert subtree.
+	return createPortal(
 		<div className="dialog-overlay">
 			<div
 				ref={panelRef}
@@ -121,6 +135,7 @@ export function Dialog(props: Dialog_Props) {
 					props.children
 				)}
 			</div>
-		</div>
+		</div>,
+		document.body,
 	);
 }

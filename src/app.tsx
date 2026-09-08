@@ -495,6 +495,8 @@ export function App(props: { client: BonoboClient }) {
 		rootSequence: number;
 		replySequence: number;
 	} | null>(null);
+	// Keep covered panes mounted so resizing does not discard drafts.
+	const threadCoversPage = isNarrow && threadRootId !== null;
 	const selectedId = selection?.kind === "channel" ? selection.id : null;
 	const selected = useQuery(
 		api.channels.get,
@@ -516,7 +518,7 @@ export function App(props: { client: BonoboClient }) {
 	const appRef = useRef<HTMLDivElement>(null);
 	const navRef = useRef<HTMLElement>(null);
 	const toggleRef = useRef<HTMLButtonElement>(null);
-	const focusOwner = useRef<"sidebar" | "drawer" | "separator" | null>(null);
+	const focusOwner = useRef<"sidebar" | "drawer" | "separator" | "main" | null>(null);
 	const pendingFocus = useRef<"drawer" | "thread" | "selected" | null>(null);
 	const selectionRequest = useRef(0);
 	const lastReadWrite = useRef<string | null>(null);
@@ -660,7 +662,7 @@ export function App(props: { client: BonoboClient }) {
 		const query = window.matchMedia("(max-width: 719px)");
 		const change = (event: MediaQueryListEvent) => {
 			pendingFocus.current = event.matches
-				? threadRootId && (focusOwner.current === "sidebar" || focusOwner.current === "separator")
+				? threadRootId && focusOwner.current !== null
 					? "thread"
 					: focusOwner.current === "sidebar" && !drawerOpen
 						? "drawer"
@@ -668,16 +670,17 @@ export function App(props: { client: BonoboClient }) {
 				: focusOwner.current === "drawer"
 					? "selected"
 					: null;
+			if (event.matches && threadRootId) setDrawerOpen(false);
 			setIsNarrow(event.matches);
 		};
 		query.addEventListener("change", change);
 		return () => query.removeEventListener("change", change);
 	}, [drawerOpen, threadRootId]);
 	useLayoutEffect(() => {
-		if (dialog !== null) return;
+		if (document.querySelector(".dialog-overlay")) return;
 		const target = pendingFocus.current;
 		pendingFocus.current = null;
-		if (target === "thread" || (target === "drawer" && threadRootId)) {
+		if (target === "thread" || (target !== null && isNarrow && threadRootId)) {
 			const thread = appRef.current?.querySelector<HTMLElement>(".thread");
 			const back = thread?.querySelector<HTMLButtonElement>(".thread-head button:not([disabled])");
 			if (back) back.focus();
@@ -726,10 +729,12 @@ export function App(props: { client: BonoboClient }) {
 							? "sidebar"
 							: target.classList.contains("thread-resize")
 								? "separator"
-								: null;
+								: appRef.current?.contains(target) && !target.closest(".thread")
+									? "main"
+									: null;
 			}}
 		>
-			<header className="app-bar">
+			<header className="app-bar" inert={threadCoversPage || undefined}>
 				<h1 className="visually-hidden">Chitchat</h1>
 				<button
 					ref={toggleRef}
@@ -743,6 +748,7 @@ export function App(props: { client: BonoboClient }) {
 			</header>
 			<nav
 				ref={navRef}
+				inert={threadCoversPage || undefined}
 				className={["sidebar", drawerOpen && "is-open", railExpanded && "is-expanded"].filter(Boolean).join(" ")}
 				aria-label="Channels"
 				tabIndex={-1}
@@ -849,17 +855,19 @@ export function App(props: { client: BonoboClient }) {
 				</div>
 			</nav>
 			<main className="main" tabIndex={-1}>
-				{selectedId ? (
-					<TranscriptStatus key={`transcript:${selectedId}`} client={props.client} channelId={selectedId} />
-				) : null}
-				{session.message ? (
-					<div className="connection-status" role="alert">
-						{session.message}
-						<button type="button" className="button" onClick={session.retry}>
-							Reconnect
-						</button>
-					</div>
-				) : null}
+				<div className="main-notices" inert={threadCoversPage || undefined}>
+					{selectedId ? (
+						<TranscriptStatus key={`transcript:${selectedId}`} client={props.client} channelId={selectedId} />
+					) : null}
+					{session.message ? (
+						<div className="connection-status" role="alert">
+							{session.message}
+							<button type="button" className="button" onClick={session.retry}>
+								Reconnect
+							</button>
+						</div>
+					) : null}
+				</div>
 				{selection?.kind === "unreads" ? (
 					<UnreadsView scopeKey={scopeKey} enabled={session.ready} memberNames={memberNames} onOpen={open_channel} />
 				) : selection?.kind === "activity" ? (
@@ -882,7 +890,10 @@ export function App(props: { client: BonoboClient }) {
 						memberNames={memberNames}
 						announce={announce}
 						threadRootId={threadRootId}
-						setThreadRootId={setThreadRootId}
+						setThreadRootId={(id) => {
+							setThreadRootId(id);
+							if (id) setDrawerOpen(false);
+						}}
 						isNarrow={isNarrow}
 						canWrite={selectedPermissions?.canWrite ?? false}
 						online={session.connected}

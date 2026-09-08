@@ -662,6 +662,10 @@ body {
 	flex-direction: column;
 }
 
+.main-notices {
+	flex-shrink: 0;
+}
+
 .page-controls {
 	display: flex;
 	flex-wrap: wrap;

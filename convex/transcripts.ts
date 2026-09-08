@@ -158,6 +158,7 @@ export const begin_connect = internalMutation({
 			sponsorLifetime: access._yay.member.membershipLifetime,
 			clientRequestId: args.clientRequestId,
 			rootPath,
+			selectIndexOnReady: true,
 			phase: "exchange" as const,
 			sourceSecret: args.sourceSecret,
 			lifecycleRequestId: crypto.randomUUID(),

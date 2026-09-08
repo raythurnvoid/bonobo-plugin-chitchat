@@ -69,6 +69,8 @@ Ordinary updates preserve unrelated manual text. An ambiguous edited block stops
 
 The README index runs independently from channel jobs. It stays within the same 100,000-byte limit and does not split into extra files. If it grows too large, archive channels or shorten their names, then retry the index. Its own status and retry control do not claim that channel transcripts failed.
 
+A successful **Connect Files** also selects that connection for the shared README index. This repairs an expired index grant even when its first channel is no longer available. Failed setup keeps the previous choice. Background renewal does not choose another sponsor. A pending index write keeps its exact saved request while the new connection retries it.
+
 New output starts with Chitchat labels and a plugin lock. Removing its label, moving or replacing a pinned folder, removing account access, or applying a human lock can block sync. Repeated setup never repairs those choices. A manual sharing change detaches automatic reader updates. The Files UI then owns that sharing.
 
 Removing workspace chat read permission does not revoke a separate Files grant while workspace and channel membership remain active. Removing the workspace membership invalidates attached transcript grants from that membership lifetime.
@@ -113,3 +115,11 @@ Backend tests use `convex-test`. Frontend tests feed native query snapshots to t
 The build writes the three frontend assets and both manifest copies. It checks per-file and total size limits, review line lengths, and hashes. Build twice and confirm stable bytes. Commit built assets because Press fetches them from GitHub. No generic backend worker ships.
 
 The SDK is pinned to a real mirror commit. Review the host and SDK changes first, mirror the SDK, pin it here, then publish the exact reviewed plugin commit. Update the installation and accept its declared origins and capabilities. Finally verify the served version and bytes. Never point the parent gitlink past the published commit.
+
+## Recovery
+
+After native chat has accepted messages, keep its database and transcript queue. Fix and release the current app. Do not restore the old generic-store plugin or import old Markdown copies as chat; that would hide messages saved since the rebuild.
+
+Use **Retry sync** after a temporary Files failure. Use **Reconnect Files** when its connection needs renewal, including after a plugin update. Both still check current permissions and locks. They never restore removed account grants or overwrite manual sharing. **Rebuild copies** requires explicit confirmation before replacing manual text.
+
+Verify access, pending jobs, and the served bundle after a repair. Uninstall is not a temporary pause: it retires the installation's authority. Never uninstall, reset the plugin registry, or wipe Press as a shortcut to recover this plugin.

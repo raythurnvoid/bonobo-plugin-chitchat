@@ -1,4 +1,4 @@
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { doc } from "convex-helpers/validators";
 import { internalMutation, internalQuery, type MutationCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
@@ -294,16 +294,16 @@ export const save_input = internalMutation({
 			.take(2048);
 		let position = 0;
 		if (file.header && args.content.startsWith(file.header)) position = file.header.length;
-		else if (file.header) throw new Error("The transcript header changed. Rebuild the Files copy to replace it.");
+		else if (file.header) throw new ConvexError("The transcript header changed. Rebuild the Files copy to replace it.");
 		for (const block of blocks) {
 			let start = block.start;
 			if (args.content !== file.content) {
 				start = args.content.indexOf(block.text);
 				if (start < position || args.content.indexOf(block.text, start + 1) !== -1)
-					throw new Error("A transcript block is missing or repeated. Rebuild the Files copy to replace it.");
+					throw new ConvexError("A transcript block is missing or repeated. Rebuild the Files copy to replace it.");
 			}
 			if (start < position || args.content.slice(start, start + block.text.length) !== block.text)
-				throw new Error("The transcript block changed. Rebuild the Files copy to replace it.");
+				throw new ConvexError("The transcript block changed. Rebuild the Files copy to replace it.");
 			await ctx.db.insert("transcript_staged_blocks", {
 				runId: current.run._id,
 				messageId: block.messageId,
@@ -477,7 +477,7 @@ export const next_job = internalQuery({
 
 async function save_output(ctx: MutationCtx, run: Doc<"transcript_runs">, order: number, content: string) {
 	if (chatbe_utf8_byte_size(content) > chatbe_ROLLOVER_MAX_BYTES)
-		throw new Error("This transcript part exceeds 100,000 bytes.");
+		throw new ConvexError("This transcript part exceeds 100,000 bytes.");
 	await ctx.db.insert("transcript_writes", {
 		runId: run._id,
 		order,
@@ -513,7 +513,7 @@ export const stage = internalMutation({
 		for (const block of page.page) {
 			const text = block.prefix + block.text + block.suffix;
 			if (chatbe_utf8_byte_size(buffer + text) > chatbe_ROLLOVER_MAX_BYTES) {
-				if (buffer === run.header) throw new Error("One transcript block exceeds the file size limit.");
+				if (buffer === run.header) throw new ConvexError("One transcript block exceeds the file size limit.");
 				await save_output(ctx, run, order, buffer);
 				outputCount++;
 				order++;

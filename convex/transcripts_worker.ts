@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { internalAction, internalMutation, type ActionCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import type { Doc } from "./_generated/dataModel";
@@ -24,6 +24,12 @@ export const transcripts_receipt = z.object({
 	readerRevision: z.number().nullable(),
 	operationId: z.string(),
 });
+
+export function transcripts_get_error_message(error: unknown, fallback: string) {
+	// Convex keeps expected refusal data separate from its cross-function error message.
+	if (error instanceof ConvexError && typeof error.data === "string") return error.data;
+	return error instanceof Error ? error.message : fallback;
+}
 
 async function readers_step(
 	ctx: ActionCtx,
@@ -273,7 +279,7 @@ export const run_channel = internalAction({
 			} catch (error) {
 				await ctx.runMutation(internal.transcripts_db.release_readers, {
 					...checkpoint,
-					error: error instanceof Error ? error.message : "Files readers could not be updated.",
+					error: transcripts_get_error_message(error, "Files readers could not be updated."),
 				});
 			}
 			return;
@@ -575,7 +581,7 @@ export const run_channel = internalAction({
 				definiteRefusal: false,
 			});
 		} catch (error) {
-			const message = error instanceof Error ? error.message : "Files sync failed. Try again.";
+			const message = transcripts_get_error_message(error, "Files sync failed. Try again.");
 			await ctx.runMutation(internal.transcripts_db.release, {
 				...checkpoint,
 				error: message,

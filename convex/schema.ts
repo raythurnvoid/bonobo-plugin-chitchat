@@ -305,6 +305,7 @@ export default defineSchema({
 		sponsorLifetime: v.number(),
 		clientRequestId: v.string(),
 		rootPath: v.string(),
+		selectIndexOnReady: v.boolean(),
 		phase: v.union(
 			v.literal("exchange"),
 			v.literal("renew"),

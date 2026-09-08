@@ -1,4 +1,4 @@
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { doc } from "convex-helpers/validators";
 import { internalAction, internalMutation, type MutationCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
@@ -11,7 +11,7 @@ import {
 	chatbe_ROLLOVER_MAX_BYTES,
 } from "../shared/transcript-markdown";
 import { transcripts_get_token, transcripts_host_post, transcripts_host_scope } from "./transcripts_grants";
-import { transcripts_prepared, transcripts_receipt } from "./transcripts_worker";
+import { transcripts_get_error_message, transcripts_prepared, transcripts_receipt } from "./transcripts_worker";
 
 async function create_run(ctx: MutationCtx, index: Doc<"transcript_indexes">, reconcile: boolean) {
 	const runId = await ctx.db.insert("transcript_index_runs", {
@@ -65,6 +65,7 @@ export async function transcripts_index_request(
 		}
 		const canRestart = !current.prepared && current.phase !== "fence";
 		await ctx.db.patch("transcript_index_runs", current._id, {
+			grantChannelId: index.grantChannelId,
 			claim: "",
 			leaseUntil: 0,
 			retryAt: 0,
@@ -141,7 +142,7 @@ export const step = internalMutation({
 				(index.entryCount ? chatbe_utf8_byte_size("\n\n## Channels\n") : 0) +
 				index.entryBytes;
 			if (size > chatbe_ROLLOVER_MAX_BYTES)
-				throw new Error(
+				throw new ConvexError(
 					"The complete channel index exceeds 100,000 bytes. Archive channels or shorten their names, then retry. Channel transcript sync can continue.",
 				);
 			const page = await ctx.db
@@ -205,13 +206,13 @@ export const prepared = internalMutation({
 				args.parentNodeId !== index.parentNodeId ||
 				args.writerGeneration !== index.writerGeneration)
 		)
-			throw new Error("The README destination changed. Its saved path cannot be adopted.");
+			throw new ConvexError("The README destination changed. Its saved path cannot be adopted.");
 		if (args.expectedNodeId !== index.nodeId)
-			throw new Error(
+			throw new ConvexError(
 				"The README path contains a different file. Move it away or restore the original file, then retry.",
 			);
 		if (!run.reconcile && args.expectedContentRevision !== index.contentRevision)
-			throw new Error("The README text changed in Files. Rebuild transcripts to replace these edits.");
+			throw new ConvexError("The README text changed in Files. Rebuild transcripts to replace these edits.");
 		const { runId: _run, claim: _claim, ...prepared } = args;
 		await ctx.db.patch("transcript_index_runs", run._id, { ...prepared, prepared: true });
 		await ctx.db.patch("transcript_indexes", index._id, {
@@ -413,7 +414,7 @@ export const run = internalAction({
 				retryable: false,
 			});
 		} catch (error) {
-			const message = error instanceof Error ? error.message : "The channel index could not be saved.";
+			const message = transcripts_get_error_message(error, "The channel index could not be saved.");
 			await ctx.runMutation(internal.transcripts_index.release, {
 				...checkpoint,
 				receipt: null,

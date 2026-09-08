@@ -359,6 +359,7 @@ function Composer(props: {
 	label: string;
 	busy: boolean;
 	disabled: boolean;
+	inert?: boolean;
 	onSend: (text: string, attachments: Attachment[], mentions: string[]) => boolean;
 }) {
 	const hintId = useId();
@@ -452,7 +453,7 @@ function Composer(props: {
 		}
 	}, [text]);
 	return (
-		<div className="composer">
+		<div className="composer" inert={props.inert || undefined}>
 			{props.draft.value.attachments.length ? (
 				<ul className="composer-attachments">
 					{props.draft.value.attachments.map((file) => (
@@ -1231,6 +1232,7 @@ export function ThreadPanel(props: ChannelViewProps & { rootMessageId: Id<"messa
 		<section
 			className="thread"
 			aria-label="Thread"
+			tabIndex={-1}
 			onKeyDown={(event) => {
 				if (event.key === "Escape") {
 					event.stopPropagation();
@@ -1316,6 +1318,7 @@ export function ChannelView(props: ChannelViewProps) {
 function ChannelContent(props: ChannelViewProps) {
 	const session = use_chat_session();
 	const enabled = session.ready && props.channel !== null;
+	const threadCoversChannel = props.isNarrow && props.threadRootId !== null;
 	const window = use_chat_window({ target: { channelId: props.channelId }, enabled, retain: session.refreshing });
 	const draft = use_chat_draft(props.client, `${props.userId}:${props.channelId}`);
 	const queue = use_send_queue({
@@ -1396,7 +1399,7 @@ function ChannelContent(props: ChannelViewProps) {
 	};
 	return (
 		<div className="channel">
-			<header className="channel-head">
+			<header className="channel-head" inert={threadCoversChannel || undefined}>
 				<div className="channel-head-main">
 					<h2 className="channel-title">{props.channel ? `#${props.channel.name}` : "Channel unavailable"}</h2>
 					{props.channel?.topic ? <p className="channel-topic">{props.channel.topic}</p> : null}
@@ -1410,6 +1413,7 @@ function ChannelContent(props: ChannelViewProps) {
 				<div
 					ref={log}
 					className="message-log"
+					inert={threadCoversChannel || undefined}
 					role="log"
 					tabIndex={0}
 					aria-live="off"
@@ -1460,6 +1464,7 @@ function ChannelContent(props: ChannelViewProps) {
 					<>
 						<div
 							className="thread-resize"
+							inert={threadCoversChannel || undefined}
 							role="separator"
 							tabIndex={0}
 							aria-orientation="vertical"
@@ -1526,6 +1531,7 @@ function ChannelContent(props: ChannelViewProps) {
 					!props.online ||
 					props.channel?.archivedAt !== null
 				}
+				inert={threadCoversChannel}
 				onSend={queue.enqueue}
 			/>
 		</div>

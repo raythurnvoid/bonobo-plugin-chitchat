@@ -6,6 +6,7 @@ import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { press_post } from "./press";
 import { transcripts_decrypt, transcripts_encrypt } from "./transcripts_secrets";
+import { transcripts_index_request } from "./transcripts_index";
 import { chatbe_channel_header } from "../shared/transcript-markdown";
 import schema from "./schema";
 
@@ -203,6 +204,20 @@ export const save_destination = internalMutation({
 		const grant = await ctx.db.get("host_grants", args.grantId);
 		if (!grant || grant.lifecycleRequestId !== args.lifecycleRequestId) return;
 		const channel = (await ctx.db.get("channels", grant.channelId))!;
+		const installation = await ctx.db.get("installations", grant.installationId);
+		const sponsor = await ctx.db
+			.query("workspace_members")
+			.withIndex("by_installation_hostUserId", (q) =>
+				q.eq("installationId", grant.installationId).eq("hostUserId", grant.sponsorUserId),
+			)
+			.unique();
+		if (
+			installation?.status !== "ready" ||
+			!sponsor?.active ||
+			sponsor.cleanupPending ||
+			sponsor.membershipLifetime !== grant.sponsorLifetime
+		)
+			throw new Error("The Files sponsor no longer has access. Connect again.");
 		const current = await ctx.db
 			.query("transcript_destinations")
 			.withIndex("by_channel", (q) => q.eq("channelId", grant.channelId))
@@ -225,7 +240,7 @@ export const save_destination = internalMutation({
 				readerRunId: null,
 				readerError: null,
 			});
-		await ctx.db.patch("host_grants", grant._id, { error: null, updatedAt: Date.now() });
+		await ctx.db.patch("host_grants", grant._id, { selectIndexOnReady: false, error: null, updatedAt: Date.now() });
 		const state = await ctx.db
 			.query("transcript_channels")
 			.withIndex("by_channel", (q) => q.eq("channelId", channel._id))
@@ -244,8 +259,11 @@ export const save_destination = internalMutation({
 			)
 			.unique();
 		if (index) {
-			if (!index.grantChannelId) await ctx.db.patch("transcript_indexes", index._id, { grantChannelId: channel._id });
-			await ctx.scheduler.runAfter(0, internal.transcripts_index.run, { indexId: index._id });
+			// Only a new explicit connection chooses another sponsor. Renewal keeps that choice.
+			if (grant.selectIndexOnReady || !index.grantChannelId)
+				await ctx.db.patch("transcript_indexes", index._id, { grantChannelId: channel._id });
+			if (grant.selectIndexOnReady || !index.grantChannelId || index.grantChannelId === channel._id)
+				await transcripts_index_request(ctx, { indexId: index._id, reconcile: false });
 		} else {
 			const indexId = await ctx.db.insert("transcript_indexes", {
 				installationId: channel.installationId,
@@ -276,7 +294,7 @@ export const renew = internalMutation({
 	returns: v.null(),
 	handler: async (ctx, args) => {
 		const grant = await ctx.db.get("host_grants", args.grantId);
-		if (!grant || grant.phase !== "ready") return;
+		if (!grant || grant.phase !== "ready" || grant.selectIndexOnReady) return;
 		if (!grant.interactiveSecret || grant.interactiveExpiresAt <= Date.now()) {
 			await ctx.db.patch("host_grants", grant._id, {
 				error: "Connect Files sync again to continue.",

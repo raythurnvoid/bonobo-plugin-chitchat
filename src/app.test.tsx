@@ -576,6 +576,147 @@ describe("App", () => {
 		fireEvent.click(screen.getByRole("button", { name: "Back to messages" }));
 		expect(screen.queryByRole("region", { name: "Thread" })).toBeNull();
 	});
+	test("keeps covered controls inert without remounting drafts when the thread fills the screen", async () => {
+		fake.overrides.set("transcripts:status", {
+			status: "not_connected",
+			canConnect: true,
+			canReconcile: false,
+			folderPath: null,
+			folderNodeId: null,
+			indexStatus: "ready",
+			error: null,
+			indexError: null,
+			readerMode: "unconfigured",
+		});
+		render(<App client={client()} />);
+		fireEvent.click(screen.getByRole("button", { name: "#general" }));
+		await screen.findByText("Message in general");
+		const channelInput = screen.getByRole("combobox", { name: "Message #general" }) as HTMLTextAreaElement;
+		fireEvent.change(channelInput, { target: { value: "Channel draft" } });
+		const reply = screen.getByRole("button", { name: "Reply in thread" });
+		fireEvent.click(reply);
+		const thread = screen.getByRole("region", { name: "Thread" });
+		const threadInput = within(thread).getByRole("combobox", { name: "Reply in thread" }) as HTMLTextAreaElement;
+		fireEvent.change(threadInput, { target: { value: "Thread draft" } });
+		fake.session.message = "Chitchat is disconnected. Your draft is kept.";
+		fake.session.connected = false;
+		fake.session.canSend = false;
+		publish();
+		channelInput.focus();
+		resize(true);
+		expect(document.activeElement).toBe(screen.getByRole("button", { name: "Back to messages" }));
+		const covered = [
+			screen.getByRole("button", { name: "Channels" }),
+			screen.getByRole("navigation", { name: "Channels" }),
+			screen.getByRole("button", { name: "Connect Files" }),
+			screen.getByRole("button", { name: "Reconnect" }),
+			screen.getByRole("log", { name: "Messages in #general" }),
+			channelInput,
+		];
+		for (const element of covered) expect(element.closest("[inert]")).not.toBeNull();
+		expect(thread.closest("[inert]")).toBeNull();
+		expect(threadInput.closest("[inert]")).toBeNull();
+		expect(channelInput.value).toBe("Channel draft");
+		expect(threadInput.value).toBe("Thread draft");
+		resize(false);
+		for (const element of covered) expect(element.closest("[inert]")).toBeNull();
+		expect(screen.getByRole("combobox", { name: "Message #general" })).toBe(channelInput);
+		expect(within(thread).getByRole("combobox", { name: "Reply in thread" })).toBe(threadInput);
+		threadInput.focus();
+		resize(true);
+		expect(document.activeElement).toBe(threadInput);
+		fireEvent.click(screen.getByRole("button", { name: "Back to messages" }));
+		await waitFor(() => expect(document.activeElement).toBe(reply));
+		expect(channelInput.closest("[inert]")).toBeNull();
+		expect(channelInput.value).toBe("Channel draft");
+	});
+	test("focuses the narrow thread region when a pending send disables its back button", async () => {
+		render(<App client={client()} />);
+		fireEvent.click(screen.getByRole("button", { name: "#general" }));
+		await screen.findByText("Message in general");
+		fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+		const pending = deferred<unknown>();
+		fake.mutation.mockImplementation((name: string) =>
+			name === "messages:send" ? pending.promise : Promise.resolve({ _yay: true }),
+		);
+		const input = screen.getByRole("combobox", { name: "Message #general" });
+		fireEvent.change(input, { target: { value: "Pending channel message" } });
+		fireEvent.click(within(input.closest(".composer") as HTMLElement).getByRole("button", { name: "Send" }));
+		screen.getByRole("separator", { name: "Resize thread panel" }).focus();
+		resize(true);
+		expect((screen.getByRole("button", { name: "Back to messages" }) as HTMLButtonElement).disabled).toBe(true);
+		expect(document.activeElement).toBe(screen.getByRole("region", { name: "Thread" }));
+		await act(async () =>
+			pending.resolve({ _yay: { kind: "message", messageId: "new-message", revision: 1, sequence: 2 } }),
+		);
+	});
+	test("closes an old drawer when opening a thread after widening the page", async () => {
+		render(<App client={client()} />);
+		fireEvent.click(screen.getByRole("button", { name: "#general" }));
+		await screen.findByText("Message in general");
+		resize(true);
+		fireEvent.click(screen.getByRole("button", { name: "Channels" }));
+		resize(false);
+		fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+		resize(true);
+		const navigation = screen.getByRole("navigation", { name: "Channels" });
+		expect(navigation.hasAttribute("inert")).toBe(true);
+		expect(navigation.classList.contains("is-open")).toBe(false);
+		fireEvent.click(screen.getByRole("button", { name: "Back to messages" }));
+		expect(screen.getByRole("button", { name: "Channels" }).getAttribute("aria-expanded")).toBe("false");
+	});
+	test.each(["attach", "delete", "rebuild", "rename"] as const)(
+		"keeps the %s modal usable when its opener is covered by the narrow thread",
+		async (kind) => {
+			fake.messages = [message((fake.channels[0] as Doc<"channels">)._id, { authorHostUserId: "alice" })];
+			fake.overrides.set("transcripts:status", {
+				status: "ready",
+				canConnect: true,
+				canReconcile: true,
+				folderPath: "/fresh/general",
+				folderNodeId: "folder-general",
+				indexStatus: "ready",
+				error: null,
+				indexError: null,
+				readerMode: "attached",
+			});
+			const host = client();
+			vi.mocked(host.fetchJson).mockResolvedValue({ status: 200, body: { items: [], cursor: null, isDone: true } });
+			render(<App client={host} />);
+			fireEvent.click(screen.getByRole("button", { name: "#general" }));
+			await screen.findByText("Message in general");
+			fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+			let opener: HTMLElement;
+			if (kind === "attach") {
+				const input = screen.getByRole("combobox", { name: "Message #general" });
+				opener = within(input.closest(".composer") as HTMLElement).getByRole("button", { name: "Attach file" });
+			} else if (kind === "delete") {
+				opener = within(screen.getByRole("log", { name: "Messages in #general" })).getByRole("button", {
+					name: "Delete",
+				});
+			} else if (kind === "rebuild") {
+				fireEvent.click(screen.getByText("Transcript details"));
+				opener = screen.getByRole("button", { name: "Rebuild copies" });
+			} else {
+				fireEvent.click(screen.getByRole("button", { name: "Actions for #general" }));
+				opener = screen.getByRole("menuitem", { name: "Rename #general" });
+			}
+			opener.focus();
+			fireEvent.click(opener);
+			const modal = await screen.findByRole("dialog");
+			const initial = document.activeElement;
+			expect(modal.contains(initial)).toBe(true);
+			resize(true);
+			expect(screen.getByRole("dialog")).toBe(modal);
+			expect(modal.closest("[inert]")).toBeNull();
+			expect(document.activeElement).toBe(initial);
+			fireEvent.click(within(modal).getByRole("button", { name: "Cancel" }));
+			await waitFor(() =>
+				expect(document.activeElement).toBe(screen.getByRole("button", { name: "Back to messages" })),
+			);
+			expect(screen.queryByRole("dialog")).toBeNull();
+		},
+	);
 	test("blocks view and channel navigation while a message send is in flight", async () => {
 		render(<App client={client()} />);
 		fireEvent.click(screen.getByRole("button", { name: "#general" }));

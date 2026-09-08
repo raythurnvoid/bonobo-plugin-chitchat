@@ -1,5 +1,6 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
+import { ConvexError } from "convex/values";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { z } from "zod";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
@@ -8,6 +9,7 @@ import schema from "./schema";
 import { transcripts_encrypt } from "./transcripts_secrets";
 import { channel_members_remove_host_member } from "./channel_members";
 import { chatbe_channel_header, chatbe_readme_markdown } from "../shared/transcript-markdown";
+import { transcripts_get_error_message } from "./transcripts_worker";
 
 const modules = import.meta.glob("./**/*.ts");
 const ROOT = "/chitchat-test-generation";
@@ -48,6 +50,7 @@ function host(isPrivate = false) {
 	let oldTokenExpired = false;
 	let oldTokenForgotten = false;
 	let afterReaders: (() => Promise<void>) | null = null;
+	let beforeWrite: (() => Promise<void>) | null = null;
 	let denyWrites = false;
 	let failWritePath: string | null = null;
 	let refuseRollback = false;
@@ -68,6 +71,11 @@ function host(isPrivate = false) {
 			const path = new URL(String(input)).pathname;
 			const body: unknown = JSON.parse(String(init?.body));
 			const bearer = new Headers(init?.headers).get("Authorization") ?? "";
+			if (path.endsWith("/write") && beforeWrite) {
+				const callback = beforeWrite;
+				beforeWrite = null;
+				await callback();
+			}
 			if (oldTokenExpired && bearer === "Bearer psg_sealed" && !path.endsWith("/rollback-readers"))
 				return Response.json({ message: "Unauthenticated" }, { status: 401 });
 			if (denyWrites && !path.endsWith("/rollback-readers"))
@@ -284,6 +292,9 @@ function host(isPrivate = false) {
 		afterReaders: (callback: () => Promise<void>) => {
 			afterReaders = callback;
 		},
+		beforeWrite: (callback: () => Promise<void>) => {
+			beforeWrite = callback;
+		},
 		denyWrites: (denied = true) => {
 			denyWrites = denied;
 		},
@@ -397,6 +408,7 @@ async function fixture(isPrivate = false) {
 			sponsorLifetime: 1,
 			clientRequestId: "connect",
 			rootPath: ROOT,
+			selectIndexOnReady: false,
 			phase: "ready",
 			lifecycleRequestId: "seal",
 			sourceSecret: "",
@@ -449,7 +461,7 @@ async function fixture(isPrivate = false) {
 		}
 		throw new Error("Transcript worker did not finish");
 	};
-	const reconnect = async () => {
+	const reconnect = async (targetChannelId = channelId) => {
 		const filesFetch = fetch;
 		const keys = await generateKeyPair("ES256");
 		const publicKey = { ...(await exportJWK(keys.publicKey)), kid: "reconnect", alg: "ES256", use: "sig" };
@@ -506,18 +518,44 @@ async function fixture(isPrivate = false) {
 		expect(
 			(
 				await alice.action(api.transcripts.connect, {
-					channelId,
+					channelId: targetChannelId,
 					pluginToken: "plu_current",
-					clientRequestId: "reconnect",
+					clientRequestId: crypto.randomUUID(),
 				})
 			)._nay,
 		).toBeUndefined();
-		const grant = (await t.run(async (ctx) => await ctx.db.query("host_grants").first()))!;
+		const grant = (await t.run(
+			async (ctx) =>
+				await ctx.db
+					.query("host_grants")
+					.withIndex("by_channel", (q) => q.eq("channelId", targetChannelId))
+					.unique(),
+		))!;
 		for (let step = 0; step < 3; step++) await t.action(internal.transcripts_grants.connect, { grantId: grant._id });
-		expect((await t.run(async (ctx) => await ctx.db.get("host_grants", grant._id)))?.error).toBeNull();
+		return (await t.run(async (ctx) => await ctx.db.get("host_grants", grant._id)))!;
 	};
 	return { t, alice, installationId, channelId, channel, remote, send, drain, reconnect };
 }
+
+describe("transcripts_get_error_message", () => {
+	test("uses the expected refusal data instead of transport diagnostics", () => {
+		const error = new ConvexError("A transcript block is missing or repeated.");
+		error.message = "Uncaught ConvexError: transport diagnostics\n    at handler (transcripts_db.ts:304:15)";
+		expect(transcripts_get_error_message(error, "Files sync failed.")).toBe(
+			"A transcript block is missing or repeated.",
+		);
+	});
+
+	test("keeps existing messages for other errors and rejects non-string error data", () => {
+		const error = new ConvexError({ message: "An object payload" });
+		error.message = "Existing diagnostics";
+		expect(transcripts_get_error_message(error, "Files sync failed.")).toBe("Existing diagnostics");
+		expect(transcripts_get_error_message(new TypeError("Request timed out"), "Files sync failed.")).toBe(
+			"Request timed out",
+		);
+		expect(transcripts_get_error_message(null, "Files sync failed.")).toBe("Files sync failed.");
+	});
+});
 
 describe("transcript publication", () => {
 	test.each(["committed", "uncommitted"])(
@@ -680,7 +718,9 @@ describe("transcript publication", () => {
 			text: "Final text",
 			mentions: [],
 		});
-		expect((await drain(true))?.error).toContain("missing or repeated");
+		expect((await drain(true))?.error).toBe(
+			"A transcript block is missing or repeated. Rebuild the Files copy to replace it.",
+		);
 		await alice.mutation(api.transcripts.reconcile, { channelId, clientRequestId: "repair" });
 		await drain();
 		expect(remote.files.get(main)!.content.match(/Final text/g)).toHaveLength(1);
@@ -893,7 +933,7 @@ describe("transcript readers", () => {
 				await t.action(internal.transcripts_worker.run_channel, { channelId });
 			}
 			remote.expireToken(outcome === "forgotten");
-			await reconnect();
+			expect((await reconnect()).error).toBeNull();
 			await alice.mutation(api.transcripts.retry, { channelId });
 			await drain();
 			expect(
@@ -1101,6 +1141,152 @@ describe("transcript readers", () => {
 });
 
 describe("transcript grants", () => {
+	test("a late refusal from the previous index sponsor cannot block the new connection", async () => {
+		const { t, alice, remote, reconnect } = await fixture();
+		const index = (await t.run(async (ctx) => await ctx.db.query("transcript_indexes").first()))!;
+		const created = await alice.mutation(api.channels.create, {
+			clientRequestId: "next-index-sponsor",
+			name: "Next sponsor",
+			topic: "",
+			visibility: "public",
+			invitedUserIds: [],
+		});
+		if (created._yay?.kind !== "channel") throw new Error("Channel creation failed");
+		const otherId = created._yay.channelId;
+		remote.beforeWrite(async () => {
+			remote.expireToken();
+			expect((await reconnect(otherId)).error).toBeNull();
+		});
+		for (let step = 0; step < 15; step++) {
+			await t.action(internal.transcripts_index.run, { indexId: index._id });
+			const current = (await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))!;
+			if (current.grantChannelId === otherId) break;
+		}
+		const rebound = (await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))!;
+		expect(rebound.grantChannelId).toBe(otherId);
+		expect(rebound.status).toBe("pending");
+		expect(rebound.error).toBeNull();
+		for (let step = 0; step < 20; step++) await t.action(internal.transcripts_index.run, { indexId: index._id });
+		expect((await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))?.status).toBe("ready");
+		expect(remote.writes()).toBe(1);
+	});
+
+	test("a sponsor removed during Files setup cannot replace the index connection", async () => {
+		const { t, alice, installationId, channelId, reconnect } = await fixture();
+		const index = (await t.run(async (ctx) => await ctx.db.query("transcript_indexes").first()))!;
+		const created = await alice.mutation(api.channels.create, {
+			clientRequestId: "removed-index-sponsor",
+			name: "Removed sponsor",
+			topic: "",
+			visibility: "public",
+			invitedUserIds: [],
+		});
+		if (created._yay?.kind !== "channel") throw new Error("Channel creation failed");
+		const filesFetch = fetch;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+				const response = await filesFetch(input, init);
+				if (new URL(String(input)).pathname.endsWith("/ensure"))
+					await t.run(async (ctx) => {
+						const sponsor = await ctx.db
+							.query("workspace_members")
+							.withIndex("by_installation_hostUserId", (q) =>
+								q.eq("installationId", installationId).eq("hostUserId", "alice"),
+							)
+							.unique();
+						await ctx.db.patch("workspace_members", sponsor!._id, { active: false });
+					});
+				return response;
+			}),
+		);
+		expect((await reconnect(created._yay.channelId)).error).toContain("no longer has access");
+		expect((await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))?.grantChannelId).toBe(
+			channelId,
+		);
+	});
+
+	test("an explicit connection refreshes a blocked index without changing its prepared write", async () => {
+		const { t, alice, channelId, remote, reconnect } = await fixture();
+		const index = (await t.run(async (ctx) => await ctx.db.query("transcript_indexes").first()))!;
+		remote.loseWrite();
+		for (let step = 0; step < 15 && remote.writes() === 0; step++)
+			await t.action(internal.transcripts_index.run, { indexId: index._id });
+		const prepared = (await t.run(async (ctx) => await ctx.db.query("transcript_index_runs").first()))!;
+		expect(prepared.prepared).toBe(true);
+		remote.expireToken();
+		await alice.mutation(api.transcripts.retry, { channelId });
+		await t.action(internal.transcripts_index.run, { indexId: index._id });
+		expect((await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))?.error).toContain("401");
+		const created = await alice.mutation(api.channels.create, {
+			clientRequestId: "new-index-sponsor",
+			name: "New sponsor",
+			topic: "",
+			visibility: "public",
+			invitedUserIds: [],
+		});
+		if (created._yay?.kind !== "channel") throw new Error("Channel creation failed");
+		const otherId = created._yay.channelId;
+		const connectedGrant = await reconnect(otherId);
+		expect(connectedGrant.error).toBeNull();
+		expect(connectedGrant.selectIndexOnReady).toBe(false);
+		const rebound = (await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))!;
+		expect(rebound.grantChannelId).toBe(otherId);
+		expect(rebound.activeRunId).toBe(prepared._id);
+		const resumed = (await t.run(async (ctx) => await ctx.db.get("transcript_index_runs", prepared._id)))!;
+		expect(resumed.grantChannelId).toBe(otherId);
+		for (const key of [
+			"content",
+			"expectedNodeId",
+			"expectedContentRevision",
+			"writerId",
+			"writerGeneration",
+			"prepared",
+		] as const)
+			expect(resumed[key]).toEqual(prepared[key]);
+		for (let step = 0; step < 20; step++) await t.action(internal.transcripts_index.run, { indexId: index._id });
+		expect((await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))?.status).toBe("ready");
+		expect(remote.writes()).toBe(2);
+		expect(remote.files.get(`${ROOT}/README.md`)?.content).toContain("New sponsor");
+
+		const originalGrant = (await t.run(
+			async (ctx) =>
+				await ctx.db
+					.query("host_grants")
+					.withIndex("by_channel", (q) => q.eq("channelId", channelId))
+					.unique(),
+		))!;
+		await t.mutation(internal.transcripts_grants.renew, { grantId: originalGrant._id });
+		for (let step = 0; step < 3; step++)
+			await t.action(internal.transcripts_grants.connect, { grantId: originalGrant._id });
+		expect((await t.run(async (ctx) => await ctx.db.get("host_grants", originalGrant._id)))?.error).toBeNull();
+		expect((await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))?.grantChannelId).toBe(
+			otherId,
+		);
+	});
+
+	test("a failed new connection keeps the current index sponsor", async () => {
+		const { t, alice, channelId, remote, reconnect } = await fixture();
+		const index = (await t.run(async (ctx) => await ctx.db.query("transcript_indexes").first()))!;
+		for (let step = 0; step < 15; step++) await t.action(internal.transcripts_index.run, { indexId: index._id });
+		const created = await alice.mutation(api.channels.create, {
+			clientRequestId: "refused-index-sponsor",
+			name: "Refused sponsor",
+			topic: "",
+			visibility: "public",
+			invitedUserIds: [],
+		});
+		if (created._yay?.kind !== "channel") throw new Error("Channel creation failed");
+		remote.denyWrites();
+		const refusedGrant = await reconnect(created._yay.channelId);
+		expect(refusedGrant.error).toContain("Permission denied");
+		expect(refusedGrant.selectIndexOnReady).toBe(true);
+		expect((await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))?.grantChannelId).toBe(
+			channelId,
+		);
+		expect(remote.writes()).toBe(1);
+	});
+
 	test("recovers lost exchange, seal and renewal responses with the saved request and encrypted source", async () => {
 		const { t, alice, channelId } = await fixture();
 		const filesFetch = fetch;

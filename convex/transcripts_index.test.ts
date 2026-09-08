@@ -253,6 +253,7 @@ async function fixture(isPrivate = false) {
 				sponsorLifetime: 1,
 				clientRequestId: "connect",
 				rootPath: ROOT,
+				selectIndexOnReady: false,
 				phase: "ready",
 				lifecycleRequestId: "seal",
 				sourceSecret: "",
@@ -364,7 +365,9 @@ describe("transcript index", () => {
 		await drain();
 		const previous = { ...remote.files.get(PATH)! };
 		const entries = await seed(Array.from({ length: 550 }, (_, i) => `${"界".repeat(60)} ${i}`));
-		expect((await drain(true)).error).toContain("100,000");
+		expect((await drain(true)).error).toBe(
+			"The complete channel index exceeds 100,000 bytes. Archive channels or shorten their names, then retry. Channel transcript sync can continue.",
+		);
 		expect(remote.files.get(PATH)).toEqual(previous);
 		expect((await state()).appliedSequence).toBe(1);
 		await t.run(async (ctx) => {
@@ -385,7 +388,9 @@ describe("transcript index", () => {
 	test("never adopts a preoccupied, replaced, or moved README path", async () => {
 		const { remote, request, seed, drain } = await fixture();
 		remote.files.set(PATH, { nodeId: "human-file", content: "Keep this text", revision: "human" });
-		expect((await drain(true)).error).toContain("different file");
+		expect((await drain(true)).error).toBe(
+			"The README path contains a different file. Move it away or restore the original file, then retry.",
+		);
 		await request(true);
 		expect((await drain(true)).error).toContain("different file");
 		expect(remote.writes()).toBe(0);
@@ -441,7 +446,9 @@ describe("transcript index", () => {
 		remote.files.get(PATH)!.content += "\nHuman text";
 		remote.files.get(PATH)!.revision = "human";
 		await seed(["Later room"]);
-		expect((await drain(true)).error).toContain("text changed");
+		expect((await drain(true)).error).toBe(
+			"The README text changed in Files. Rebuild transcripts to replace these edits.",
+		);
 		expect(remote.files.get(PATH)!.content).toContain("Human text");
 		remote.loseFence();
 		await request(true);
