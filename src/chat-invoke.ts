@@ -1,14 +1,11 @@
 import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
 import { chat_get_error_message, type chat_BackendEndpointId } from "./chat-data";
 
-/**
- * Page-side wrapper for the invoke route: waits out the held-back answers (409 is the
- * serialization lock, 429 the rate bucket, and both may carry `retryAfterMs`), parses the
- * backend's relayed JSON, and maps everything into the `_yay`/`_nay` shape the page's write
- * machinery already speaks. A 5xx, an answer that did not parse, and a thrown call all become
- * `unavailable` — the run may have happened, so callers replay with the same `clientRequestId`,
- * exactly like the old append door. A response-size failure needs manual retry instead.
- */
+// The page retries lock (409) and rate-limit (429) responses using retryAfterMs.
+// It maps the plugin's relayed JSON into the _yay/_nay result used by the send queues.
+// A 5xx response, invalid JSON, or failed request may follow a saved write.
+// Callers retry unavailable results with the same clientRequestId. A response-size
+// failure requires manual retry.
 
 const BUSY_RETRY_MAX_CALLS = 3;
 const BUSY_RETRY_MAX_WAIT_MS = 5_000;

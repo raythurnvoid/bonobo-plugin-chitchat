@@ -389,7 +389,9 @@ type InvokeAnswer =
 	| { status: 500; body: { message: string; runId: string; code?: "response_too_large" } }
 	| { status: 400 | 401 | 403 | 404 | 409 | 413 | 429; body: { message: string; retryAfterMs?: number } };
 
-/** Wraps a backend answer the way the invoke route delivers a finished run: the body as JSON text. */
+/**
+ * Wraps a backend answer the way the invoke route delivers a finished run: the body as JSON text.
+ */
 function invoke_ok(body: Record<string, unknown>, pluginStatus = 200): InvokeAnswer {
 	return {
 		status: 200,
@@ -397,7 +399,9 @@ function invoke_ok(body: Record<string, unknown>, pluginStatus = 200): InvokeAns
 	};
 }
 
-/** A relayed backend refusal: a non-2xx pluginStatus is still a 200 from the route. */
+/**
+ * A relayed backend refusal: a non-2xx pluginStatus is still a 200 from the route.
+ */
 function invoke_refused(pluginStatus: number, message: string): InvokeAnswer {
 	return invoke_ok({ message }, pluginStatus);
 }
@@ -2206,8 +2210,6 @@ test("an unavailable send retry timer stops when the page unmounts", async () =>
 	}
 });
 
-// #endregion send flow
-
 describe("backend send responses", () => {
 	test.each(["message-send", "reply-send"])("%s keeps an HTTP 500 size failure for manual retry with the same request", async (endpoint) => {
 		const h = make_harness();
@@ -2310,6 +2312,8 @@ describe("backend send responses", () => {
 		}
 	});
 });
+
+// #endregion send flow
 
 // #region announcer
 

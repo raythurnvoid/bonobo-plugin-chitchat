@@ -12,7 +12,9 @@ function make_client(fetchJson: unknown, expiresAt = Date.now() + 60 * 60 * 1_00
 	return { fetchJson, session: { expiresAt: () => expiresAt } } as unknown as BonoboClient;
 }
 
-/** A finished run, the way the invoke route delivers one: the backend's body as JSON text. */
+/**
+ * A finished run, the way the invoke route delivers one: the backend's body as JSON text.
+ */
 function run_finished(body: Record<string, unknown>, pluginStatus = 200) {
 	return {
 		status: 200,
