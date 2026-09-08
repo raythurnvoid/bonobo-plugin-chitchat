@@ -1,5 +1,5 @@
 import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
-import { useConvex, useQueries, useQuery } from "convex/react";
+import { useConvex, useQueries } from "convex/react";
 import type { FunctionReturnType } from "convex/server";
 import {
 	Component,
@@ -20,6 +20,7 @@ import { ChannelRowMenu } from "./channel-row-menu";
 import { ChannelView, type chat_MemberNamesApi } from "./channel-view";
 import { chat_format_recency } from "../shared/chat-display";
 import { ChatPageControls, use_chat_page } from "./chat-pages";
+import { use_chat_query } from "./chat-query";
 import { use_chat_session } from "./session";
 import { TranscriptStatus } from "./transcript-status";
 
@@ -115,20 +116,20 @@ function member_name(names: chat_MemberNamesApi, userId: string) {
 
 function UnreadsView(props: {
 	scopeKey: string;
-	enabled: boolean;
+	session: ReturnType<typeof use_chat_session>;
 	memberNames: chat_MemberNamesApi;
 	onOpen: OpenChannel;
 }) {
 	const publicPage = use_chat_page(`${props.scopeKey}:public`);
 	const privatePage = use_chat_page(`${props.scopeKey}:private`);
-	const publicRows = useQuery(
-		api.views.unreads,
-		props.enabled ? { visibility: "public", paginationOpts: { numItems: 50, cursor: publicPage.cursor } } : "skip",
-	);
-	const privateRows = useQuery(
-		api.views.unreads,
-		props.enabled ? { visibility: "private", paginationOpts: { numItems: 50, cursor: privatePage.cursor } } : "skip",
-	);
+	const publicRows = use_chat_query(props.session, api.views.unreads, {
+		visibility: "public",
+		paginationOpts: { numItems: 50, cursor: publicPage.cursor },
+	});
+	const privateRows = use_chat_query(props.session, api.views.unreads, {
+		visibility: "private",
+		paginationOpts: { numItems: 50, cursor: privatePage.cursor },
+	});
 	useEffect(() => {
 		void props.memberNames.resolve(
 			(publicRows?.page ?? []).flatMap((row) => (row.latest ? [row.latest.authorHostUserId] : [])),
@@ -200,16 +201,15 @@ function UnreadsView(props: {
 
 function ActivityView(props: {
 	scopeKey: string;
-	enabled: boolean;
+	session: ReturnType<typeof use_chat_session>;
 	userId: string;
 	memberNames: chat_MemberNamesApi;
 	onOpen: OpenChannel;
 }) {
 	const page = use_chat_page(props.scopeKey);
-	const rows = useQuery(
-		api.views.activity,
-		props.enabled ? { paginationOpts: { numItems: 50, cursor: page.cursor } } : "skip",
-	);
+	const rows = use_chat_query(props.session, api.views.activity, {
+		paginationOpts: { numItems: 50, cursor: page.cursor },
+	});
 	useEffect(() => {
 		void props.memberNames.resolve((rows?.page ?? []).map((row) => row.message.authorHostUserId));
 	}, [rows, props.memberNames]);
@@ -263,15 +263,14 @@ function ActivityView(props: {
 
 function ThreadsView(props: {
 	scopeKey: string;
-	enabled: boolean;
+	session: ReturnType<typeof use_chat_session>;
 	memberNames: chat_MemberNamesApi;
 	onOpen: OpenChannel;
 }) {
 	const page = use_chat_page(props.scopeKey);
-	const rows = useQuery(
-		api.views.threads,
-		props.enabled ? { paginationOpts: { numItems: 50, cursor: page.cursor } } : "skip",
-	);
+	const rows = use_chat_query(props.session, api.views.threads, {
+		paginationOpts: { numItems: 50, cursor: page.cursor },
+	});
 	useEffect(() => {
 		void props.memberNames.resolve((rows?.page ?? []).map((row) => row.latest.authorHostUserId));
 	}, [rows, props.memberNames]);
@@ -325,12 +324,12 @@ function ChannelLink(props: {
 	channel: Doc<"channels">;
 	selected: boolean;
 	blocked: boolean;
-	enabled: boolean;
+	session: ReturnType<typeof use_chat_session>;
 	unread: ChannelRead | Error | undefined;
 	onOpen: OpenChannel;
 	onDialog: (dialog: ChannelDialog) => void;
 }) {
-	const permissions = useQuery(api.channels.permissions, props.enabled ? { channelId: props.channel._id } : "skip");
+	const permissions = use_chat_query(props.session, api.channels.permissions, { channelId: props.channel._id });
 	const unread = props.unread instanceof Error ? null : props.unread;
 	const channel = props.channel;
 	return (
@@ -456,25 +455,23 @@ export function App(props: { client: BonoboClient }) {
 	const archivedPage = use_chat_page(`${scopeKey}:archived`);
 	const archivedPrivatePage = use_chat_page(`${scopeKey}:archived-private`);
 	const [showArchived, setShowArchived] = useState(false);
-	const publicChannels = useQuery(
-		api.channels.list_public,
-		session.ready ? { archived: false, paginationOpts: { numItems: 50, cursor: publicPage.cursor } } : "skip",
-	);
-	const privateChannels = useQuery(
+	const publicChannels = use_chat_query(session, api.channels.list_public, {
+		archived: false,
+		paginationOpts: { numItems: 50, cursor: publicPage.cursor },
+	});
+	const privateChannels = use_chat_query(session, api.channels.list_mine, {
+		archived: false,
+		paginationOpts: { numItems: 50, cursor: privatePage.cursor },
+	});
+	const archivedPrivateChannels = use_chat_query(
+		session,
 		api.channels.list_mine,
-		session.ready ? { archived: false, paginationOpts: { numItems: 50, cursor: privatePage.cursor } } : "skip",
+		showArchived ? { archived: true, paginationOpts: { numItems: 50, cursor: archivedPrivatePage.cursor } } : "skip",
 	);
-	const archivedPrivateChannels = useQuery(
-		api.channels.list_mine,
-		session.ready && showArchived
-			? { archived: true, paginationOpts: { numItems: 50, cursor: archivedPrivatePage.cursor } }
-			: "skip",
-	);
-	const archivedChannels = useQuery(
+	const archivedChannels = use_chat_query(
+		session,
 		api.channels.list_public,
-		session.ready && showArchived
-			? { archived: true, paginationOpts: { numItems: 50, cursor: archivedPage.cursor } }
-			: "skip",
+		showArchived ? { archived: true, paginationOpts: { numItems: 50, cursor: archivedPage.cursor } } : "skip",
 	);
 	const [selection, setSelection] = useState<
 		| { kind: "channel"; id: Id<"channels">; openedAtReadSequence: number }
@@ -498,23 +495,13 @@ export function App(props: { client: BonoboClient }) {
 	// Keep covered panes mounted so resizing does not discard drafts.
 	const threadCoversPage = isNarrow && threadRootId !== null;
 	const selectedId = selection?.kind === "channel" ? selection.id : null;
-	const selected = useQuery(
-		api.channels.get,
-		(session.ready || session.refreshing) && selectedId ? { channelId: selectedId } : "skip",
-	);
-	const selectedPermissions = useQuery(
+	const selected = use_chat_query(session, api.channels.get, selectedId ? { channelId: selectedId } : "skip");
+	const selectedPermissions = use_chat_query(
+		session,
 		api.channels.permissions,
-		(session.ready || session.refreshing) && selectedId ? { channelId: selectedId } : "skip",
+		selectedId ? { channelId: selectedId } : "skip",
 	);
-	const [previousSelected, setPreviousSelected] = useState<Doc<"channels"> | null>(null);
-	if (selected && selected !== previousSelected) setPreviousSelected(selected);
-	if (
-		((!session.ready && !session.refreshing) || selected === null) &&
-		previousSelected !== null &&
-		!session.refreshing
-	)
-		setPreviousSelected(null);
-	const channel = session.refreshing && previousSelected?._id === selectedId ? previousSelected : (selected ?? null);
+	const channel = selected ?? null;
 	const appRef = useRef<HTMLDivElement>(null);
 	const navRef = useRef<HTMLElement>(null);
 	const toggleRef = useRef<HTMLButtonElement>(null);
@@ -707,7 +694,7 @@ export function App(props: { client: BonoboClient }) {
 							channel={entry}
 							selected={selectedId === entry._id}
 							blocked={sendRequests > 0}
-							enabled={session.ready}
+							session={session}
 							unread={readAnswers[entry._id]}
 							onOpen={open_channel}
 							onDialog={setDialog}
@@ -815,7 +802,7 @@ export function App(props: { client: BonoboClient }) {
 							</li>
 						))}
 					</ul>
-					{session.ready && publicChannels && privateChannels ? (
+					{(session.ready || session.refreshing) && publicChannels && privateChannels ? (
 						<>
 							{render_section("Channels", channelsTitleId, publicChannels.page)}
 							<ChatPageControls page={publicPage} result={publicChannels} label="Public channels" />
@@ -869,17 +856,17 @@ export function App(props: { client: BonoboClient }) {
 					) : null}
 				</div>
 				{selection?.kind === "unreads" ? (
-					<UnreadsView scopeKey={scopeKey} enabled={session.ready} memberNames={memberNames} onOpen={open_channel} />
+					<UnreadsView scopeKey={scopeKey} session={session} memberNames={memberNames} onOpen={open_channel} />
 				) : selection?.kind === "activity" ? (
 					<ActivityView
 						scopeKey={scopeKey}
-						enabled={session.ready}
+						session={session}
 						userId={userId}
 						memberNames={memberNames}
 						onOpen={open_channel}
 					/>
 				) : selection?.kind === "threads" ? (
-					<ThreadsView scopeKey={scopeKey} enabled={session.ready} memberNames={memberNames} onOpen={open_channel} />
+					<ThreadsView scopeKey={scopeKey} session={session} memberNames={memberNames} onOpen={open_channel} />
 				) : selection?.kind === "channel" ? (
 					<ChannelView
 						key={`channel:${selection.id}`}

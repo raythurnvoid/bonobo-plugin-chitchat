@@ -316,6 +316,138 @@ afterEach(() => {
 });
 
 describe("App", () => {
+	test("keeps channel pages, menu choices, and focus through a verified refresh", async () => {
+		fake.channels.push(
+			channel("archived", { archivedAt: 2 }),
+			channel("private-old", { visibility: "private", archivedAt: 2 }),
+		);
+		render(<App client={client()} />);
+		fireEvent.click(screen.getByRole("button", { name: "Show archived channels" }));
+		fireEvent.click(screen.getByRole("button", { name: "Actions for #private-room" }));
+		const choice = await screen.findByRole("menuitem", { name: "Rename #private-room" });
+		choice.focus();
+		const menu = screen.getByRole("menu");
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		fake.session.canSend = false;
+		fake.overrides.set("channels:list_public", { page: [], continueCursor: "", isDone: true });
+		fake.overrides.set("channels:list_mine", { page: [], continueCursor: "", isDone: true });
+		fake.overrides.set("channels:permissions", null);
+		publish();
+		expect(screen.getByRole("menu")).toBe(menu);
+		expect(screen.getByRole("menuitem", { name: "Rename #private-room" })).toBe(choice);
+		expect(document.activeElement).toBe(choice);
+		expect(document.querySelectorAll(".channel-item")).toHaveLength(5);
+		expect(queries("channels:list_public")).toHaveLength(2);
+		expect(queries("channels:list_mine")).toHaveLength(2);
+		expect(queries("read_states:get_for_channel")).toHaveLength(5);
+		fake.session.refreshing = false;
+		set_connection(false);
+		expect(screen.queryByRole("menu")).toBeNull();
+		expect(document.body.textContent).not.toContain("private-room");
+		expect(queries("channels:list_public")).toHaveLength(0);
+	});
+	test("keeps the active mention choice through renewal without allowing a send", async () => {
+		render(<App client={client()} />);
+		fireEvent.click(screen.getByRole("button", { name: "#general" }));
+		const input = await screen.findByRole("combobox", { name: "Message #general" });
+		input.focus();
+		fireEvent.change(input, { target: { value: "@", selectionStart: 1 } });
+		const choice = await screen.findByRole("option", { name: "Carol" });
+		fireEvent.mouseMove(choice);
+		await waitFor(() => expect(input.getAttribute("aria-activedescendant")).toBe(choice.id));
+		const menu = screen.getByRole("listbox");
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		fake.session.canSend = false;
+		fake.overrides.set("members:list", null);
+		publish();
+		expect(screen.getByRole("listbox")).toBe(menu);
+		expect(screen.getByRole("option", { name: "Carol" })).toBe(choice);
+		expect(input.getAttribute("aria-activedescendant")).toBe(choice.id);
+		expect(document.activeElement).toBe(input);
+		expect(queries("members:list")).toHaveLength(1);
+		fireEvent.click(screen.getByRole("button", { name: "Send" }));
+		expect(fake.mutation.mock.calls.some(([name]) => name === "messages:send")).toBe(false);
+		fake.overrides.clear();
+		fake.session.ready = true;
+		fake.session.refreshing = false;
+		fake.session.canSend = true;
+		publish();
+		fireEvent.keyDown(input, { key: "Enter" });
+		expect((input as HTMLTextAreaElement).value).toBe("@Carol ");
+		fireEvent.change(input, { target: { value: "@", selectionStart: 1 } });
+		await screen.findByRole("option", { name: "Carol" });
+		set_connection(false);
+		expect(screen.queryByRole("listbox")).toBeNull();
+	});
+	test("keeps reaction and thread summary controls subscribed through renewal", async () => {
+		fake.overrides.set("reactions:get_for_message", [{ token: "heart", count: 1, reactedByMe: true }]);
+		fake.overrides.set("threads:get_summary", { totalReplyCount: 2, latestReplyAt: 1 });
+		render(<App client={client()} />);
+		fireEvent.click(screen.getByRole("button", { name: "#general" }));
+		const reaction = await screen.findByRole("button", { name: "Heart, 1 reaction" });
+		const summary = screen.getByRole("button", { name: /^2 replies/ });
+		summary.focus();
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		fake.session.canSend = false;
+		fake.overrides.set("reactions:get_for_message", null);
+		fake.overrides.set("threads:get_summary", null);
+		publish();
+		expect(screen.getByRole("button", { name: "Heart, 1 reaction" })).toBe(reaction);
+		expect(screen.getByRole("button", { name: /^2 replies/ })).toBe(summary);
+		expect(document.activeElement).toBe(summary);
+		expect(queries("reactions:get_for_message")).toHaveLength(1);
+		expect(queries("threads:get_summary")).toHaveLength(1);
+		fake.session.refreshing = false;
+		set_connection(false);
+		expect(screen.queryByRole("button", { name: /^2 replies/ })).toBeNull();
+	});
+	test.each(["Activity", "Threads", "Unreads"] as const)(
+		"keeps the current %s page during renewal and clears it on denial",
+		(name) => {
+			const general = fake.channels[0] as Doc<"channels">;
+			const root = fake.messages[0] as Doc<"messages">;
+			const query = `views:${name.toLowerCase()}`;
+			fake.overrides.set(query, {
+				page:
+					name === "Activity"
+						? [{ channel: general, message: root }]
+						: name === "Threads"
+							? [
+									{
+										channel: general,
+										summary: { _id: "summary", rootMessageId: root._id, activeReplyCount: 1 },
+										latest: root,
+									},
+								]
+							: [{ channel: general, latest: root, mentionCount: 0, lastActivityAt: 1 }],
+				continueCursor: "",
+				isDone: true,
+			});
+			if (name === "Unreads")
+				fake.overrides.set('views:unreads:{"visibility":"private","paginationOpts":{"numItems":50,"cursor":null}}', {
+					page: [],
+					continueCursor: "",
+					isDone: true,
+				});
+			render(<App client={client()} />);
+			fireEvent.click(screen.getByRole("button", { name }));
+			const region = screen.getByRole("region", { name });
+			const preview = within(region).getByText(/Message in general/);
+			fake.session.ready = false;
+			fake.session.refreshing = true;
+			fake.session.canSend = false;
+			fake.overrides.set(query, { page: [], continueCursor: "", isDone: true });
+			publish();
+			expect(within(region).getByText(/Message in general/)).toBe(preview);
+			expect(queries(query)).toHaveLength(name === "Unreads" ? 2 : 1);
+			fake.session.refreshing = false;
+			set_connection(false);
+			expect(within(region).queryByText(/Message in general/)).toBeNull();
+		},
+	);
 	test("keeps an inline edit and its subscriptions during a verified token refresh", async () => {
 		fake.messages = [message((fake.channels[0] as Doc<"channels">)._id, { authorHostUserId: "alice" })];
 		render(<App client={client()} />);
@@ -813,6 +945,27 @@ describe("App", () => {
 });
 
 describe("ChannelNameDialog", () => {
+	test("keeps checked private invitees and checkbox focus during verified renewal", () => {
+		render(<ChannelNameDialog channel={null} selfUserId="alice" onSaved={vi.fn()} onClose={vi.fn()} />);
+		fireEvent.click(screen.getByRole("checkbox", { name: "Private channel" }));
+		const person = screen.getByRole("checkbox", { name: "Bob" }) as HTMLInputElement;
+		fireEvent.click(person);
+		person.focus();
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		fake.session.canSend = false;
+		fake.overrides.set("members:list", null);
+		publish();
+		expect(screen.getByRole("checkbox", { name: "Bob" })).toBe(person);
+		expect(person.checked).toBe(true);
+		expect(document.activeElement).toBe(person);
+		expect(queries("members:list")).toHaveLength(1);
+		fireEvent.click(screen.getByRole("button", { name: "Create" }));
+		expect(fake.mutation).not.toHaveBeenCalled();
+		fake.session.refreshing = false;
+		set_connection(false);
+		expect(screen.queryByRole("checkbox", { name: "Bob" })).toBeNull();
+	});
 	test("validates blank names and submits trimmed name and topic", async () => {
 		const onSaved = vi.fn();
 		render(<ChannelNameDialog channel={null} selfUserId="alice" onSaved={onSaved} onClose={vi.fn()} />);
@@ -946,6 +1099,32 @@ describe("ChannelNameDialog", () => {
 });
 
 describe("ChannelPeopleDialog", () => {
+	test("keeps the focused member access control and names during verified renewal", () => {
+		render(<ChannelPeopleDialog channelId={"private-room" as Id<"channels">} selfUserId="alice" onClose={vi.fn()} />);
+		const level = screen.getByRole("combobox", { name: "Access for Bob" });
+		level.focus();
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		fake.session.canSend = false;
+		for (const name of [
+			"channels:get",
+			"channels:list_members",
+			"channels:permissions",
+			"members:resolve",
+			"members:list",
+		])
+			fake.overrides.set(name, null);
+		publish();
+		expect(screen.getByRole("combobox", { name: "Access for Bob" })).toBe(level);
+		expect(document.activeElement).toBe(level);
+		expect(screen.getByRole("heading", { name: "People in #private-room" })).toBeTruthy();
+		expect(queries("channels:list_members")).toHaveLength(1);
+		expect(queries("members:resolve")).toHaveLength(1);
+		fake.session.refreshing = false;
+		set_connection(false);
+		expect(screen.queryByRole("combobox")).toBeNull();
+		expect(document.body.textContent).not.toContain("private-room");
+	});
 	test("a manager changes a person's level with the displayed revision and count", async () => {
 		fake.mutation.mockResolvedValue({ _yay: { kind: "membership", pending: true } });
 		render(<ChannelPeopleDialog channelId={"private-room" as Id<"channels">} selfUserId="alice" onClose={vi.fn()} />);
@@ -968,8 +1147,16 @@ describe("ChannelPeopleDialog", () => {
 			membershipRevision: 2,
 		});
 		publish();
-		expect(screen.getByText("Updating channel and transcript access…")).toBeTruthy();
+		const waiting = screen.getByText("Updating channel and transcript access…");
 		expect((screen.getByRole("checkbox", { name: "Carol" }) as HTMLInputElement).disabled).toBe(true);
+		const statusQuery = queries("channel_members:status")[0];
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		fake.session.canSend = false;
+		fake.overrides.set("channel_members:status", null);
+		publish();
+		expect(screen.getByText("Updating channel and transcript access…")).toBe(waiting);
+		expect(queries("channel_members:status")).toEqual([statusQuery]);
 	});
 	test("keeps an uncertain membership request locked and retries it unchanged", async () => {
 		fake.mutation.mockRejectedValueOnce(new Error("Lost response"));
@@ -1177,6 +1364,57 @@ describe("TranscriptStatus", () => {
 		expect(screen.getByText("A file marker is missing")).toBeTruthy();
 		expect(screen.getByText("Files sharing is managed in Press.")).toBeTruthy();
 		expect(screen.getByText("/fresh-transcripts/general")).toBeTruthy();
+	});
+	test("keeps open transcript details and their query during a verified session refresh", () => {
+		render_status();
+		const summary = screen.getByText("Transcript details");
+		fireEvent.click(summary);
+		const details = summary.closest("details")!;
+		expect(details.open).toBe(true);
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		fake.session.connected = false;
+		fake.session.canSend = false;
+		for (const answer of [null, undefined]) {
+			fake.overrides.set("transcripts:status", answer);
+			publish();
+			expect(queries("transcripts:status")).toEqual([{ name: "transcripts:status", args: { channelId: "general" } }]);
+			expect(screen.getByText("Transcript details").closest("details")).toBe(details);
+			expect(details.open).toBe(true);
+			expect(screen.getByText("/fresh-transcripts/general")).toBeTruthy();
+			expect(screen.getByText("A file marker is missing")).toBeTruthy();
+			expect((screen.getByRole("button", { name: "Retry sync" }) as HTMLButtonElement).disabled).toBe(true);
+		}
+		fake.overrides.set("transcripts:status", status({ error: "A later sync error" }));
+		fake.session.refreshing = false;
+		set_connection(true);
+		expect(screen.getByText("Transcript details").closest("details")).toBe(details);
+		expect(details.open).toBe(true);
+		expect(screen.getByText("A later sync error")).toBeTruthy();
+		expect(screen.queryByText("A file marker is missing")).toBeNull();
+	});
+	test.each(["session", "channel"])("clears retained transcript details on real %s access loss", (kind) => {
+		render_status();
+		open_rebuild();
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		fake.session.connected = false;
+		fake.overrides.set("transcripts:status", null);
+		publish();
+		fake.session.refreshing = false;
+		fake.session.ready = kind === "channel";
+		publish();
+		expect(screen.queryByText("Transcript details")).toBeNull();
+		expect(document.body.textContent).not.toContain("/fresh-transcripts/general");
+		expect(document.body.textContent).not.toContain("A file marker is missing");
+		expect(screen.queryByRole("checkbox")).toBeNull();
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		publish();
+		expect(screen.queryByText("Transcript details")).toBeNull();
+		expect(document.body.textContent).not.toContain("/fresh-transcripts/general");
+		expect(fake.action).not.toHaveBeenCalled();
+		expect(fake.mutation).not.toHaveBeenCalled();
 	});
 	test("explains initial permissions without asking to open a folder that does not exist", () => {
 		render_status();

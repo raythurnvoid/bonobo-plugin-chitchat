@@ -12,8 +12,8 @@ importers:
         specifier: 0.4.20
         version: 0.4.20(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       bonobo-plugin-sdk:
-        specifier: github:raythurnvoid/bonobo-plugin-sdk#9c5226694efe3b03115322b66b33e969f18d214e
-        version: https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/9c5226694efe3b03115322b66b33e969f18d214e(convex@1.44.0(react@19.2.8))(react@19.2.8)
+        specifier: github:raythurnvoid/bonobo-plugin-sdk#4b7d0ee3a83d8348de1b04c9587ba5ba3cdfad4e
+        version: https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/4b7d0ee3a83d8348de1b04c9587ba5ba3cdfad4e(convex@1.44.0(react@19.2.8))(react@19.2.8)
       convex:
         specifier: ^1.42.2
         version: 1.44.0(react@19.2.8)
@@ -632,9 +632,9 @@ packages:
     resolution: {integrity: sha512-Izi8RQcffqCeNVgFigKli1ssklIbpHnCYc6AknXGYoB6grJqyeby7jv12JUQgmTAnIDnbck1uxksT4dzN3PWBA==}
     engines: {node: '>=12'}
 
-  bonobo-plugin-sdk@https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/9c5226694efe3b03115322b66b33e969f18d214e:
-    resolution: {tarball: https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/9c5226694efe3b03115322b66b33e969f18d214e}
-    version: 0.20.2
+  bonobo-plugin-sdk@https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/4b7d0ee3a83d8348de1b04c9587ba5ba3cdfad4e:
+    resolution: {tarball: https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/4b7d0ee3a83d8348de1b04c9587ba5ba3cdfad4e}
+    version: 0.20.3
     peerDependencies:
       convex: ^1.42.2
       react: ^19.0.0
@@ -1414,7 +1414,7 @@ snapshots:
 
   assertion-error@2.0.1: {}
 
-  bonobo-plugin-sdk@https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/9c5226694efe3b03115322b66b33e969f18d214e(convex@1.44.0(react@19.2.8))(react@19.2.8):
+  bonobo-plugin-sdk@https://codeload.github.com/raythurnvoid/bonobo-plugin-sdk/tar.gz/4b7d0ee3a83d8348de1b04c9587ba5ba3cdfad4e(convex@1.44.0(react@19.2.8))(react@19.2.8):
     dependencies:
       '@cloudflare/workers-types': 4.20260702.1
       convex: 1.44.0(react@19.2.8)

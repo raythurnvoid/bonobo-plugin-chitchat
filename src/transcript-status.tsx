@@ -1,14 +1,15 @@
 import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
-import { useAction, useMutation, useQuery } from "convex/react";
+import { useAction, useMutation } from "convex/react";
 import { useId, useRef, useState } from "react";
 import { api } from "../convex/_generated/api";
 import type { Id } from "../convex/_generated/dataModel";
 import { Dialog } from "./dialog";
 import { use_chat_session } from "./session";
+import { use_chat_query } from "./chat-query";
 
 export function TranscriptStatus(props: { client: BonoboClient; channelId: Id<"channels"> }) {
 	const session = use_chat_session();
-	const status = useQuery(api.transcripts.status, session.ready ? { channelId: props.channelId } : "skip");
+	const status = use_chat_query(session, api.transcripts.status, { channelId: props.channelId });
 	const connect = useAction(api.transcripts.connect);
 	const retry = useMutation(api.transcripts.retry);
 	const reconcile = useMutation(api.transcripts.reconcile);

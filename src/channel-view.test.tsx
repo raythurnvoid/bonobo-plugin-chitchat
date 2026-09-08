@@ -364,6 +364,81 @@ describe("ChannelView", () => {
 });
 
 describe("MessageRow", () => {
+	test("requests an attachment download without opening another window", async () => {
+		const initial = props();
+		vi.mocked(initial.client.fetchJson).mockResolvedValue({
+			status: 200,
+			body: {
+				items: [
+					{
+						fileNodeId: "file-one",
+						name: "one.png",
+						contentType: "image/png",
+						url: "https://files.test/one",
+						expiresAt: Date.now() + 60_000,
+					},
+				],
+				errors: [],
+				truncated: false,
+			},
+		});
+		render(
+			<ul>
+				<MessageRow
+					{...initial}
+					doc={message(1, { attachments: [{ fileNodeId: "file-one", name: "one.png" }] })}
+					isContinuation={false}
+				/>
+			</ul>,
+		);
+		fireEvent.click(screen.getByRole("button", { name: "one.png" }));
+		const link = await screen.findByRole("link", { name: "one.png" });
+		expect(initial.client.fetchJson).toHaveBeenCalledWith("/api/v1/files/download-urls", {
+			fileNodeIds: ["file-one"],
+			download: true,
+		});
+		expect(link.getAttribute("download")).toBe("one.png");
+		expect(link.getAttribute("target")).toBeNull();
+		expect(document.activeElement).toBe(link);
+	});
+	test("stops an expired attachment link and allows refreshing it", async () => {
+		const initial = props();
+		const item = { fileNodeId: "file-one", name: "one.md", contentType: "text/markdown" };
+		vi.mocked(initial.client.fetchJson)
+			.mockResolvedValueOnce({
+				status: 200,
+				body: {
+					items: [{ ...item, url: "https://files.test/expired", expiresAt: Date.now() - 1 }],
+					errors: [],
+					truncated: false,
+				},
+			})
+			.mockResolvedValueOnce({
+				status: 200,
+				body: {
+					items: [{ ...item, url: "https://files.test/fresh", expiresAt: Date.now() + 60_000 }],
+					errors: [],
+					truncated: false,
+				},
+			});
+		render(
+			<ul>
+				<MessageRow
+					{...initial}
+					doc={message(1, { attachments: [{ fileNodeId: "file-one", name: "one.md" }] })}
+					isContinuation={false}
+				/>
+			</ul>,
+		);
+		fireEvent.click(screen.getByRole("button", { name: "one.md" }));
+		const link = await screen.findByRole("link", { name: "one.md" });
+		expect(fireEvent.click(link)).toBe(false);
+		expect(screen.getByRole("alert").textContent).toBe("This download link expired. Use Refresh link to try again.");
+		fireEvent.click(screen.getByRole("button", { name: "Refresh link" }));
+		await waitFor(() => expect(link.getAttribute("href")).toBe("https://files.test/fresh"));
+		expect(screen.queryByRole("alert")).toBeNull();
+		expect(fireEvent.click(link)).toBe(true);
+	});
 	test("edits with an expected revision, permits attachment-only text, and deletes with focus retained", async () => {
 		const initial = props();
 		const doc = message(1, { authorHostUserId: "alice", attachments: [{ fileNodeId: "file-one", name: "one.pdf" }] });

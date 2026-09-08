@@ -1,10 +1,11 @@
-import { useConvex, useQuery } from "convex/react";
+import { useConvex } from "convex/react";
 import type { FunctionArgs } from "convex/server";
 import { useEffect, useId, useState } from "react";
 import { api } from "../convex/_generated/api";
 import type { Doc, Id } from "../convex/_generated/dataModel";
 import { chat_PRIVATE_CHANNEL_DISCLOSURE, chat_member_label } from "../shared/chat-display";
 import { ChatPageControls, use_chat_page } from "./chat-pages";
+import { use_chat_query } from "./chat-query";
 import { Dialog } from "./dialog";
 import { use_chat_session } from "./session";
 
@@ -16,10 +17,7 @@ function MemberPicker(props: {
 }) {
 	const session = use_chat_session();
 	const page = use_chat_page(`${session.member?.generation}:${session.member?.membershipLifetime}`);
-	const roster = useQuery(
-		api.members.list,
-		session.ready ? { paginationOpts: { numItems: 100, cursor: page.cursor } } : "skip",
-	);
+	const roster = use_chat_query(session, api.members.list, { paginationOpts: { numItems: 100, cursor: page.cursor } });
 	return (
 		<>
 			{!roster ? (
@@ -69,9 +67,10 @@ export function ChannelNameDialog(props: {
 	const inputId = useId();
 	const topicId = useId();
 	const errorId = useId();
-	const permissions = useQuery(
+	const permissions = use_chat_query(
+		session,
 		api.channels.permissions,
-		session.ready && props.channel ? { channelId: props.channel._id } : "skip",
+		props.channel ? { channelId: props.channel._id } : "skip",
 	);
 	const [name, setName] = useState(props.channel?.name ?? "");
 	const [topic, setTopic] = useState(props.channel?.topic ?? "");
@@ -242,19 +241,21 @@ export function ChannelPeopleDialog(props: { channelId: Id<"channels">; selfUser
 	const [attempt, setAttempt] = useState<FunctionArgs<typeof api.channel_members.change> | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
-	const channel = useQuery(api.channels.get, session.ready ? { channelId: props.channelId } : "skip");
-	const people = useQuery(
-		api.channels.list_members,
-		session.ready ? { channelId: props.channelId, paginationOpts: { numItems: 50, cursor: null } } : "skip",
-	);
-	const permissions = useQuery(api.channels.permissions, session.ready ? { channelId: props.channelId } : "skip");
-	const names = useQuery(
+	const channel = use_chat_query(session, api.channels.get, { channelId: props.channelId });
+	const people = use_chat_query(session, api.channels.list_members, {
+		channelId: props.channelId,
+		paginationOpts: { numItems: 50, cursor: null },
+	});
+	const permissions = use_chat_query(session, api.channels.permissions, { channelId: props.channelId });
+	const names = use_chat_query(
+		session,
 		api.members.resolve,
-		session.ready && people ? { userIds: people.page.map((person) => person.hostUserId) } : "skip",
+		people ? { userIds: people.page.map((person) => person.hostUserId) } : "skip",
 	);
-	const result = useQuery(
+	const result = use_chat_query(
+		session,
 		api.channel_members.status,
-		session.ready && attempt ? { channelId: props.channelId, clientRequestId: attempt.clientRequestId } : "skip",
+		attempt ? { channelId: props.channelId, clientRequestId: attempt.clientRequestId } : "skip",
 	);
 	const waiting = result?.status === "pending";
 	useEffect(() => {
@@ -410,10 +411,11 @@ export function ChannelActionDialog(props: {
 	const [submitted, setSubmitted] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const privateAction = props.action === "leave" || props.action === "delete";
-	const permissions = useQuery(api.channels.permissions, session.ready ? { channelId: props.channel._id } : "skip");
-	const status = useQuery(
+	const permissions = use_chat_query(session, api.channels.permissions, { channelId: props.channel._id });
+	const status = use_chat_query(
+		session,
 		api.channel_members.status,
-		session.ready && submitted && privateAction ? { channelId: props.channel._id, clientRequestId: requestId } : "skip",
+		submitted && privateAction ? { channelId: props.channel._id, clientRequestId: requestId } : "skip",
 	);
 	const waiting = status?.status === "pending";
 	useEffect(() => {

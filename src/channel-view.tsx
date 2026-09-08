@@ -1,6 +1,6 @@
 import type { BonoboClient } from "bonobo-plugin-sdk/frontend";
 import type { BonoboHttpApi } from "bonobo-plugin-sdk/http-api";
-import { useAction, useMutation, useQuery } from "convex/react";
+import { useAction, useMutation } from "convex/react";
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from "react";
 import { ArrowUp, Paperclip } from "lucide-react";
 // The subpath keeps the plugin below its published bundle limit.
@@ -23,6 +23,7 @@ import {
 } from "../shared/chat-display";
 import { use_chat_draft, type chat_PendingSend } from "./chat-drafts";
 import { use_chat_window } from "./chat-window";
+import { use_chat_query } from "./chat-query";
 import { use_chat_session } from "./session";
 import { Dialog } from "./dialog";
 import { chatbe_bounded_author_name } from "../shared/transcript-markdown";
@@ -173,7 +174,7 @@ function use_send_queue(props: {
 }
 
 function MessageAttachments(props: { client: BonoboClient; attachments: Attachment[] }) {
-	const [resolved, setResolved] = useState<Record<string, string>>({});
+	const [resolved, setResolved] = useState<Record<string, { url: string; expiresAt: number }>>({});
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const links = useRef(new Map<string, HTMLAnchorElement>());
@@ -191,10 +192,15 @@ function MessageAttachments(props: { client: BonoboClient; attachments: Attachme
 		try {
 			const answer = await props.client.fetchJson("/api/v1/files/download-urls", {
 				fileNodeIds: props.attachments.map((file) => file.fileNodeId),
+				download: true,
 			});
 			if (answer.status !== 200 || !answer.body)
 				throw new Error(answer.body?.message ?? "The file links are unavailable.");
-			setResolved(Object.fromEntries(answer.body.items.map((file) => [file.fileNodeId, file.url])));
+			setResolved(
+				Object.fromEntries(
+					answer.body.items.map((file) => [file.fileNodeId, { url: file.url, expiresAt: file.expiresAt }]),
+				),
+			);
 			const failure = answer.body.errors.find((file) => file.fileNodeId === fileNodeId);
 			if (failure) setError(failure.message);
 		} catch (cause) {
@@ -215,9 +221,16 @@ function MessageAttachments(props: { client: BonoboClient; attachments: Attachme
 									else links.current.delete(file.fileNodeId);
 								}}
 								className="attachment-link"
-								href={resolved[file.fileNodeId]}
-								target="_blank"
-								rel="noopener noreferrer"
+								href={resolved[file.fileNodeId].url}
+								download={file.name}
+								rel="noreferrer"
+								onClick={(event) => {
+									// An expired URL could navigate this frame to an error page and end the chat session.
+									if (resolved[file.fileNodeId].expiresAt <= Date.now()) {
+										event.preventDefault();
+										setError("This download link expired. Use Refresh link to try again.");
+									}
+								}}
 							>
 								{file.name}
 							</a>
@@ -369,9 +382,10 @@ function Composer(props: {
 	const [error, setError] = useState<string | null>(null);
 	const [mentionQuery, setMentionQuery] = useState<{ start: number; query: string } | null>(null);
 	const [memberCursor, setMemberCursor] = useState<string | null>(null);
-	const members = useQuery(
+	const members = use_chat_query(
+		session,
 		api.members.list,
-		mentionQuery !== null && session.ready ? { paginationOpts: { numItems: 100, cursor: memberCursor } } : "skip",
+		mentionQuery !== null ? { paginationOpts: { numItems: 100, cursor: memberCursor } } : "skip",
 	);
 	const text = props.draft.value.text;
 	const textarea = useRef<HTMLTextAreaElement | null>(null);
@@ -387,7 +401,7 @@ function Composer(props: {
 		mentionQuery && members
 			? chat_filter_mention_members(members.page, mentionQuery.query, props.userId).slice(0, 8)
 			: [];
-	const open = mentionQuery !== null && session.ready;
+	const open = mentionQuery !== null && (session.ready || session.refreshing);
 	const change = (value: Partial<DraftOwner["value"]>) => setError(props.draft.set({ ...props.draft.get(), ...value }));
 	const pick = (member: { userId: string; label: string }) => {
 		if (!mentionQuery) return;
@@ -719,10 +733,11 @@ type RowProps = {
 export function MessageRow(props: RowProps) {
 	const { doc } = props;
 	const session = use_chat_session();
-	const reactions = useQuery(api.reactions.get_for_message, session.ready ? { messageId: doc._id } : "skip");
-	const summary = useQuery(
+	const reactions = use_chat_query(session, api.reactions.get_for_message, { messageId: doc._id });
+	const summary = use_chat_query(
+		session,
 		api.threads.get_summary,
-		props.onOpenThread && session.ready ? { rootMessageId: doc._id } : "skip",
+		props.onOpenThread ? { rootMessageId: doc._id } : "skip",
 	);
 	const edit = useMutation(api.messages.edit);
 	const remove = useMutation(api.messages.remove);
@@ -1188,14 +1203,14 @@ export type ChannelViewProps = {
 export function ThreadPanel(props: ChannelViewProps & { rootMessageId: Id<"messages">; onClose: () => void }) {
 	const session = use_chat_session();
 	const enabled = session.ready && props.channel !== null;
-	const root = useQuery(api.messages.get, enabled || session.refreshing ? { messageId: props.rootMessageId } : "skip");
-	const retainedRoot = useRef(root);
-	if (root) retainedRoot.current = root;
-	if (!enabled && !session.refreshing) retainedRoot.current = null;
-	const shownRoot = session.refreshing ? retainedRoot.current : root;
+	const shownRoot = use_chat_query(
+		session,
+		api.messages.get,
+		enabled || session.refreshing ? { messageId: props.rootMessageId } : "skip",
+	);
 	const window = use_chat_window({
 		target: { rootMessageId: props.rootMessageId },
-		enabled: enabled && root !== null,
+		enabled: enabled && shownRoot !== null,
 		retain: session.refreshing,
 	});
 	const draft = use_chat_draft(props.client, `${props.userId}:${props.channelId}:${props.rootMessageId}`);
@@ -1253,7 +1268,7 @@ export function ThreadPanel(props: ChannelViewProps & { rootMessageId: Id<"messa
 				</ul>
 			) : (
 				<p className="channel-status">
-					{enabled && root === undefined ? "Loading thread…" : "This thread is unavailable."}
+					{enabled && shownRoot === undefined ? "Loading thread…" : "This thread is unavailable."}
 				</p>
 			)}
 			<div
