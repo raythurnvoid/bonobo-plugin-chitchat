@@ -56,10 +56,14 @@ router.route({
 			});
 			if (!installationId)
 				return Response.json({ message: "Chitchat access expired. Try again." }, { status: 409, headers });
-			const ready = await ctx.runAction(internal.access.sync, {
-				installationId,
-				requiredRevision: facts.requiredRevision,
-			});
+			const installation = await ctx.runQuery(internal.access.get_installation, { installationId });
+			// The cron still polls for later changes. Admission below rechecks current access.
+			const ready =
+				(installation?.status === "ready" && installation.appliedAccessRevision >= facts.requiredRevision) ||
+				(await ctx.runAction(internal.access.sync, {
+					installationId,
+					requiredRevision: facts.requiredRevision,
+				}));
 			if (!ready)
 				return Response.json(
 					{ message: "Chitchat is syncing workspace access. Try again shortly." },

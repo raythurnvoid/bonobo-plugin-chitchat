@@ -41,7 +41,7 @@ Press is the only identity authority for this release. `src/session.tsx` owns a 
 2. Chitchat calls `/api/v1/plugins/identity/exchange` with its server-held service proof.
 3. Press checks the current user, membership, installation, version, capabilities, service account, and plugin session.
 4. Press signs a short ES256 JWT with audience `bonobo-plugin:chitchat`, issuer `<PRESS_HTTP_URL>/plugins-services`, and the exact exchange and membership lifetime.
-5. Chitchat catches up its versioned access mirror before admitting that lease.
+5. Chitchat catches up to the signed required access revision before admitting that lease. A ready installation already at that revision or later skips the immediate access-feed read. Admission still checks current local access.
 
 The target lease is 30 seconds. Membership and permission changes can reach Chitchat sooner through durable access events. If catch-up or renewal fails, access closes when the current lease expires. This is an explicit brief revocation window. Scheduled expiry writes also invalidate idle subscriptions. The browser checks a conservative monotonic deadline before submitting.
 
