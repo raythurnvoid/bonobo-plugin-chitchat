@@ -1525,6 +1525,41 @@ describe("TranscriptStatus", () => {
 		]);
 		expect(fake.action.mock.calls[1][1].clientRequestId).toBe(fake.action.mock.calls[0][1].clientRequestId);
 	});
+	test.each(["Reconnect Files", "Retry sync", "Rebuild copies"])(
+		"explains when session refresh blocks %s and allows a later retry",
+		async (name) => {
+			const host = client();
+			render_status(host);
+			const scope = name === "Rebuild copies" ? within(open_rebuild()) : screen;
+			if (name === "Rebuild copies")
+				fireEvent.click(scope.getByRole("checkbox", { name: "Replace edits in the generated transcripts" }));
+			fake.session.canSend = false;
+			fake.session.can_request_now = () => false;
+			publish();
+			const button = scope.getByRole("button", { name });
+			expect((button as HTMLButtonElement).disabled).toBe(false);
+			fireEvent.click(button);
+			expect(scope.getByText("Chitchat is reconnecting. Try again shortly.").getAttribute("role")).toBe("alert");
+			expect(host.getToken).not.toHaveBeenCalled();
+			expect(fake.action).not.toHaveBeenCalled();
+			expect(fake.mutation).not.toHaveBeenCalled();
+			fake.session.canSend = true;
+			fake.session.can_request_now = () => true;
+			publish();
+			fireEvent.click(button);
+			await waitFor(() =>
+				expect(name === "Reconnect Files" ? fake.action : fake.mutation).toHaveBeenCalledWith(
+					name === "Reconnect Files"
+						? "transcripts:connect"
+						: name === "Retry sync"
+							? "transcripts:retry"
+							: "transcripts:reconcile",
+					expect.objectContaining({ channelId: "general" }),
+				),
+			);
+			expect(screen.queryByText("Chitchat is reconnecting. Try again shortly.")).toBeNull();
+		},
+	);
 	test("does not start a connection if access expires while fetching its Press token", async () => {
 		const token = deferred<string>();
 		const host = client();
@@ -1534,6 +1569,11 @@ describe("TranscriptStatus", () => {
 		set_connection(false);
 		await act(async () => token.resolve("plu_test"));
 		expect(fake.action).not.toHaveBeenCalled();
+		expect(screen.getByText("Chitchat is reconnecting. Try again shortly.").getAttribute("role")).toBe("alert");
+		set_connection(true);
+		fireEvent.click(screen.getByRole("button", { name: "Reconnect Files" }));
+		await waitFor(() => expect(fake.action).toHaveBeenCalledTimes(1));
+		expect(screen.queryByText("Chitchat is reconnecting. Try again shortly.")).toBeNull();
 	});
 	test("requires the overwrite checkbox before rebuilding and keeps the same retry ID", async () => {
 		fake.mutation.mockRejectedValueOnce(new Error("Lost response"));

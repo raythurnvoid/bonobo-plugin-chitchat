@@ -25547,11 +25547,18 @@ function US(e) {
 		A = (0, w.useId)(),
 		D = (0, w.useId)(),
 		T = async () => {
-			if (!(f || !n.can_request_now())) {
+			if (!f) {
+				if (!n.can_request_now()) {
+					v("Chitchat is reconnecting. Try again shortly.");
+					return;
+				}
 				((E.current ??= crypto.randomUUID()), h(!0), v(null));
 				try {
 					const I = await e.client.getToken();
-					if (!n.can_request_now()) return;
+					if (!n.can_request_now()) {
+						v("Chitchat is reconnecting. Try again shortly.");
+						return;
+					}
 					const L = await u({ channelId: e.channelId, pluginToken: I, clientRequestId: E.current });
 					L._nay ? v(L._nay.message) : (E.current = null);
 				} catch {
@@ -25562,7 +25569,11 @@ function US(e) {
 			}
 		},
 		R = async () => {
-			if (!(f || !n.can_request_now())) {
+			if (!f) {
+				if (!n.can_request_now()) {
+					v("Chitchat is reconnecting. Try again shortly.");
+					return;
+				}
 				(h(!0), v(null));
 				try {
 					const I = await l({ channelId: e.channelId });
@@ -25575,15 +25586,21 @@ function US(e) {
 			}
 		},
 		O = async () => {
-			if (!(f || !p || !a?.canReconcile || !n.canSend || !n.can_request_now())) {
-				((C.current ??= crypto.randomUUID()), h(!0), v(null));
-				try {
-					const I = await o({ channelId: e.channelId, clientRequestId: C.current });
-					I._nay ? v(I._nay.message) : ((C.current = null), _(!1), S(!1));
-				} catch {
-					v("Could not confirm the rebuild request. Retry to check it.");
-				} finally {
-					h(!1);
+			if (!(f || !p || !a?.canReconcile)) {
+				if (!n.can_request_now()) {
+					v("Chitchat is reconnecting. Try again shortly.");
+					return;
+				}
+				if (n.canSend) {
+					((C.current ??= crypto.randomUUID()), h(!0), v(null));
+					try {
+						const I = await o({ channelId: e.channelId, clientRequestId: C.current });
+						I._nay ? v(I._nay.message) : ((C.current = null), _(!1), S(!1));
+					} catch {
+						v("Could not confirm the rebuild request. Retry to check it.");
+					} finally {
+						h(!1);
+					}
 				}
 			}
 		};

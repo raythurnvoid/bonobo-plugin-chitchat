@@ -22,13 +22,20 @@ export function TranscriptStatus(props: { client: BonoboClient; channelId: Id<"c
 	const titleId = useId();
 	const replaceId = useId();
 	const connect_files = async () => {
-		if (busy || !session.can_request_now()) return;
+		if (busy) return;
+		if (!session.can_request_now()) {
+			setError("Chitchat is reconnecting. Try again shortly.");
+			return;
+		}
 		connectRequest.current ??= crypto.randomUUID();
 		setBusy(true);
 		setError(null);
 		try {
 			const pluginToken = await props.client.getToken();
-			if (!session.can_request_now()) return;
+			if (!session.can_request_now()) {
+				setError("Chitchat is reconnecting. Try again shortly.");
+				return;
+			}
 			const result = await connect({
 				channelId: props.channelId,
 				pluginToken,
@@ -43,7 +50,11 @@ export function TranscriptStatus(props: { client: BonoboClient; channelId: Id<"c
 		}
 	};
 	const retry_sync = async () => {
-		if (busy || !session.can_request_now()) return;
+		if (busy) return;
+		if (!session.can_request_now()) {
+			setError("Chitchat is reconnecting. Try again shortly.");
+			return;
+		}
 		setBusy(true);
 		setError(null);
 		try {
@@ -56,7 +67,12 @@ export function TranscriptStatus(props: { client: BonoboClient; channelId: Id<"c
 		}
 	};
 	const rebuild = async () => {
-		if (busy || !replaceEdits || !status?.canReconcile || !session.canSend || !session.can_request_now()) return;
+		if (busy || !replaceEdits || !status?.canReconcile) return;
+		if (!session.can_request_now()) {
+			setError("Chitchat is reconnecting. Try again shortly.");
+			return;
+		}
+		if (!session.canSend) return;
 		rebuildRequest.current ??= crypto.randomUUID();
 		setBusy(true);
 		setError(null);
