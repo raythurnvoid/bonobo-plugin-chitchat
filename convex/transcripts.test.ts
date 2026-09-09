@@ -59,21 +59,30 @@ function host(isPrivate = false) {
 	let failWritePath: string | null = null;
 	let refuseRollback = false;
 	const removedReaders = new Set<string>();
-	const writeBody = z.object({
-		writerId: z.string(),
-		path: z.string(),
-		operationId: z.string(),
-		writerGeneration: z.number(),
-		sequence: z.number(),
-		expectedNodeId: z.string().nullable(),
-		expectedContentRevision: z.string().nullable(),
-		content: z.string(),
-		expectedReaderRevision: z.number().nullable(),
-	});
+	const writeBody = z
+		.object({
+			path: z.string(),
+			content: z.string(),
+			contentType: z.literal("text/markdown;charset=utf-8"),
+			nonCollaborative: z.literal(true),
+			expectedParentNodeId: z.string(),
+			writer: z.object({
+				writerId: z.string(),
+				operationId: z.string(),
+				writerGeneration: z.number(),
+				sequence: z.number(),
+				expectedNodeId: z.string().nullable(),
+				expectedContentRevision: z.string().nullable(),
+				expectedReaderRevision: z.number().nullable(),
+				contentHash: z.string(),
+			}),
+		})
+		.transform(({ writer, ...request }) => ({ ...request, ...writer }));
 	vi.stubGlobal(
 		"fetch",
 		vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 			const path = new URL(String(input)).pathname;
+			expect(path.startsWith("/api/v1/")).toBe(true);
 			const body: unknown = JSON.parse(String(init?.body));
 			const bearer = new Headers(init?.headers).get("Authorization") ?? "";
 			if (path.endsWith("/write") && beforeWrite) {
@@ -81,11 +90,11 @@ function host(isPrivate = false) {
 				beforeWrite = null;
 				await callback();
 			}
-			if (oldTokenExpired && bearer === "Bearer psg_sealed" && !path.endsWith("/rollback-readers"))
+			if (oldTokenExpired && bearer === "Bearer psg_sealed" && !path.endsWith("/plugin-access/undo"))
 				return Response.json({ message: "Unauthenticated" }, { status: 401 });
-			if (denyWrites && !path.endsWith("/rollback-readers"))
+			if (denyWrites && !path.endsWith("/plugin-access/undo"))
 				return Response.json({ message: "Permission denied" }, { status: 403 });
-			if (path.endsWith("/rollback-readers")) {
+			if (path.endsWith("/plugin-access/undo")) {
 				if (refuseRollback)
 					return Response.json({ message: "The Files readers changed after this update." }, { status: 409 });
 				const request = z
@@ -114,20 +123,25 @@ function host(isPrivate = false) {
 				receipts.set(request.operationId, acknowledgement);
 				return Response.json(acknowledgement);
 			}
-			if (path.endsWith("/readers")) {
+			if (path.endsWith("/plugin-access/set")) {
 				const request = z
 					.object({
-						operationId: z.string(),
-						expectedReaderRevision: z.number(),
-						writerGeneration: z.number(),
-						readers: z.array(z.object({ userId: z.string(), membershipLifetime: z.number() })),
+						path: z.string(),
+						writer: z.object({
+							writerId: z.string(),
+							operationId: z.string(),
+							expectedReaderRevision: z.number(),
+							writerGeneration: z.number(),
+						}),
+						access: z.object({ readers: z.array(z.object({ userId: z.string(), membershipLifetime: z.number() })) }),
 					})
+					.transform(({ writer, access }) => ({ ...writer, ...access }))
 					.parse(body);
 				if (cancelledReaderOperations.has(request.operationId))
 					return Response.json({ message: "This operation was already used" }, { status: 409 });
 				if (request.writerGeneration !== generations.get("writer"))
 					return Response.json({ message: "Stale reader writer generation" }, { status: 409 });
-				if (receipts.has(request.operationId)) return Response.json(receipts.get(request.operationId));
+				if (receipts.has(request.operationId)) return Response.json({ receipt: receipts.get(request.operationId) });
 				if (request.expectedReaderRevision !== readerRevision)
 					return Response.json({ message: "Stale readers" }, { status: 409 });
 				readerJournals.set(request.operationId, readers);
@@ -148,14 +162,15 @@ function host(isPrivate = false) {
 					afterReaders = null;
 					await callback();
 				}
-				return Response.json(receipt);
+				return Response.json({ receipt });
 			}
-			if (path.endsWith("/prepare")) {
-				const request = z.object({ writerId: z.string(), path: z.string() }).parse(body);
+			if (path.endsWith("/plugin-writers/inspect")) {
+				const request = z.object({ writerId: z.string(), path: z.string(), maxBytes: z.literal(100_000) }).parse(body);
 				const file = files.get(request.path);
 				return Response.json({
 					nodeId: file?.nodeId ?? null,
 					content: file?.content ?? null,
+					contentType: file ? "text/markdown;charset=utf-8" : null,
 					contentRevision: file?.revision ?? null,
 					expectedParentNodeId: "folder",
 					writerGeneration: generations.get(request.writerId),
@@ -163,7 +178,7 @@ function host(isPrivate = false) {
 					detached,
 				});
 			}
-			if (path.endsWith("/fence")) {
+			if (path.endsWith("/plugin-writers/advance")) {
 				if (failFence === "refused") {
 					failFence = null;
 					return Response.json({ message: "This item is read-only." }, { status: 409 });
@@ -207,7 +222,7 @@ function host(isPrivate = false) {
 				}
 				if (generations.get(request.writerId) !== request.writerGeneration)
 					return Response.json({ message: "Stale writer" }, { status: 409 });
-				if (receipts.has(request.operationId)) return Response.json(receipts.get(request.operationId));
+				if (receipts.has(request.operationId)) return Response.json({ receipt: receipts.get(request.operationId) });
 				if (request.expectedReaderRevision !== readerRevision)
 					return Response.json({ message: "Stale readers" }, { status: 409 });
 				const file = files.get(request.path);
@@ -238,22 +253,25 @@ function host(isPrivate = false) {
 					loseNextWrite = false;
 					throw new TypeError("Network response lost");
 				}
-				return Response.json(receipt);
+				return Response.json({ receipt });
 			}
-			if (path.endsWith("/archive")) {
+			if (path.endsWith("/plugin-archive")) {
 				if (detached) return Response.json({ message: "The transcript readers are managed in Files" }, { status: 409 });
 				const request = z
 					.object({
-						writerId: z.string(),
 						path: z.string(),
-						nodeId: z.string(),
-						operationId: z.string(),
-						writerGeneration: z.number(),
-						sequence: z.number(),
-						expectedContentRevision: z.string().optional(),
+						writer: z.object({
+							writerId: z.string(),
+							nodeId: z.string(),
+							operationId: z.string(),
+							writerGeneration: z.number(),
+							sequence: z.number(),
+							expectedContentRevision: z.string().optional(),
+						}),
 					})
+					.transform(({ path, writer }) => ({ path, ...writer }))
 					.parse(body);
-				if (receipts.has(request.operationId)) return Response.json(receipts.get(request.operationId));
+				if (receipts.has(request.operationId)) return Response.json({ receipt: receipts.get(request.operationId) });
 				const sequenceKey = `${request.writerId}:${request.writerGeneration}:${request.path}`;
 				if ((fileSequences.get(sequenceKey) ?? -1) >= request.sequence)
 					return Response.json({ message: "A newer transcript write already exists" }, { status: 409 });
@@ -280,18 +298,21 @@ function host(isPrivate = false) {
 					loseNextArchive = false;
 					throw new TypeError("Archive response lost");
 				}
-				return Response.json(receipt);
+				return Response.json({ receipt });
 			}
 			if (path.endsWith("/ensure")) {
-				const request = z.object({ channelId: z.string() }).parse(body);
+				const request = z.object({ writer: z.object({ resourceKey: z.string() }) }).parse(body);
+				const key = z.tuple([z.string(), z.string()]).parse(JSON.parse(request.writer.resourceKey));
+				const writerId = key[1] === "__root" ? "root-writer" : "writer";
 				return Response.json({
-					writerId: request.channelId === "__root" ? "root-writer" : "writer",
-					rootNodeId: "folder",
-					folderNodeId: "folder",
-					writerGeneration: generations.get(request.channelId === "__root" ? "root-writer" : "writer"),
-					readerRevision,
-					detached,
-					created: false,
+					writer: {
+						writerId,
+						rootNodeId: "folder",
+						folderNodeId: "folder",
+						writerGeneration: generations.get(writerId),
+						readerRevision,
+						detached,
+					},
 				});
 			}
 			throw new Error(`Unexpected Press call: ${path}`);
@@ -415,7 +436,7 @@ async function fixture(isPrivate = false) {
 		return id;
 	});
 	const alice = t.withIdentity({
-		issuer: "https://press.test/plugins/chitchat",
+		issuer: "https://press.test/plugins-services",
 		subject: "session-alice",
 		exchangeId: "exchange-alice",
 	});
@@ -508,7 +529,7 @@ async function fixture(isPrivate = false) {
 					.unique(),
 		))!;
 		const actorClient = t.withIdentity({
-			issuer: "https://press.test/plugins/chitchat",
+			issuer: "https://press.test/plugins-services",
 			subject: session.hostSessionId,
 			exchangeId: session.exchangeId,
 		});
@@ -520,7 +541,7 @@ async function fixture(isPrivate = false) {
 			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 				const path = new URL(String(input)).pathname;
 				if (path === "/.well-known/jwks.json") return Response.json({ keys: [publicKey] });
-				if (path.endsWith("/chitchat/lease")) {
+				if (path.endsWith("/plugins/identity/exchange")) {
 					const request = z
 						.object({ exchangeId: z.string(), requestedExpiresAt: z.number() })
 						.parse(JSON.parse(String(init?.body)));
@@ -545,8 +566,8 @@ async function fixture(isPrivate = false) {
 						expiresAt: request.requestedExpiresAt,
 					})
 						.setProtectedHeader({ alg: "ES256", kid: "reconnect" })
-						.setIssuer("https://press.test/plugins/chitchat")
-						.setAudience("chitchat")
+						.setIssuer("https://press.test/plugins-services")
+						.setAudience("bonobo-plugin:chitchat")
 						.setSubject(session.hostSessionId)
 						.setExpirationTime(Math.floor(request.requestedExpiresAt / 1000))
 						.sign(keys.privateKey);
@@ -1451,7 +1472,7 @@ describe("private transcript deletion", () => {
 			});
 		});
 		const bob = t.withIdentity({
-			issuer: "https://press.test/plugins/chitchat",
+			issuer: "https://press.test/plugins-services",
 			subject: "session-bob",
 			exchangeId: "exchange-bob",
 		});
@@ -1534,7 +1555,7 @@ describe("private transcript deletion", () => {
 			expect(remote.archived.size).toBe(0);
 			expect(remote.readers()).toHaveLength(2);
 			const charlie = t.withIdentity({
-				issuer: "https://press.test/plugins/chitchat",
+				issuer: "https://press.test/plugins-services",
 				subject: "session-charlie",
 				exchangeId: "exchange-charlie",
 			});
@@ -1789,7 +1810,7 @@ describe("transcript grants", () => {
 			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 				const path = new URL(String(input)).pathname;
 				if (path === "/.well-known/jwks.json") return Response.json({ keys: [publicKey] });
-				if (path.endsWith("/chitchat/lease")) {
+				if (path.endsWith("/plugins/identity/exchange")) {
 					const request = z
 						.object({ exchangeId: z.string(), requestedExpiresAt: z.number() })
 						.parse(JSON.parse(String(init?.body)));
@@ -1814,8 +1835,8 @@ describe("transcript grants", () => {
 						expiresAt: request.requestedExpiresAt,
 					})
 						.setProtectedHeader({ alg: "ES256", kid: "lease-test" })
-						.setIssuer("https://press.test/plugins/chitchat")
-						.setAudience("chitchat")
+						.setIssuer("https://press.test/plugins-services")
+						.setAudience("bonobo-plugin:chitchat")
 						.setSubject("session-alice")
 						.setExpirationTime(Math.floor(request.requestedExpiresAt / 1000))
 						.sign(keys.privateKey);

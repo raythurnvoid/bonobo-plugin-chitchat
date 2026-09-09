@@ -334,7 +334,7 @@ export const sync = internalAction({
 				});
 				if (!installation || installation.status === "revoked") return false;
 				if (installation.status === "bootstrapping" && installation.bootstrapPhase === "members") {
-					const answer = await press_post("/api/internal/plugins/chitchat/snapshot", {
+					const answer = await press_post("/api/v1/plugins/members/list", {
 						installationId: installation.hostInstallationId,
 						cursor: installation.bootstrapCursor,
 						startRevision: installation.bootstrapStartRevision,
@@ -361,7 +361,7 @@ export const sync = internalAction({
 					await ctx.runMutation(internal.access.finish_snapshot, { installationId: installation._id });
 					continue;
 				}
-				const answer = await press_post("/api/internal/plugins/chitchat/events", {
+				const answer = await press_post("/api/v1/plugins/access/changes", {
 					installationId: installation.hostInstallationId,
 					afterRevision: installation.appliedAccessRevision,
 					limit: 100,
@@ -401,30 +401,26 @@ export const sync = internalAction({
 		} catch {
 			console.warn("Press membership sync will retry", { installationId: args.installationId });
 		}
-		await ctx.scheduler.runAfter(10_000, internal.access.sync, args);
+		// The cron resumes saved progress. A failed call must not start another retry chain.
 		return false;
 	},
 });
 
 export const wake_installations = internalMutation({
-	args: { availableRevision: v.number(), paginationOpts: paginationOptsValidator },
+	args: { paginationOpts: paginationOptsValidator },
 	returns: v.null(),
 	handler: async (ctx, args) => {
 		const page = await ctx.db.query("installations").paginate({ ...args.paginationOpts, numItems: 50 });
 		for (const installation of page.page) {
-			if (
-				installation.status !== "revoked" &&
-				(installation.appliedAccessRevision < args.availableRevision || installation.status !== "ready")
-			) {
+			if (installation.status !== "revoked") {
 				await ctx.scheduler.runAfter(0, internal.access.sync, {
 					installationId: installation._id,
-					requiredRevision: args.availableRevision,
+					requiredRevision: installation.appliedAccessRevision,
 				});
 			}
 		}
 		if (!page.isDone)
 			await ctx.scheduler.runAfter(0, internal.access.wake_installations, {
-				availableRevision: args.availableRevision,
 				paginationOpts: { numItems: 50, cursor: page.continueCursor },
 			});
 		return null;

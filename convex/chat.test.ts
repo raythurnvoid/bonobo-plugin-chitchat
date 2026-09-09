@@ -76,7 +76,7 @@ async function fixture() {
 	});
 	const asUser = (userId: string) =>
 		t.withIdentity({
-			issuer: "https://press.test/plugins/chitchat",
+			issuer: "https://press.test/plugins-services",
 			subject: `session-${userId}`,
 			exchangeId: `exchange-${userId}`,
 		});

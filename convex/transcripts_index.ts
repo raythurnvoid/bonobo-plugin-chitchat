@@ -11,7 +11,12 @@ import {
 	chatbe_ROLLOVER_MAX_BYTES,
 } from "../shared/transcript-markdown";
 import { transcripts_get_token, transcripts_host_post, transcripts_host_scope } from "./transcripts_grants";
-import { transcripts_get_error_message, transcripts_prepared, transcripts_receipt } from "./transcripts_worker";
+import {
+	transcripts_get_error_message,
+	transcripts_prepared,
+	transcripts_receipt,
+	transcripts_file_result,
+} from "./transcripts_worker";
 
 async function create_run(ctx: MutationCtx, index: Doc<"transcript_indexes">, reconcile: boolean) {
 	const runId = await ctx.db.insert("transcript_index_runs", {
@@ -333,7 +338,7 @@ export const run = internalAction({
 				const path = `${grant.rootPath}/README.md`;
 				if (run.phase === "fence") {
 					const fenced = await transcripts_host_post(
-						"/api/internal/plugins/files/fence",
+						"/api/v1/files/plugin-writers/advance",
 						{
 							writerId: run.writerId,
 							operationId: `${run._id}:fence`,
@@ -350,20 +355,21 @@ export const run = internalAction({
 					});
 				} else if (run.phase === "publish" && !run.prepared) {
 					const root = await transcripts_host_post(
-						"/api/internal/plugins/files/ensure",
+						"/api/v1/files/plugin-folders/ensure",
 						{
-							datasetGeneration: installation.generation,
-							channelId: "__root",
-							rootPath: grant.rootPath,
 							path: grant.rootPath,
-							readOnly: true,
+							writer: {
+								resourceKey: JSON.stringify([installation.generation, "__root"]),
+								rootNodeId: null,
+							},
+							access: { readOnly: true },
 						},
 						token,
 						transcripts_host_scope,
 					);
 					const prepared = await transcripts_host_post(
-						"/api/internal/plugins/files/prepare",
-						{ writerId: root.writerId, path },
+						"/api/v1/files/plugin-writers/inspect",
+						{ writerId: root.writerId, path, maxBytes: chatbe_ROLLOVER_MAX_BYTES },
 						token,
 						transcripts_prepared,
 					);
@@ -382,22 +388,26 @@ export const run = internalAction({
 					});
 				} else if (run.phase === "publish") {
 					const saved = await transcripts_host_post(
-						"/api/internal/plugins/files/write",
+						"/api/v1/files/write",
 						{
-							writerId: run.writerId,
 							path,
-							operationId: `${run._id}:readme`,
-							writerGeneration: run.writerGeneration,
-							sequence: run.barrier + 1,
 							expectedParentNodeId: run.parentNodeId,
-							expectedNodeId: run.expectedNodeId,
-							expectedContentRevision: run.expectedContentRevision,
-							expectedReaderRevision: null,
 							content: run.content,
-							contentHash: await chatbe_sha256_hex(run.content),
+							contentType: "text/markdown;charset=utf-8",
+							nonCollaborative: true,
+							writer: {
+								writerId: run.writerId,
+								operationId: `${run._id}:readme`,
+								writerGeneration: run.writerGeneration,
+								sequence: run.barrier + 1,
+								expectedNodeId: run.expectedNodeId,
+								expectedContentRevision: run.expectedContentRevision,
+								expectedReaderRevision: null,
+								contentHash: await chatbe_sha256_hex(run.content),
+							},
 						},
 						token,
-						transcripts_receipt,
+						transcripts_file_result,
 					);
 					receipt = {
 						operationId: saved.operationId,

@@ -38,22 +38,22 @@ Channel and overview pages request at most 50 entries; the member picker request
 Press is the only identity authority for this release. `src/session.tsx` owns a separate Convex client for Chitchat. The SDK client still points to Press for the host bridge, theme, and Files.
 
 1. The frame sends its current Press plugin bearer to Chitchat's `/auth/lease`.
-2. Chitchat calls the configured Press lease endpoint with its server-held service proof.
+2. Chitchat calls `/api/v1/plugins/identity/exchange` with its server-held service proof.
 3. Press checks the current user, membership, installation, version, capabilities, service account, and plugin session.
-4. Press signs a short ES256 JWT with audience `chitchat`, issuer `<PRESS_HTTP_URL>/plugins/chitchat`, and the exact exchange and membership lifetime.
+4. Press signs a short ES256 JWT with audience `bonobo-plugin:chitchat`, issuer `<PRESS_HTTP_URL>/plugins-services`, and the exact exchange and membership lifetime.
 5. Chitchat catches up its versioned access mirror before admitting that lease.
 
 The target lease is 30 seconds. Membership and permission changes can reach Chitchat sooner through durable access events. If catch-up or renewal fails, access closes when the current lease expires. This is an explicit brief revocation window. Scheduled expiry writes also invalidate idle subscriptions. The browser checks a conservative monotonic deadline before submitting.
 
-Removal and reinvitation start a new membership lifetime. Old private grants do not become valid again. Uninstall, account changes, and version changes retire their old authority. Snapshot and event pages are bounded. Push delivery is a wake-up hint; ordered pulls and saved revisions decide access.
+Removal and reinvitation start a new membership lifetime. Old private grants do not become valid again. Uninstall, account changes, and version changes retire their old authority. Member pages use `/api/v1/plugins/members/list`; ordered events use `/api/v1/plugins/access/changes`. The 30-second cron schedules at most 50 installations per transaction and continues later pages. It owns background retries; failed requests never start another retry chain. Saved progress resumes on the next tick. Lease expiry remains independent of polling.
 
 ## Markdown transcripts
 
 The native database is the source of chat. Transcript failure never rolls back a saved message. The UI shows connection, pending, running, blocked, and saved states separately from message delivery.
 
-This rebuild starts with empty chat data. It creates a fresh `/chitchat-<generation>` root. Existing `/chitchat` files, content, sharing, locks, and metadata are left alone. No old plugin-store data is read or migrated.
+Each new dataset creates a fresh `/chitchat-<generation>` root. Existing datasets retain their exact root, folder, and file IDs. The public API cutover keeps native chats, saved requests, Markdown bytes, metadata, permissions, and locks. Old plugin-store data is not read into native chat.
 
-Inside the new root, the existing layout and format remain:
+Inside the dataset root, the layout and format remain:
 
 - `README.md` lists public channels.
 - Public transcripts use `<slug>.md` and numbered `<slug>.001.md` rollovers.
@@ -61,11 +61,18 @@ Inside the new root, the existing layout and format remain:
 - Each file stays within 100,000 UTF-8 bytes. The current rollover scheme is retained.
 - Message markers, UTC dates, saved author names, two-space reply indentation, edit/delete flags, attachment names, and reaction lines keep their existing format. Signed download URLs are never stored.
 
-Connect Files from the channel's transcript status. The server exchanges and seals a Files-only grant for the exact new root. Grants are encrypted before storage.
+Connect Files from the channel's transcript status. The server uses `/api/v1/plugins/service-grants/*` to exchange and seal a Files-only grant for the exact root. Grants are encrypted before storage.
+
+Files writes use the public plugin folder, access, and archive APIs plus `/api/v1/files/write`.
+Writer inspection, generation advance, and reader undo are general public Files capabilities.
+`JSON.stringify([generation, channelPublicId])` is the opaque writer resource key; `__root` identifies
+the README writer inside Chitchat only. Press never parses this value. Chitchat sends the original
+saved operation ID, sequence, target and revision checks on every retry. Its 100,000-byte Markdown
+limit remains local even though the public API supports other editable text and larger bounds.
 
 A workspace admin must make the first connection. Both the connecting person and the exact Chitchat service account need **Can manage** on the workspace to create the initial locked root. Creating later locked folders needs **Can manage** on their parent folder or workspace. **Can write** alone cannot set their locks.
 
-After the root and `private` container exist, reduce the account's broad access where possible. Keep the workspace **Can write** permission needed for ordinary file writes, and **Can manage** on the exact generated root and `private` container. Normal folder grants do not pass to other folders or files. Private setup first creates an empty restricted channel folder; give the exact Chitchat service account **Can manage** on each private channel folder, then reconnect. That permission lets Chitchat update both the transcript and its readers. The connecting person must also keep the Files permissions needed for each operation. Setup never grants account permissions automatically.
+After the root and `private` container exist, reduce the account's broad access where possible. Keep the workspace **Can write** permission needed for ordinary file writes, and **Can manage** on the exact generated root and `private` container. Normal folder grants do not pass to other folders or files. When creating a private channel folder, the public API grants **Can manage** on that new folder to the exact bound service account. The connecting person must be allowed to manage that account and grant access on the parent. This lets Chitchat update the transcript and its readers. Later setup calls keep existing grants unchanged and never restore a removed grant. The connecting person must also keep the Files permissions needed for each operation.
 
 Transcript jobs are ordered per channel. Work claims, immutable source input, staged output, target IDs, write revisions, operation IDs, and checkpoints survive retries. A host transaction rechecks current access, labels, parent identity, file revision, and writer generation when publishing. A lost response can be checked without publishing twice.
 
@@ -100,10 +107,11 @@ Set these secrets on the Chitchat deployment:
 
 - `PRESS_HTTP_URL`: configured Press HTTP origin.
 - `PRESS_CHITCHAT_SERVICE_SECRET`: Press-issued Chitchat service proof.
-- `PRESS_ACCESS_PUSH_SECRET`: secret for access-event wake-ups.
 - `CHITCHAT_GRANT_ENCRYPTION_KEY`: base64 of 32 random bytes for AES-GCM.
 
-Press needs `CHITCHAT_HTTP_URL` and `CHITCHAT_ACCESS_PUSH_SECRET`. The latter must match `PRESS_ACCESS_PUSH_SECRET`. Never put server secrets in Vite variables, source, logs, or built assets.
+Press needs no Chitchat URL, callback secret, or product-specific environment value. The publisher
+registers Chitchat through the normal service controls. Never put server secrets in Vite variables,
+source, logs, or built assets.
 
 ## Development and release
 

@@ -1,4 +1,5 @@
 import { convexTest } from "convex-test";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
@@ -57,7 +58,7 @@ async function setup() {
 	await t.mutation(internal.access.finish_catchup, { installationId, observedRevision: 0 });
 	await t.mutation(internal.access.admit_lease, { installationId, facts });
 	const user = t.withIdentity({
-		issuer: "https://press.test/plugins/chitchat",
+		issuer: "https://press.test/plugins-services",
 		subject: facts.hostSessionId,
 		exchangeId: facts.exchangeId,
 	});
@@ -72,18 +73,38 @@ async function setup() {
 	return { t, user, facts, channelId: created._yay.channelId };
 }
 
+async function serve_selection(facts: Awaited<ReturnType<typeof setup>>["facts"], downloads: Response) {
+	const keys = await generateKeyPair("ES256");
+	const jwk = { ...(await exportJWK(keys.publicKey)), kid: "test", alg: "ES256", use: "sig" };
+	const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+		const url = input instanceof Request ? input.url : String(input);
+		if (url.endsWith("/.well-known/jwks.json")) return Response.json({ keys: [jwk] });
+		if (url.endsWith("/api/v1/plugins/identity/exchange")) {
+			const request = JSON.parse(String(init?.body));
+			const expiresAt = Math.min(facts.expiresAt, request.requestedExpiresAt);
+			const jwt = await new SignJWT({ ...facts, expiresAt, exchangeId: request.exchangeId })
+				.setProtectedHeader({ alg: "ES256", kid: "test" })
+				.setIssuer("https://press.test/plugins-services")
+				.setAudience("bonobo-plugin:chitchat")
+				.setSubject(facts.hostSessionId)
+				.setExpirationTime(Math.floor(expiresAt / 1000))
+				.sign(keys.privateKey);
+			return Response.json({ jwt });
+		}
+		expect(url).toBe("https://press.test/api/v1/files/download-urls");
+		return downloads;
+	});
+	vi.stubGlobal("fetch", fetchMock);
+	return fetchMock;
+}
+
 describe("authorize_selection", () => {
 	test("uses the current Press file name and saves only a bounded proof", async () => {
 		const { t, user, facts, channelId } = await setup();
-		const fetchMock = vi
-			.fn()
-			.mockResolvedValueOnce(Response.json({ facts }))
-			.mockResolvedValueOnce(
-				Response.json({
-					items: [{ fileNodeId: "file", name: "Report.pdf", url: "https://storage.test/secret-signed-url" }],
-				}),
-			);
-		vi.stubGlobal("fetch", fetchMock);
+		await serve_selection(
+			facts,
+			Response.json({ items: [{ fileNodeId: "file", name: "Report.pdf", url: "https://storage.test/secret-signed-url" }] }),
+		);
 		expect(
 			await user.action(api.files.authorize_selection, { pressToken: "plu_current", fileNodeIds: ["file"] }),
 		).toEqual({ _yay: [{ fileNodeId: "file", name: "Report.pdf" }] });
@@ -103,28 +124,20 @@ describe("authorize_selection", () => {
 
 	test("rejects a bearer from a different Press session before reading files", async () => {
 		const { t, user, facts } = await setup();
-		const fetchMock = vi
-			.fn()
-			.mockResolvedValueOnce(
-				Response.json({ facts: { ...facts, hostSessionId: "other-session", hostUserId: "other-member" } }),
-			);
-		vi.stubGlobal("fetch", fetchMock);
+		const fetchMock = await serve_selection(
+			{ ...facts, hostSessionId: "other-session", hostUserId: "other-member" },
+			Response.json({ items: [] }),
+		);
 		expect(
 			await user.action(api.files.authorize_selection, { pressToken: "plu_other", fileNodeIds: ["private-file"] }),
 		).toMatchObject({ _nay: { message: "Unauthorized" } });
-		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/files/download-urls"))).toBe(false);
 		expect(await t.run(async (ctx) => await ctx.db.query("attachment_proofs").collect())).toEqual([]);
 	});
 
 	test("cannot turn a refused cross-workspace file into an attachment", async () => {
 		const { t, user, facts, channelId } = await setup();
-		vi.stubGlobal(
-			"fetch",
-			vi
-				.fn()
-				.mockResolvedValueOnce(Response.json({ facts }))
-				.mockResolvedValueOnce(Response.json({ message: "Permission denied" }, { status: 403 })),
-		);
+		await serve_selection(facts, Response.json({ message: "Permission denied" }, { status: 403 }));
 		expect(
 			(
 				await user.action(api.files.authorize_selection, {

@@ -4,10 +4,6 @@ import { httpAction } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { press_HTTP_URL, press_get_lease } from "./press";
 
-if (!process.env.PRESS_ACCESS_PUSH_SECRET) {
-	throw new Error("PRESS_ACCESS_PUSH_SECRET is not set in Convex env");
-}
-const PRESS_ACCESS_PUSH_SECRET = process.env.PRESS_ACCESS_PUSH_SECRET;
 const DEV_PLUGIN_ORIGIN = process.env.DEV_PLUGIN_ORIGIN;
 const PRESS_ORIGIN = new URL(press_HTTP_URL).origin;
 const router = httpRouter();
@@ -80,27 +76,6 @@ router.route({
 			);
 		} catch {
 			return Response.json({ message: "Could not connect to Chitchat. Try again." }, { status: 503, headers });
-		}
-	}),
-});
-
-router.route({
-	path: "/auth/access-events",
-	method: "POST",
-	handler: httpAction(async (ctx, request) => {
-		if (request.headers.get("Authorization") !== `Bearer ${PRESS_ACCESS_PUSH_SECRET}`)
-			return new Response(null, { status: 401 });
-		try {
-			const raw: unknown = await request.json();
-			const body = z.object({ availableRevision: z.number().int().nonnegative() }).strict().safeParse(raw);
-			if (!body.success) return new Response(null, { status: 400 });
-			await ctx.runMutation(internal.access.wake_installations, {
-				availableRevision: body.data.availableRevision,
-				paginationOpts: { cursor: null, numItems: 50 },
-			});
-			return new Response(null, { status: 204 });
-		} catch {
-			return new Response(null, { status: 503 });
 		}
 	}),
 });

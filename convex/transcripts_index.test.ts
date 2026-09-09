@@ -34,42 +34,51 @@ function host() {
 	let loseFence = false;
 	let denied = false;
 	let beforeWrite: (() => Promise<void>) | null = null;
-	const writeSchema = z.object({
-		writerId: z.string(),
-		operationId: z.string(),
-		writerGeneration: z.number(),
-		sequence: z.number().int().positive(),
-		path: z.string(),
-		expectedParentNodeId: z.string(),
-		expectedNodeId: z.string().nullable(),
-		expectedContentRevision: z.string().nullable(),
-		expectedReaderRevision: z.null(),
-		content: z.string(),
-		contentHash: z.string(),
-	});
+	const writeSchema = z
+		.object({
+			path: z.string(),
+			expectedParentNodeId: z.string(),
+			content: z.string(),
+			contentType: z.literal("text/markdown;charset=utf-8"),
+			nonCollaborative: z.literal(true),
+			writer: z.object({
+				writerId: z.string(),
+				operationId: z.string(),
+				writerGeneration: z.number(),
+				sequence: z.number().int().positive(),
+				expectedNodeId: z.string().nullable(),
+				expectedContentRevision: z.string().nullable(),
+				expectedReaderRevision: z.null(),
+				contentHash: z.string(),
+			}),
+		})
+		.transform(({ writer, ...request }) => ({ ...request, ...writer }));
 	vi.stubGlobal(
 		"fetch",
 		vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 			const path = new URL(String(input)).pathname;
+			expect(path.startsWith("/api/v1/")).toBe(true);
 			const body: unknown = JSON.parse(String(init?.body));
 			calls.push({ path, body });
 			if (denied) return Response.json({ message: "Files write permission was removed." }, { status: 403 });
 			if (path.endsWith("/ensure"))
 				return Response.json({
-					writerId: "root-writer",
-					rootNodeId: "root",
-					folderNodeId: "root",
-					writerGeneration: generation,
-					readerRevision: null,
-					detached: false,
-					created: false,
+					writer: {
+						writerId: "root-writer",
+						rootNodeId: "root",
+						folderNodeId: "root",
+						writerGeneration: generation,
+						readerRevision: null,
+						detached: false,
+					},
 				});
-			if (path.endsWith("/prepare")) {
-				const request = z.object({ path: z.string() }).parse(body);
+			if (path.endsWith("/inspect")) {
+				const request = z.object({ path: z.string(), maxBytes: z.literal(100_000) }).parse(body);
 				const file = files.get(request.path);
 				return Response.json({
 					nodeId: file?.nodeId ?? null,
 					content: file?.content ?? null,
+					contentType: file ? "text/markdown;charset=utf-8" : null,
 					contentRevision: file?.revision ?? null,
 					expectedParentNodeId: "root",
 					writerGeneration: generation,
@@ -77,7 +86,7 @@ function host() {
 					detached: false,
 				});
 			}
-			if (path.endsWith("/fence")) {
+			if (path.endsWith("/advance")) {
 				const request = z
 					.object({
 						writerId: z.string(),
@@ -121,7 +130,7 @@ function host() {
 				const saved = receipts.get(request.operationId);
 				if (saved) {
 					expect(saved.fingerprint).toBe(JSON.stringify(body));
-					return Response.json(saved.value);
+					return Response.json({ receipt: saved.value });
 				}
 				const file = files.get(request.path);
 				if (
@@ -150,7 +159,7 @@ function host() {
 					loseWrite = false;
 					throw new TypeError("Write response lost");
 				}
-				return Response.json(value);
+				return Response.json({ receipt: value });
 			}
 			throw new Error(`Unexpected host call: ${path}`);
 		}),
@@ -231,7 +240,7 @@ async function fixture(isPrivate = false) {
 		return id;
 	});
 	const alice = t.withIdentity({
-		issuer: "https://press.test/plugins/chitchat",
+		issuer: "https://press.test/plugins-services",
 		subject: "session",
 		exchangeId: "exchange",
 	});
@@ -344,8 +353,8 @@ describe("transcript index", () => {
 		expect(index.nodeId).not.toBeNull();
 		expect(remote.files.get(PATH)!.content).toBe(chatbe_readme_markdown([]));
 		expect(
-			z.object({ sequence: z.number() }).parse(remote.calls.find((call) => call.path.endsWith("/write"))!.body)
-				.sequence,
+			z.object({ writer: z.object({ sequence: z.number() }) })
+				.parse(remote.calls.find((call) => call.path.endsWith("/write"))!.body).writer.sequence,
 		).toBe(1);
 	});
 
@@ -435,8 +444,8 @@ describe("transcript index", () => {
 		expect(remote.files.get(PATH)!.content).not.toContain("Human text");
 		expect(remote.generation()).toBe(2);
 		expect(remote.writes()).toBe(2);
-		const operations = remote.calls.filter((call) => /\/(write|fence)$/.test(call.path));
-		expect(operations.slice(0, 3).map((call) => call.path.split("/").at(-1))).toEqual(["write", "write", "fence"]);
+		const operations = remote.calls.filter((call) => /\/(write|advance)$/.test(call.path));
+		expect(operations.slice(0, 3).map((call) => call.path.split("/").at(-1))).toEqual(["write", "write", "advance"]);
 	});
 
 	test("requires explicit rebuild for human edits and replays a lost fence receipt", async () => {
@@ -458,7 +467,7 @@ describe("transcript index", () => {
 		await drain();
 		expect(remote.files.get(PATH)!.nodeId).toBe(originalId);
 		expect(remote.files.get(PATH)!.content).not.toContain("Human text");
-		const fences = remote.calls.filter((call) => call.path.endsWith("/fence"));
+		const fences = remote.calls.filter((call) => call.path.endsWith("/advance"));
 		expect(fences).toHaveLength(2);
 		expect(fences[0]!.body).toEqual(fences[1]!.body);
 		expect(remote.generation()).toBe(2);

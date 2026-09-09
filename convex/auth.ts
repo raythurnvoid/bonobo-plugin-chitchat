@@ -5,7 +5,7 @@ import type { chat_Result } from "../shared/chat";
 if (!process.env.PRESS_HTTP_URL) {
 	throw new Error("PRESS_HTTP_URL is not set in Convex env");
 }
-const PRESS_ISSUER = `${process.env.PRESS_HTTP_URL}/plugins/chitchat`;
+const PRESS_ISSUER = `${process.env.PRESS_HTTP_URL}/plugins-services`;
 
 export async function auth_get_current_access(ctx: QueryCtx): Promise<
 	chat_Result<{

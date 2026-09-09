@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import type { BonoboHttpApi, BonoboHttpApiPath } from "bonobo-plugin-sdk/http-api";
 
 if (!process.env.PRESS_HTTP_URL) {
 	throw new Error("PRESS_HTTP_URL is not set in Convex env");
@@ -52,7 +53,11 @@ export const press_access_event = z.discriminatedUnion("kind", [
 ]);
 
 // Only backend actions use the service proof. The browser supplies its current Press session separately.
-export async function press_post(path: string, body: unknown, token?: string) {
+export async function press_post<Path extends BonoboHttpApiPath>(
+	path: Path,
+	body: BonoboHttpApi[Path]["POST"]["body"],
+	token?: string,
+) {
 	const response = await fetch(`${press_HTTP_URL}${path}`, {
 		method: "POST",
 		redirect: "error",
@@ -72,15 +77,15 @@ export async function press_post(path: string, body: unknown, token?: string) {
 export async function press_get_lease(pressToken: string, requestedExpiresAt = Date.now() + 30_000) {
 	const exchangeId = crypto.randomUUID();
 	const answer = await press_post(
-		"/api/internal/plugins/chitchat/lease",
+		"/api/v1/plugins/identity/exchange",
 		{ exchangeId, requestedExpiresAt },
 		pressToken,
 	);
 	if (answer.status !== 200) return { status: answer.status, lease: null };
 	const signed = z.object({ jwt: z.string().max(16_000) }).parse(answer.body);
 	const verified = await jwtVerify(signed.jwt, createRemoteJWKSet(new URL(`${press_HTTP_URL}/.well-known/jwks.json`)), {
-		issuer: `${press_HTTP_URL}/plugins/chitchat`,
-		audience: "chitchat",
+		issuer: `${press_HTTP_URL}/plugins-services`,
+		audience: "bonobo-plugin:chitchat",
 		algorithms: ["ES256"],
 	});
 	const facts = press_lease_facts.parse(verified.payload);

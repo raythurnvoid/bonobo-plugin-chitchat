@@ -4,7 +4,7 @@ import type { Doc } from "./_generated/dataModel";
 import { action, internalMutation, internalQuery, type QueryCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { auth_get_current_access } from "./auth";
-import { press_lease_facts, press_post } from "./press";
+import { press_get_lease, press_post } from "./press";
 import { chat_attachment, chat_error, type chat_Result } from "../shared/chat";
 
 export async function files_validate_attachments(
@@ -108,18 +108,10 @@ export const authorize_selection = action({
 		if (!authority) return { _nay: { message: "Unauthorized" } };
 		try {
 			// Bind the supplied Press bearer to this native session before checking its file access.
-			const lease = await press_post(
-				"/api/internal/plugins/chitchat/lease",
-				{
-					exchangeId: crypto.randomUUID(),
-					requestedExpiresAt: authority.expiresAt,
-				},
-				args.pressToken,
-			);
-			const leaseBody = z.object({ facts: press_lease_facts }).safeParse(lease.body);
-			if (lease.status !== 200 || !leaseBody.success)
+			const lease = await press_get_lease(args.pressToken, authority.expiresAt);
+			if (lease.status !== 200 || !lease.lease)
 				return { _nay: { message: "Press could not confirm attachment access." } };
-			const facts = leaseBody.data.facts;
+			const facts = lease.lease.facts;
 			if (
 				facts.hostSessionId !== authority.hostSessionId ||
 				facts.hostUserId !== authority.hostUserId ||

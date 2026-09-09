@@ -8,8 +8,8 @@ export default {
 	providers: [
 		{
 			type: "customJwt",
-			issuer: `${process.env.PRESS_HTTP_URL}/plugins/chitchat`,
-			applicationID: "chitchat",
+			issuer: `${process.env.PRESS_HTTP_URL}/plugins-services`,
+			applicationID: "bonobo-plugin:chitchat",
 			jwks: `${process.env.PRESS_HTTP_URL}/.well-known/jwks.json`,
 			algorithm: "ES256",
 		},

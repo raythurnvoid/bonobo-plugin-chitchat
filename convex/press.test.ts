@@ -4,7 +4,7 @@ import { press_get_lease } from "./press";
 
 afterEach(() => vi.unstubAllGlobals());
 
-async function serve_lease(change: (facts: Record<string, unknown>) => void = () => {}, audience = "chitchat") {
+async function serve_lease(change: (facts: Record<string, unknown>) => void = () => {}, audience = "bonobo-plugin:chitchat") {
 	const keys = await generateKeyPair("ES256");
 	const jwk = { ...(await exportJWK(keys.publicKey)), kid: "test", alg: "ES256", use: "sig" };
 	vi.stubGlobal(
@@ -12,7 +12,7 @@ async function serve_lease(change: (facts: Record<string, unknown>) => void = ()
 		vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
 			const url = input instanceof Request ? input.url : String(input);
 			if (url === "https://press.test/.well-known/jwks.json") return Response.json({ keys: [jwk] });
-			expect(url).toBe("https://press.test/api/internal/plugins/chitchat/lease");
+			expect(url).toBe("https://press.test/api/v1/plugins/identity/exchange");
 			expect(init?.headers).toMatchObject({
 				Authorization: "Bearer plu_test",
 				"X-Bonobo-Service-Authorization": "Bearer pse_testservice",
@@ -42,7 +42,7 @@ async function serve_lease(change: (facts: Record<string, unknown>) => void = ()
 			change(facts);
 			const jwt = await new SignJWT(facts)
 				.setProtectedHeader({ alg: "ES256", kid: "test" })
-				.setIssuer("https://press.test/plugins/chitchat")
+				.setIssuer("https://press.test/plugins-services")
 				.setAudience(audience)
 				.setSubject("session")
 				.setExpirationTime(Math.floor(facts.expiresAt / 1000))

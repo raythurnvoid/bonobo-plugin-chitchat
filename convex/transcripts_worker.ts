@@ -4,12 +4,13 @@ import { internalAction, internalMutation, type ActionCtx } from "./_generated/s
 import { internal } from "./_generated/api";
 import type { Doc } from "./_generated/dataModel";
 import { transcripts_get_token, transcripts_host_post, transcripts_HostError } from "./transcripts_grants";
-import { chatbe_rollover_path } from "../shared/transcript-markdown";
+import { chatbe_rollover_path, chatbe_ROLLOVER_MAX_BYTES } from "../shared/transcript-markdown";
 import { transcripts_decrypt, transcripts_encrypt } from "./transcripts_secrets";
 
 export const transcripts_prepared = z.object({
 	nodeId: z.string().nullable(),
 	content: z.string().nullable(),
+	contentType: z.literal("text/markdown;charset=utf-8").nullable(),
 	contentRevision: z.string().nullable(),
 	expectedParentNodeId: z.string(),
 	writerGeneration: z.number(),
@@ -24,6 +25,7 @@ export const transcripts_receipt = z.object({
 	readerRevision: z.number().nullable(),
 	operationId: z.string(),
 });
+export const transcripts_file_result = z.object({ receipt: transcripts_receipt }).transform((result) => result.receipt);
 
 export function transcripts_get_error_message(error: unknown, fallback: string) {
 	// Convex keeps expected refusal data separate from its cross-function error message.
@@ -113,7 +115,7 @@ async function readers_step(
 			let rollback;
 			try {
 				rollback = await transcripts_host_post(
-					"/api/internal/plugins/files/rollback-readers",
+					"/api/v1/files/plugin-access/undo",
 					{
 						writerId: destination.writerId,
 						operationId: `${run._id}:${job.sequence}:rollback:${run.readerAttempt}`,
@@ -156,10 +158,11 @@ async function readers_step(
 		}
 		// An explicit Files takeover leaves its readers independent of later chat membership.
 		const prepared = await transcripts_host_post(
-			"/api/internal/plugins/files/prepare",
+			"/api/v1/files/plugin-writers/inspect",
 			{
 				writerId: destination.writerId,
 				path: chatbe_rollover_path(destination.folderPath, context.channel.transcriptSlug, 0),
+				maxBytes: chatbe_ROLLOVER_MAX_BYTES,
 			},
 			readerToken,
 			transcripts_prepared,
@@ -174,16 +177,19 @@ async function readers_step(
 			return;
 		}
 		const receipt = await transcripts_host_post(
-			"/api/internal/plugins/files/readers",
+			"/api/v1/files/plugin-access/set",
 			{
-				writerId: destination.writerId,
-				operationId: `${run._id}:${job.sequence}:readers:${run.readerAttempt}`,
-				writerGeneration: run.writerGeneration,
-				expectedReaderRevision: destination.readerRevision,
-				readers: run.readerSnapshot.readers,
+				path: destination.folderPath,
+				access: { readers: run.readerSnapshot.readers },
+				writer: {
+					writerId: destination.writerId,
+					operationId: `${run._id}:${job.sequence}:readers:${run.readerAttempt}`,
+					writerGeneration: run.writerGeneration,
+					expectedReaderRevision: destination.readerRevision!,
+				},
 			},
 			readerToken,
-			transcripts_receipt,
+			transcripts_file_result,
 		);
 		await ctx.runMutation(internal.transcripts_db.reader_receipt, {
 			...checkpoint,
@@ -277,17 +283,19 @@ export const run_channel = internalAction({
 				const { token } = await transcripts_get_token(ctx, args.channelId);
 				// Archive after the copy boundary, preserving this exact file's current text and manual edits.
 				const receipt = await transcripts_host_post(
-					"/api/internal/plugins/files/archive",
+					"/api/v1/files/plugin-archive",
 					{
-						writerId: deletion.destination.writerId,
-						operationId: prepared.operationId,
-						writerGeneration: prepared.writerGeneration,
 						path: prepared.path,
-						nodeId: prepared.nodeId,
-						sequence: deletion.deletion.barrier + 1,
+						writer: {
+							writerId: deletion.destination.writerId,
+							operationId: prepared.operationId,
+							writerGeneration: prepared.writerGeneration,
+							nodeId: prepared.nodeId,
+							sequence: deletion.deletion.barrier + 1,
+						},
 					},
 					token,
-					transcripts_receipt,
+					transcripts_file_result,
 				);
 				if (receipt.nodeId !== prepared.nodeId || receipt.operationId !== prepared.operationId)
 					throw new Error("Press did not confirm this transcript archive.");
@@ -340,25 +348,27 @@ export const run_channel = internalAction({
 						if (!output || output.path !== input.path) {
 							try {
 								await transcripts_host_post(
-									"/api/internal/plugins/files/archive",
+									"/api/v1/files/plugin-archive",
 									{
-										writerId: destination.writerId,
-										operationId: `${previous._id}:archive:${input.fileId}`,
-										writerGeneration: previous.writerGeneration,
 										path: input.path,
-										nodeId: input.nodeId,
-										sequence: previous.barrier,
-										expectedContentRevision: input.contentRevision,
+										writer: {
+											writerId: destination.writerId,
+											operationId: `${previous._id}:archive:${input.fileId}`,
+											writerGeneration: previous.writerGeneration,
+											nodeId: input.nodeId,
+											sequence: previous.barrier,
+											expectedContentRevision: input.contentRevision,
+										},
 									},
 									token,
-									transcripts_receipt,
+									transcripts_file_result,
 								);
 								archived = true;
 							} catch (error) {
 								if (!(error instanceof transcripts_HostError) || error.status !== 409) throw error;
 								const prepared = await transcripts_host_post(
-									"/api/internal/plugins/files/prepare",
-									{ writerId: destination.writerId, path: input.path },
+									"/api/v1/files/plugin-writers/inspect",
+									{ writerId: destination.writerId, path: input.path, maxBytes: chatbe_ROLLOVER_MAX_BYTES },
 									token,
 									transcripts_prepared,
 								);
@@ -377,22 +387,26 @@ export const run_channel = internalAction({
 					try {
 						// Settle the old request before its generation is fenced. Never adopt an unknown path.
 						const receipt = await transcripts_host_post(
-							"/api/internal/plugins/files/write",
+							"/api/v1/files/write",
 							{
-								writerId: destination.writerId,
 								path: write.path,
-								operationId: write.operationId,
-								writerGeneration: previous.writerGeneration,
-								sequence: previous.barrier,
 								expectedParentNodeId: write.expectedParentNodeId,
-								expectedNodeId: write.expectedNodeId,
-								expectedContentRevision: write.expectedContentRevision,
-								expectedReaderRevision: write.expectedReaderRevision,
-								contentHash: write.contentHash,
 								content: write.content,
+								contentType: "text/markdown;charset=utf-8",
+								nonCollaborative: true,
+								writer: {
+									writerId: destination.writerId,
+									operationId: write.operationId,
+									writerGeneration: previous.writerGeneration,
+									sequence: previous.barrier,
+									expectedNodeId: write.expectedNodeId,
+									expectedContentRevision: write.expectedContentRevision,
+									expectedReaderRevision: write.expectedReaderRevision,
+									contentHash: write.contentHash,
+								},
 							},
 							token,
-							transcripts_receipt,
+							transcripts_file_result,
 						);
 						if (!receipt.nodeId || !receipt.contentRevision)
 							throw new Error("Press did not confirm the transcript content.");
@@ -406,10 +420,11 @@ export const run_channel = internalAction({
 						if (!(error instanceof transcripts_HostError) || error.status !== 409) throw error;
 						// A current-generation conflict has no receipt. The confirmed rebuild can stage fresh preconditions.
 						const prepared = await transcripts_host_post(
-							"/api/internal/plugins/files/prepare",
+							"/api/v1/files/plugin-writers/inspect",
 							{
 								writerId: destination.writerId,
 								path: write.path,
+								maxBytes: chatbe_ROLLOVER_MAX_BYTES,
 							},
 							token,
 							transcripts_prepared,
@@ -424,7 +439,7 @@ export const run_channel = internalAction({
 			} else if (run.phase === "fence") {
 				if (!(await ctx.runMutation(internal.transcripts_db.mark_fence_sent, checkpoint))) return;
 				await transcripts_host_post(
-					"/api/internal/plugins/files/fence",
+					"/api/v1/files/plugin-writers/advance",
 					{
 						writerId: destination.writerId,
 						operationId: `${run._id}:fence`,
@@ -447,8 +462,8 @@ export const run_channel = internalAction({
 						});
 					else {
 						const prepared = await transcripts_host_post(
-							"/api/internal/plugins/files/prepare",
-							{ writerId: destination.writerId, path: input.file.path },
+							"/api/v1/files/plugin-writers/inspect",
+							{ writerId: destination.writerId, path: input.file.path, maxBytes: chatbe_ROLLOVER_MAX_BYTES },
 							token,
 							transcripts_prepared,
 						);
@@ -477,8 +492,8 @@ export const run_channel = internalAction({
 						isTail ? 0 : write.order + 1,
 					);
 					const prepared = await transcripts_host_post(
-						"/api/internal/plugins/files/prepare",
-						{ writerId: destination.writerId, path },
+						"/api/v1/files/plugin-writers/inspect",
+						{ writerId: destination.writerId, path, maxBytes: chatbe_ROLLOVER_MAX_BYTES },
 						token,
 						transcripts_prepared,
 					);
@@ -510,8 +525,8 @@ export const run_channel = internalAction({
 					});
 				else if (run.phase === "validate") {
 					const prepared = await transcripts_host_post(
-						"/api/internal/plugins/files/prepare",
-						{ writerId: destination.writerId, path: input.path },
+						"/api/v1/files/plugin-writers/inspect",
+						{ writerId: destination.writerId, path: input.path, maxBytes: chatbe_ROLLOVER_MAX_BYTES },
 						token,
 						transcripts_prepared,
 					);
@@ -535,18 +550,20 @@ export const run_channel = internalAction({
 					});
 					if (!output || output.path !== input.path)
 						await transcripts_host_post(
-							"/api/internal/plugins/files/archive",
+							"/api/v1/files/plugin-archive",
 							{
-								writerId: destination.writerId,
-								operationId: `${run._id}:archive:${input.fileId}`,
-								writerGeneration: run.writerGeneration,
 								path: input.path,
-								nodeId: input.nodeId,
-								sequence: run.barrier,
-								expectedContentRevision: input.contentRevision,
+								writer: {
+									writerId: destination.writerId,
+									operationId: `${run._id}:archive:${input.fileId}`,
+									writerGeneration: run.writerGeneration,
+									nodeId: input.nodeId,
+									sequence: run.barrier,
+									expectedContentRevision: input.contentRevision,
+								},
 							},
 							token,
-							transcripts_receipt,
+							transcripts_file_result,
 						);
 					await ctx.runMutation(internal.transcripts_db.validate_input, {
 						...checkpoint,
@@ -561,22 +578,26 @@ export const run_channel = internalAction({
 					await ctx.runMutation(internal.transcripts_db.advance, { ...checkpoint, phase: "archive", cursor: null });
 				else {
 					const receipt = await transcripts_host_post(
-						"/api/internal/plugins/files/write",
+						"/api/v1/files/write",
 						{
-							writerId: destination.writerId,
 							path: write.path,
-							operationId: write.operationId,
-							writerGeneration: run.writerGeneration,
-							sequence: run.barrier,
 							expectedParentNodeId: write.expectedParentNodeId,
-							expectedNodeId: write.expectedNodeId,
-							expectedContentRevision: write.expectedContentRevision,
-							expectedReaderRevision: write.expectedReaderRevision,
-							contentHash: write.contentHash,
 							content: write.content,
+							contentType: "text/markdown;charset=utf-8",
+							nonCollaborative: true,
+							writer: {
+								writerId: destination.writerId,
+								operationId: write.operationId,
+								writerGeneration: run.writerGeneration,
+								sequence: run.barrier,
+								expectedNodeId: write.expectedNodeId,
+								expectedContentRevision: write.expectedContentRevision,
+								expectedReaderRevision: write.expectedReaderRevision,
+								contentHash: write.contentHash,
+							},
 						},
 						token,
-						transcripts_receipt,
+						transcripts_file_result,
 					);
 					if (!receipt.nodeId || !receipt.contentRevision)
 						throw new Error("Press did not confirm the transcript content.");

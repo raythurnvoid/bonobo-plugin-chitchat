@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { BonoboHttpApi, BonoboHttpApiPath } from "bonobo-plugin-sdk/http-api";
 import { v } from "convex/values";
 import { doc } from "convex-helpers/validators";
 import { internalAction, internalMutation, internalQuery, type ActionCtx } from "./_generated/server";
@@ -17,15 +18,18 @@ const scoped_grant_response = grant_response.extend({
 	workspaceId: z.string(),
 	installationId: z.string(),
 });
-export const transcripts_host_scope = z.object({
-	writerId: z.string(),
-	rootNodeId: z.string(),
-	folderNodeId: z.string(),
-	writerGeneration: z.number(),
-	readerRevision: z.number().nullable(),
-	detached: z.boolean(),
-	created: z.boolean(),
-});
+export const transcripts_host_scope = z
+	.object({
+		writer: z.object({
+			writerId: z.string(),
+			rootNodeId: z.string(),
+			folderNodeId: z.string(),
+			writerGeneration: z.number(),
+			readerRevision: z.number().nullable(),
+			detached: z.boolean(),
+		}),
+	})
+	.transform((result) => result.writer);
 
 export class transcripts_HostError extends Error {
 	constructor(
@@ -37,9 +41,9 @@ export class transcripts_HostError extends Error {
 	}
 }
 
-export async function transcripts_host_post<T>(
-	path: string,
-	body: unknown,
+export async function transcripts_host_post<Path extends BonoboHttpApiPath, T>(
+	path: Path,
+	body: BonoboHttpApi[Path]["POST"]["body"],
 	token: string,
 	schema: z.ZodType<T>,
 ): Promise<T> {
@@ -346,10 +350,10 @@ export const connect = internalAction({
 					...(operation === "seal" ? { destinationPathPrefix: grant.rootPath } : {}),
 				};
 				// Always ask for the saved result first. The previous bearer may already be rotated.
-				let response = await press_post("/api/internal/plugins/service-grants/recover", { operation, ...body }, source);
+				let response = await press_post("/api/v1/plugins/service-grants/recover", { operation, ...body }, source);
 				if (response.status === 404)
 					response = await press_post(
-						`/api/internal/plugins/service-grants/${operation === "seal" ? "seal-processing" : operation}`,
+						`/api/v1/plugins/service-grants/${operation === "seal" ? "seal-processing" : operation}`,
 						body,
 						source,
 					);
@@ -380,13 +384,14 @@ export const connect = internalAction({
 			}
 			const token = await transcripts_decrypt(grant.sealedSecret!);
 			const root = await transcripts_host_post(
-				"/api/internal/plugins/files/ensure",
+				"/api/v1/files/plugin-folders/ensure",
 				{
-					datasetGeneration: current.installation.generation,
-					channelId: "__root",
-					rootPath: grant.rootPath,
 					path: grant.rootPath,
-					readOnly: true,
+					writer: {
+						resourceKey: JSON.stringify([current.installation.generation, "__root"]),
+						rootNodeId: null,
+					},
+					access: { readOnly: true },
 				},
 				token,
 				transcripts_host_scope,
@@ -396,14 +401,17 @@ export const connect = internalAction({
 					? `${grant.rootPath}/private/${current.channel.transcriptSlug}`
 					: grant.rootPath;
 			const destination = await transcripts_host_post(
-				"/api/internal/plugins/files/ensure",
+				"/api/v1/files/plugin-folders/ensure",
 				{
-					datasetGeneration: current.installation.generation,
-					channelId: current.channel.publicId,
-					rootPath: grant.rootPath,
 					path: folderPath,
-					readOnly: true,
-					...(current.channel.visibility === "private" ? { readers: current.readers } : {}),
+					writer: {
+						resourceKey: JSON.stringify([current.installation.generation, current.channel.publicId]),
+						rootNodeId: root.rootNodeId,
+					},
+					access: {
+						readOnly: true,
+						...(current.channel.visibility === "private" ? { readers: current.readers } : {}),
+					},
 				},
 				token,
 				transcripts_host_scope,
