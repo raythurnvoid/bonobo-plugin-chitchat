@@ -152,6 +152,7 @@ export default defineSchema({
 		deletedAt: v.union(v.number(), v.null()),
 	})
 		.index("by_channel_rootMessage_sequence", ["channelId", "rootMessageId", "sequence"])
+		.index("by_channel_channelReplySequence", ["channelId", "channelReplySequence"])
 		.index("by_rootMessage_deletedAt_sequence", ["rootMessageId", "deletedAt", "sequence"])
 		.index("by_channel_rootMessage_author_deletedAt_sequence", [
 			"channelId",
@@ -206,6 +207,16 @@ export default defineSchema({
 	})
 		.index("by_channel_hostUserId", ["channelId", "hostUserId"])
 		.index("by_installation_hostUserId_membershipLifetime", ["installationId", "hostUserId", "membershipLifetime"]),
+	thread_read_states: defineTable({
+		installationId: v.id("installations"),
+		channelId: v.id("channels"),
+		rootMessageId: v.id("messages"),
+		hostUserId: v.string(),
+		membershipLifetime: v.number(),
+		replySequence: v.number(),
+	})
+		.index("by_rootMessage_hostUserId", ["rootMessageId", "hostUserId"])
+		.index("by_installation_hostUserId_membershipLifetime", ["installationId", "hostUserId", "membershipLifetime"]),
 	channel_author_activity: defineTable({
 		channelId: v.id("channels"),
 		authorHostUserId: v.string(),
@@ -246,6 +257,36 @@ export default defineSchema({
 	})
 		.index("by_channel", ["channelId"])
 		.index("by_status_nextAttemptAt", ["status", "nextAttemptAt"]),
+	// Deletion waits for its accepted copies, then archives exact transcript files in bounded steps.
+	transcript_deletions: defineTable({
+		channelId: v.id("channels"),
+		installationId: v.id("installations"),
+		actorHostUserId: v.union(v.string(), v.null()),
+		actorLifetime: v.union(v.number(), v.null()),
+		barrier: v.number(),
+		archiveStartedAt: v.union(v.number(), v.null()),
+		completedAt: v.union(v.number(), v.null()),
+		cursor: v.number(),
+		claim: v.string(),
+		leaseUntil: v.number(),
+		nextAttemptAt: v.number(),
+		error: v.union(v.string(), v.null()),
+		prepared: v.union(
+			v.object({
+				fileId: v.id("transcript_files"),
+				order: v.number(),
+				path: v.string(),
+				nodeId: v.string(),
+				writerGeneration: v.number(),
+				operationId: v.string(),
+			}),
+			v.null(),
+		),
+	})
+		.index("by_channel", ["channelId"])
+		.index("by_completedAt_nextAttemptAt", ["completedAt", "nextAttemptAt"])
+		.index("by_installation_completedAt", ["installationId", "completedAt"])
+		.index("by_installation_actor_lifetime_completedAt", ["installationId", "actorHostUserId", "actorLifetime", "completedAt"]),
 	transcript_jobs: defineTable({
 		channelId: v.id("channels"),
 		sequence: v.number(),

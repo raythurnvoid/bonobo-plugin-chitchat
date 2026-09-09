@@ -27,7 +27,9 @@ afterEach(() => {
 
 function host(isPrivate = false) {
 	const files = new Map<string, { nodeId: string; content: string; revision: string }>();
+	const archived = new Map<string, { nodeId: string; content: string; revision: string }>();
 	const receipts = new Map<string, object>();
+	const fileSequences = new Map<string, number>();
 	const generations = new Map<string, number>([
 		["writer", 1],
 		["root-writer", 1],
@@ -49,6 +51,8 @@ function host(isPrivate = false) {
 	const cancelledReaderOperations = new Set<string>();
 	let oldTokenExpired = false;
 	let oldTokenForgotten = false;
+	let oldVersionChanged = false;
+	let detached = false;
 	let afterReaders: (() => Promise<void>) | null = null;
 	let beforeWrite: (() => Promise<void>) | null = null;
 	let denyWrites = false;
@@ -60,6 +64,7 @@ function host(isPrivate = false) {
 		path: z.string(),
 		operationId: z.string(),
 		writerGeneration: z.number(),
+		sequence: z.number(),
 		expectedNodeId: z.string().nullable(),
 		expectedContentRevision: z.string().nullable(),
 		content: z.string(),
@@ -93,7 +98,11 @@ function host(isPrivate = false) {
 				if (receipts.has(request.operationId)) return Response.json(receipts.get(request.operationId));
 				const originalId = request.receiptId ?? request.originalReaderOperationId!;
 				const proof = readerProofs.get(originalId);
-				if ((proof && proof !== bearer) || (!proof && oldTokenForgotten && bearer === "Bearer psg_sealed"))
+				if (
+					(oldVersionChanged && bearer === "Bearer psg_sealed") ||
+					(!oldVersionChanged && proof && proof !== bearer) ||
+					(!proof && oldTokenForgotten && bearer === "Bearer psg_sealed")
+				)
 					return Response.json({ message: "Unauthenticated", code: "reader_proof_mismatch" }, { status: 401 });
 				readers = (readerJournals.get(request.receiptId ?? request.originalReaderOperationId!) ?? readers).filter(
 					(reader) => !removedReaders.has(reader.userId),
@@ -151,7 +160,7 @@ function host(isPrivate = false) {
 					expectedParentNodeId: "folder",
 					writerGeneration: generations.get(request.writerId),
 					readerRevision,
-					detached: false,
+					detached,
 				});
 			}
 			if (path.endsWith("/fence")) {
@@ -215,6 +224,7 @@ function host(isPrivate = false) {
 					revision: `revision-${writes}`,
 				};
 				files.set(request.path, saved);
+				fileSequences.set(`${request.writerId}:${request.writerGeneration}:${request.path}`, request.sequence);
 				const receipt = {
 					_id: request.operationId,
 					nodeId: saved.nodeId,
@@ -231,21 +241,32 @@ function host(isPrivate = false) {
 				return Response.json(receipt);
 			}
 			if (path.endsWith("/archive")) {
+				if (detached) return Response.json({ message: "The transcript readers are managed in Files" }, { status: 409 });
 				const request = z
 					.object({
+						writerId: z.string(),
 						path: z.string(),
 						nodeId: z.string(),
 						operationId: z.string(),
 						writerGeneration: z.number(),
+						sequence: z.number(),
 						expectedContentRevision: z.string().optional(),
 					})
 					.parse(body);
 				if (receipts.has(request.operationId)) return Response.json(receipts.get(request.operationId));
+				const sequenceKey = `${request.writerId}:${request.writerGeneration}:${request.path}`;
+				if ((fileSequences.get(sequenceKey) ?? -1) >= request.sequence)
+					return Response.json({ message: "A newer transcript write already exists" }, { status: 409 });
 				if (files.get(request.path)?.nodeId !== request.nodeId)
 					return Response.json({ message: "Wrong archive target" }, { status: 409 });
-				if (request.expectedContentRevision !== files.get(request.path)?.revision)
+				if (
+					request.expectedContentRevision !== undefined &&
+					request.expectedContentRevision !== files.get(request.path)?.revision
+				)
 					return Response.json({ message: "Archive content changed" }, { status: 409 });
+				archived.set(request.path, files.get(request.path)!);
 				files.delete(request.path);
+				fileSequences.set(sequenceKey, request.sequence);
 				const receipt = {
 					_id: request.operationId,
 					nodeId: request.nodeId,
@@ -269,7 +290,7 @@ function host(isPrivate = false) {
 					folderNodeId: "folder",
 					writerGeneration: generations.get(request.channelId === "__root" ? "root-writer" : "writer"),
 					readerRevision,
-					detached: false,
+					detached,
 					created: false,
 				});
 			}
@@ -278,6 +299,7 @@ function host(isPrivate = false) {
 	);
 	return {
 		files,
+		archived,
 		receipts,
 		generations,
 		loseWrite: (beforeCommit = false) => {
@@ -313,6 +335,13 @@ function host(isPrivate = false) {
 		expireToken: (forget = false) => {
 			oldTokenExpired = true;
 			oldTokenForgotten = forget;
+		},
+		upgrade: () => {
+			oldTokenExpired = true;
+			oldVersionChanged = true;
+		},
+		detach: () => {
+			detached = true;
 		},
 	};
 }
@@ -461,7 +490,28 @@ async function fixture(isPrivate = false) {
 		}
 		throw new Error("Transcript worker did not finish");
 	};
-	const reconnect = async (targetChannelId = channelId) => {
+	const reconnect = async (targetChannelId = channelId, actorHostUserId = "alice") => {
+		const actor = (await t.run(
+			async (ctx) =>
+				await ctx.db
+					.query("workspace_members")
+					.withIndex("by_installation_hostUserId", (q) =>
+						q.eq("installationId", installationId).eq("hostUserId", actorHostUserId),
+					)
+					.unique(),
+		))!;
+		const session = (await t.run(
+			async (ctx) =>
+				await ctx.db
+					.query("sessions")
+					.withIndex("by_hostSessionId", (q) => q.eq("hostSessionId", `session-${actorHostUserId}`))
+					.unique(),
+		))!;
+		const actorClient = t.withIdentity({
+			issuer: "https://press.test/plugins/chitchat",
+			subject: session.hostSessionId,
+			exchangeId: session.exchangeId,
+		});
 		const filesFetch = fetch;
 		const keys = await generateKeyPair("ES256");
 		const publicKey = { ...(await exportJWK(keys.publicKey)), kid: "reconnect", alg: "ES256", use: "sig" };
@@ -475,21 +525,21 @@ async function fixture(isPrivate = false) {
 						.object({ exchangeId: z.string(), requestedExpiresAt: z.number() })
 						.parse(JSON.parse(String(init?.body)));
 					const jwt = await new SignJWT({
-						hostSessionId: "session-alice",
-						hostUserId: "alice",
-						hostMembershipId: "membership-alice",
+						hostSessionId: session.hostSessionId,
+						hostUserId: actorHostUserId,
+						hostMembershipId: actor.hostMembershipId,
 						hostOrganizationId: "org-one",
 						hostWorkspaceId: "workspace-one",
 						hostInstallationId: "installation-one",
 						hostPluginVersionId: "version-one",
 						hostServiceAccountId: "service-one",
-						membershipLifetime: 1,
+						membershipLifetime: actor.membershipLifetime,
 						requiredRevision: 1,
-						canRead: true,
-						canWrite: true,
-						isOwner: true,
-						organizationOwnerUserId: "alice",
-						displayName: "Alice",
+						canRead: actor.canRead,
+						canWrite: actor.canWrite,
+						isOwner: actor.isOwner,
+						organizationOwnerUserId: actorHostUserId,
+						displayName: actor.displayName,
 						exchangeId: request.exchangeId,
 						validatedAt: Date.now(),
 						expiresAt: request.requestedExpiresAt,
@@ -497,7 +547,7 @@ async function fixture(isPrivate = false) {
 						.setProtectedHeader({ alg: "ES256", kid: "reconnect" })
 						.setIssuer("https://press.test/plugins/chitchat")
 						.setAudience("chitchat")
-						.setSubject("session-alice")
+						.setSubject(session.hostSessionId)
 						.setExpirationTime(Math.floor(request.requestedExpiresAt / 1000))
 						.sign(keys.privateKey);
 					return Response.json({ jwt });
@@ -508,7 +558,7 @@ async function fixture(isPrivate = false) {
 					token: path.endsWith("/exchange") ? "psg_fresh_interactive" : "psg_fresh_sealed",
 					expiresAt: Date.now() + 86_400_000,
 					scopes: path.endsWith("/exchange") ? [] : ["files:write"],
-					actorUserId: "alice",
+					actorUserId: actorHostUserId,
 					organizationId: "org-one",
 					workspaceId: "workspace-one",
 					installationId: "installation-one",
@@ -517,7 +567,7 @@ async function fixture(isPrivate = false) {
 		);
 		expect(
 			(
-				await alice.action(api.transcripts.connect, {
+				await actorClient.action(api.transcripts.connect, {
 					channelId: targetChannelId,
 					pluginToken: "plu_current",
 					clientRequestId: crypto.randomUUID(),
@@ -534,7 +584,15 @@ async function fixture(isPrivate = false) {
 		for (let step = 0; step < 3; step++) await t.action(internal.transcripts_grants.connect, { grantId: grant._id });
 		return (await t.run(async (ctx) => await ctx.db.get("host_grants", grant._id)))!;
 	};
-	return { t, alice, installationId, channelId, channel, remote, send, drain, reconnect };
+	const drainDeletion = async () => {
+		for (let step = 0; step < 3000; step++) {
+			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			const deletion = await t.run(async (ctx) => await ctx.db.query("transcript_deletions").first());
+			if (deletion?.completedAt !== null && deletion?.completedAt !== undefined) return deletion;
+		}
+		throw new Error("Transcript deletion did not finish");
+	};
+	return { t, alice, installationId, channelId, channel, remote, send, drain, drainDeletion, reconnect };
 }
 
 describe("transcripts_get_error_message", () => {
@@ -892,7 +950,7 @@ describe("transcript readers", () => {
 		expect(remote.readers()).toEqual([{ userId: "bob", membershipLifetime: 1 }]);
 	});
 
-	test.each(["expired", "forgotten", "committed", "source-changed"])(
+	test.each(["expired", "forgotten", "committed", "source-changed", "upgraded"])(
 		"reconnect settles %s reader proof before using a new grant",
 		async (outcome) => {
 			const { t, alice, installationId, channelId, channel, remote, drain, reconnect } = await fixture(true);
@@ -909,7 +967,7 @@ describe("transcript readers", () => {
 				)._nay,
 			).toBeUndefined();
 			await t.action(internal.transcripts_worker.run_channel, { channelId });
-			if (outcome === "committed" || outcome === "source-changed") {
+			if (outcome === "committed" || outcome === "source-changed" || outcome === "upgraded") {
 				remote.afterReaders(async () => {
 					if (outcome === "source-changed") {
 						await t.run(async (ctx) => {
@@ -933,6 +991,7 @@ describe("transcript readers", () => {
 				await t.action(internal.transcripts_worker.run_channel, { channelId });
 			}
 			remote.expireToken(outcome === "forgotten");
+			if (outcome === "upgraded") remote.upgrade();
 			expect((await reconnect()).error).toBeNull();
 			await alice.mutation(api.transcripts.retry, { channelId });
 			await drain();
@@ -1137,6 +1196,395 @@ describe("transcript readers", () => {
 		expect(
 			(await alice.query(api.channel_members.status, { channelId, clientRequestId: "invite-charlie" }))?.status,
 		).toBe("cancelled");
+	});
+});
+
+describe("private transcript deletion", () => {
+	test("copies an accepted message before archiving its transcript", async () => {
+		const { alice, channelId, channel, remote, send, drain, drainDeletion } = await fixture(true);
+		await send("Already copied");
+		await drain();
+		await send("Saved just before deletion");
+		await alice.mutation(api.channel_members.delete_channel, {
+			channelId,
+			clientRequestId: "delete-with-pending-copy",
+			expectedMembershipRevision: 1,
+		});
+
+		await drainDeletion();
+		const path = `${ROOT}/private/${channel.transcriptSlug}/${channel.transcriptSlug}.md`;
+		expect(remote.archived.get(path)?.content).toContain("Saved just before deletion");
+		expect(remote.readers()).toEqual([]);
+		expect(await alice.query(api.messages.latest_roots, { channelId })).toBeNull();
+	});
+
+	test("keeps copy recovery visible after private access is removed", async () => {
+		const { t, alice, channelId, channel, remote, send, drain, drainDeletion, reconnect } = await fixture(true);
+		const message = await send("Before manual replacement");
+		await drain();
+		const path = `${ROOT}/private/${channel.transcriptSlug}/${channel.transcriptSlug}.md`;
+		remote.files.get(path)!.content = "A manual replacement";
+		remote.files.get(path)!.revision = "manual";
+		await alice.mutation(api.messages.edit, {
+			messageId: message.messageId,
+			expectedRevision: 1,
+			clientRequestId: "edit-before-delete",
+			text: "Accepted edit",
+			mentions: [],
+		});
+		await drain(true);
+		await alice.mutation(api.channel_members.delete_channel, {
+			channelId,
+			clientRequestId: "delete-with-blocked-copy",
+			expectedMembershipRevision: 1,
+		});
+
+		for (let step = 0; step < 20; step++) await t.action(internal.transcripts_worker.run_channel, { channelId });
+		expect(remote.readers()).toEqual([]);
+		expect(remote.archived.size).toBe(0);
+		expect((await alice.query(api.transcripts.status, { channelId }))?.status).toBe("blocked");
+		expect(
+			(
+				await alice.query(api.transcripts.list_deletions, {
+					paginationOpts: { cursor: null, numItems: 10 },
+				})
+			).page,
+		).toEqual([{ channelId, name: channel.name }]);
+		expect((await reconnect()).error).toBeNull();
+		expect(
+			(
+				await alice.mutation(api.transcripts.reconcile, {
+					channelId,
+					clientRequestId: "rebuild-deleted-copy",
+				})
+			)._nay,
+		).toBeUndefined();
+		await drainDeletion();
+		expect(remote.archived.get(path)?.content).toContain("Accepted edit");
+		expect(
+			(
+				await alice.query(api.transcripts.list_deletions, {
+					paginationOpts: { cursor: null, numItems: 10 },
+				})
+			).page,
+		).toEqual([]);
+	});
+
+	test("a rebuild folds the deletion before it publishes, but archives only after publication", async () => {
+		const { t, alice, channelId, channel, remote, send, drain, drainDeletion } = await fixture(true);
+		await send("Initial text");
+		await drain();
+		await send("Pending before rebuild");
+		await alice.mutation(api.channel_members.delete_channel, {
+			channelId,
+			clientRequestId: "delete-before-rebuild",
+			expectedMembershipRevision: 1,
+		});
+		await alice.mutation(api.transcripts.reconcile, { channelId, clientRequestId: "rebuild-through-deletion" });
+		await drainDeletion();
+		const path = `${ROOT}/private/${channel.transcriptSlug}/${channel.transcriptSlug}.md`;
+		expect(remote.archived.get(path)?.content).toContain("Pending before rebuild");
+		const state = await t.run(async (ctx) => await ctx.db.query("transcript_channels").first());
+		expect(state?.appliedSequence).toBe(state?.desiredSequence);
+	});
+
+	test("archives more than 256 known parts in bounded steps and keeps unrelated files", async () => {
+		const { t, alice, channelId, channel, remote, send, drain, drainDeletion } = await fixture(true);
+		await send("First part");
+		await drain();
+		const folder = `${ROOT}/private/${channel.transcriptSlug}`;
+		remote.files.set(`${folder}/unrelated.md`, { nodeId: "unrelated", revision: "manual", content: "Keep this file" });
+		await t.run(async (ctx) => {
+			for (let order = 1; order <= 260; order++) {
+				const path = `${folder}/${channel.transcriptSlug}-${order}.md`;
+				const file = { nodeId: `part-${order}`, content: `Part ${order}`, revision: `part-${order}` };
+				remote.files.set(path, file);
+				await ctx.db.insert("transcript_files", {
+					channelId,
+					order,
+					path,
+					nodeId: file.nodeId,
+					contentRevision: file.revision,
+					content: file.content,
+					header: "",
+					active: true,
+				});
+			}
+		});
+		await alice.mutation(api.channel_members.delete_channel, {
+			channelId,
+			clientRequestId: "delete-many-parts",
+			expectedMembershipRevision: 1,
+		});
+		for (let step = 0; step < 12; step++) {
+			const before = remote.archived.size;
+			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			expect(remote.archived.size - before).toBeLessThanOrEqual(1);
+		}
+		await drainDeletion();
+		expect(remote.archived.size).toBe(261);
+		expect(remote.files.get(`${folder}/unrelated.md`)?.content).toBe("Keep this file");
+	});
+
+	test("replays a lost file archive response and keeps manual text", async () => {
+		const { t, alice, channelId, channel, remote, send, drain, drainDeletion, reconnect } = await fixture(true);
+		await send("Copied text");
+		await drain();
+		const path = `${ROOT}/private/${channel.transcriptSlug}/${channel.transcriptSlug}.md`;
+		remote.files.get(path)!.content += "\nManual note to preserve";
+		remote.files.get(path)!.revision = "manual-note";
+		remote.loseArchive();
+		await alice.mutation(api.channel_members.delete_channel, {
+			channelId,
+			clientRequestId: "delete-lost-response",
+			expectedMembershipRevision: 1,
+		});
+		for (let step = 0; step < 30; step++) {
+			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			if ((await alice.query(api.transcripts.status, { channelId }))?.error) break;
+		}
+		const before = await t.run(async (ctx) => await ctx.db.query("transcript_deletions").first());
+		expect(before?.error).toContain("Archive response lost");
+		expect(before?.prepared).not.toBeNull();
+		expect(
+			(
+				await alice.mutation(api.transcripts.reconcile, {
+					channelId,
+					clientRequestId: "cannot-rebuild-archive",
+				})
+			)._nay?.message,
+		).toContain("being archived");
+		expect((await reconnect()).error).toBeNull();
+		expect((await alice.mutation(api.transcripts.retry, { channelId }))._nay).toBeUndefined();
+		await drainDeletion();
+		expect(remote.archived.size).toBe(1);
+		expect(remote.archived.get(path)?.content).toContain("Manual note to preserve");
+		expect(remote.receipts.has(before!.prepared!.operationId)).toBe(true);
+	});
+
+	test("the sweep resumes an expired archive claim and ignores its late completion", async () => {
+		const { t, alice, channelId, remote, send, drain, drainDeletion } = await fixture(true);
+		await send("Survive a stopped worker");
+		await drain();
+		await alice.mutation(api.channel_members.delete_channel, {
+			channelId,
+			clientRequestId: "delete-before-worker-stops",
+			expectedMembershipRevision: 1,
+		});
+		for (let step = 0; step < 20; step++) {
+			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			const state = await t.run(async (ctx) => await ctx.db.query("transcript_channels").first());
+			if (state?.appliedSequence === state?.desiredSequence) break;
+		}
+		const original = (await t.mutation(internal.transcripts_deletions.claim, { channelId }))!;
+		expect(original.deletion.prepared).not.toBeNull();
+		expect(remote.archived.size).toBe(0);
+		vi.setSystemTime(Date.now() + 60_001);
+		const beforeSweep = await t.run(
+			async (ctx) => (await ctx.db.system.query("_scheduled_functions").collect()).length,
+		);
+		await t.mutation(internal.transcripts_worker.sweep, {});
+		const scheduled = await t.run(async (ctx) => await ctx.db.system.query("_scheduled_functions").collect());
+		expect(scheduled.slice(beforeSweep).some((job) => job.name === "transcripts_worker:run_channel")).toBe(true);
+		const resumed = (await t.mutation(internal.transcripts_deletions.claim, { channelId }))!;
+		expect(resumed.deletion.prepared).toEqual(original.deletion.prepared);
+		expect(resumed.deletion.claim).not.toBe(original.deletion.claim);
+		await t.mutation(internal.transcripts_deletions.release, {
+			deletionId: original.deletion._id,
+			claim: original.deletion.claim,
+			error: null,
+		});
+		const afterLateRelease = (await t.run(
+			async (ctx) => await ctx.db.get("transcript_deletions", original.deletion._id),
+		))!;
+		expect(afterLateRelease.prepared).toEqual(original.deletion.prepared);
+		expect(afterLateRelease.cursor).toBe(-1);
+		vi.setSystemTime(Date.now() + 60_001);
+		await drainDeletion();
+		expect(remote.archived.size).toBe(1);
+	});
+
+	test("manual sharing leaves remaining transcript files active", async () => {
+		const { t, alice, channelId, channel, remote, send, drain, drainDeletion, reconnect } = await fixture(true);
+		await send("Keep this manual copy");
+		await drain();
+		await alice.mutation(api.channel_members.delete_channel, {
+			channelId,
+			clientRequestId: "delete-then-manual-sharing",
+			expectedMembershipRevision: 1,
+		});
+		for (let step = 0; step < 10; step++) {
+			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			if (await t.run(async (ctx) => await ctx.db.query("transcript_deletions").first())) break;
+		}
+		remote.detach();
+		expect((await reconnect()).error).toBeNull();
+		await drainDeletion();
+		expect(remote.archived.size).toBe(0);
+		expect(
+			remote.files.get(`${ROOT}/private/${channel.transcriptSlug}/${channel.transcriptSlug}.md`)?.content,
+		).toContain("Keep this manual copy");
+	});
+
+	test("limits deleted-copy recovery to the owner or the original actor's current membership", async () => {
+		const { t, alice, channelId, installationId, remote, send, drain } = await fixture(true);
+		await send("Private text");
+		await drain();
+		await t.run(async (ctx) => {
+			const session = (await ctx.db.query("sessions").first())!;
+			await ctx.db.patch("sessions", session._id, { isOwner: false });
+			const actor = (await ctx.db
+				.query("workspace_members")
+				.withIndex("by_installation_hostUserId", (q) =>
+					q.eq("installationId", installationId).eq("hostUserId", "alice"),
+				)
+				.unique())!;
+			await ctx.db.patch("workspace_members", actor._id, { isOwner: false });
+			const { _id, _creationTime, ...fields } = session;
+			await ctx.db.insert("sessions", {
+				...fields,
+				hostSessionId: "session-bob",
+				exchangeId: "exchange-bob",
+				hostUserId: "bob",
+				hostMembershipId: "membership-bob",
+				isOwner: false,
+			});
+		});
+		const bob = t.withIdentity({
+			issuer: "https://press.test/plugins/chitchat",
+			subject: "session-bob",
+			exchangeId: "exchange-bob",
+		});
+		remote.afterReaders(async () => remote.denyWrites());
+		await alice.mutation(api.channel_members.delete_channel, {
+			channelId,
+			clientRequestId: "delete-as-manager",
+			expectedMembershipRevision: 1,
+		});
+		for (let step = 0; step < 20; step++) await t.action(internal.transcripts_worker.run_channel, { channelId });
+		const paginationOpts = { cursor: null, numItems: 10 };
+		expect((await alice.query(api.transcripts.list_deletions, { paginationOpts })).page).toHaveLength(1);
+		expect((await alice.query(api.transcripts.status, { channelId }))?.canConnect).toBe(true);
+		expect((await bob.query(api.transcripts.list_deletions, { paginationOpts })).page).toEqual([]);
+		expect(await bob.query(api.transcripts.status, { channelId })).toBeNull();
+		expect((await bob.mutation(api.transcripts.retry, { channelId }))._nay).toBeDefined();
+		expect(await alice.query(api.messages.latest_roots, { channelId })).toBeNull();
+
+		await t.run(async (ctx) => {
+			for (const session of await ctx.db.query("sessions").collect())
+				await ctx.db.patch(
+					"sessions",
+					session._id,
+					session.hostUserId === "bob" ? { isOwner: true } : { membershipLifetime: 2 },
+				);
+			for (const member of await ctx.db.query("workspace_members").collect()) {
+				if (member.hostUserId === "bob") await ctx.db.patch("workspace_members", member._id, { isOwner: true });
+				if (member.hostUserId === "alice")
+					await ctx.db.patch("workspace_members", member._id, { membershipLifetime: 2 });
+			}
+		});
+		expect((await bob.query(api.transcripts.list_deletions, { paginationOpts })).page).toHaveLength(1);
+		expect((await bob.query(api.transcripts.status, { channelId }))?.canConnect).toBe(true);
+		expect((await alice.query(api.transcripts.list_deletions, { paginationOpts })).page).toEqual([]);
+		expect(await alice.query(api.transcripts.status, { channelId })).toBeNull();
+		expect((await alice.mutation(api.transcripts.retry, { channelId }))._nay).toBeDefined();
+	});
+
+	test.each([true, false])(
+		"last-member cleanup keeps owner recovery when a destination is saved: %s",
+		async (hasDestination) => {
+			const { t, alice, channelId, installationId, remote, send, drain, drainDeletion, reconnect } =
+				await fixture(true);
+			await send("Copy before workspace departure");
+			if (hasDestination) await drain();
+			remote.expireToken(true);
+			await t.run(async (ctx) => {
+				await ctx.db.patch("installations", installationId, { organizationOwnerUserId: "charlie" });
+				if (!hasDestination) {
+					const destination = (await ctx.db.query("transcript_destinations").first())!;
+					await ctx.db.delete("transcript_destinations", destination._id);
+				}
+				const session = (await ctx.db.query("sessions").first())!;
+				const { _id, _creationTime, ...fields } = session;
+				await ctx.db.insert("sessions", {
+					...fields,
+					hostSessionId: "session-charlie",
+					exchangeId: "exchange-charlie",
+					hostUserId: "charlie",
+					hostMembershipId: "membership-charlie",
+					isOwner: true,
+				});
+				for (const member of await ctx.db.query("workspace_members").collect()) {
+					if (member.hostUserId === "charlie") await ctx.db.patch("workspace_members", member._id, { isOwner: true });
+					else await ctx.db.patch("workspace_members", member._id, { active: false, membershipLifetime: 2 });
+				}
+				await channel_members_remove_host_member(ctx, { installationId, hostUserId: "bob", membershipLifetime: 2 });
+				await channel_members_remove_host_member(ctx, { installationId, hostUserId: "alice", membershipLifetime: 2 });
+			});
+			const queued = await t.run(async (ctx) => ({
+				deletion: await ctx.db.query("transcript_deletions").first(),
+				progress: await ctx.db.query("transcript_channels").first(),
+			}));
+			expect(queued.deletion?.barrier).toBe(queued.progress?.desiredSequence);
+			expect(queued.deletion?.archiveStartedAt).toBeNull();
+			for (let step = 0; step < 30; step++) await t.action(internal.transcripts_worker.run_channel, { channelId });
+			const deletion = await t.run(async (ctx) => await ctx.db.query("transcript_deletions").first());
+			expect(deletion?.actorHostUserId).toBeNull();
+			expect(deletion?.completedAt).toBeNull();
+			expect(remote.archived.size).toBe(0);
+			expect(remote.readers()).toHaveLength(2);
+			const charlie = t.withIdentity({
+				issuer: "https://press.test/plugins/chitchat",
+				subject: "session-charlie",
+				exchangeId: "exchange-charlie",
+			});
+			expect(
+				(await charlie.query(api.transcripts.list_deletions, { paginationOpts: { cursor: null, numItems: 10 } })).page,
+			).toHaveLength(1);
+			expect((await charlie.query(api.transcripts.status, { channelId }))?.canConnect).toBe(true);
+			expect(await charlie.query(api.messages.latest_roots, { channelId })).toBeNull();
+			expect(await alice.query(api.transcripts.status, { channelId })).toBeNull();
+			expect((await reconnect(channelId, "charlie")).error).toBeNull();
+			expect((await charlie.mutation(api.transcripts.retry, { channelId }))._nay).toBeUndefined();
+			await drainDeletion();
+			expect(remote.readers()).toEqual([]);
+			expect(remote.archived.size).toBe(1);
+			expect([...remote.archived.values()][0]!.content).toContain("Copy before workspace departure");
+			expect(
+				(
+					await charlie.query(api.transcripts.list_deletions, {
+						paginationOpts: { cursor: null, numItems: 10 },
+					})
+				).page,
+			).toEqual([]);
+		},
+	);
+
+	test("last-member cleanup does not offer Files recovery when no connection was started", async () => {
+		const { t, alice, installationId } = await fixture();
+		const created = await alice.mutation(api.channels.create, {
+			clientRequestId: "never-connected",
+			name: "No Files copy",
+			topic: "",
+			visibility: "private",
+			invitedUserIds: ["bob"],
+		});
+		if (created._yay?.kind !== "channel") throw new Error("Channel creation failed");
+		const channelId = created._yay.channelId;
+		await t.run(async (ctx) => {
+			await channel_members_remove_host_member(ctx, { installationId, hostUserId: "bob", membershipLifetime: 2 });
+			await channel_members_remove_host_member(ctx, { installationId, hostUserId: "alice", membershipLifetime: 2 });
+		});
+		await t.action(internal.transcripts_worker.run_channel, { channelId });
+		const state = await t.run(async (ctx) => ({
+			channel: await ctx.db.get("channels", channelId),
+			deletion: await ctx.db
+				.query("transcript_deletions")
+				.withIndex("by_channel", (q) => q.eq("channelId", channelId))
+				.unique(),
+		}));
+		expect(state.channel?.deletedAt).not.toBeNull();
+		expect(state.deletion).toBeNull();
 	});
 });
 

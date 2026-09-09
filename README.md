@@ -27,6 +27,10 @@ An exact successful request can be checked again without writing twice. Reusing 
 
 Queries use indexes and bounded pages. The live message head has at most 50 messages. History keeps at most five root pages and two reply pages. Each pane has a 3 MiB retained-message limit. Dropped pages remain reachable through older/newer controls. New arrivals while reading older history offer a return to the latest messages.
 
+One open edit per pane stays mounted when its message leaves the loaded window. The draft keeps the revision and mentions from when Edit opened. If another client saves first, Save returns a conflict and keeps the draft. A real access loss clears protected content.
+
+The main log marks only visible roots read. A narrow thread covers that log and stops its read updates. Replies have separate per-thread read positions. The channel reply position advances only through replies covered by those thread positions, in bounded steps. Reading one thread cannot clear another thread's unread replies. Existing read positions remain the baseline; the app does not guess what people saw before this fix.
+
 Channel and overview pages request at most 50 entries; the member picker requests at most 100. Empty filtered pages keep their continuation cursor. The name cache holds at most 1,000 entries for five minutes. Partial unread totals show a plus sign.
 
 ## Press login and access
@@ -77,6 +81,10 @@ Removing workspace chat read permission does not revoke a separate Files grant w
 
 Once Files setup has started, private reader changes wait for its acknowledgement before chat opens under the new access. Before any Files connection exists, they may complete locally. If authority changes during a Files step, the saved reader operation must be rolled back safely or cancelled under its original operation ID before a delayed apply can arrive. Current file locks still apply. A missing proof or newer file state keeps sync blocked. Manual sharing is acknowledged without changing it.
 
+After a plugin upgrade or account rebind, Reconnect can settle the saved reader operation with a new sealed grant for the same installation and exact root. The current person and account must have Files write and sharing-management access. Old credentials cannot authorize new changes. Recovery still checks locks, labels, exact writer and reader revisions, and membership lifetimes.
+
+Private deletion removes chat access first. It then finishes all transcript copies through the saved deletion sequence. Only after those copies finish does it archive each saved transcript file, one file per worker step. Each archive request is saved before sending, so a lost reply can be retried exactly. The folder and unrelated files remain in Files. Archiving keeps the current text, including manual edits; it does not replace content. A current lock or missing permission blocks the next step. Manual sharing stops automatic archive.
+
 ## Configuration
 
 The current development projects are separate:
@@ -121,5 +129,9 @@ The SDK is pinned to a real mirror commit. Review the host and SDK changes first
 After native chat has accepted messages, keep its database and transcript queue. Fix and release the current app. Do not restore the old generic-store plugin or import old Markdown copies as chat; that would hide messages saved since the rebuild.
 
 Use **Retry sync** after a temporary Files failure. Use **Reconnect Files** when its connection needs renewal, including after a plugin update. Both still check current permissions and locks. They never restore removed account grants or overwrite manual sharing. **Rebuild copies** requires explicit confirmation before replacing manual text.
+
+Unfinished private deletion appears in **Files sync** for the current owner or the original delete actor with the same active membership lifetime. This view shows copy progress and recovery controls. It does not reopen deleted messages. Rebuild remains available while copies are pending and stops being available when file archiving starts. A scheduled sweep also resumes interrupted archive work.
+
+When the last channel member leaves the workspace, cleanup saves owner recovery before trying to update Files readers. This lets a current owner reconnect if the old sponsor can no longer write. A channel that never started Files setup needs no recovery entry.
 
 Verify access, pending jobs, and the served bundle after a repair. Uninstall is not a temporary pause: it retires the installation's authority. Never uninstall, reset the plugin registry, or wipe Press as a shortcut to recover this plugin.

@@ -316,6 +316,36 @@ afterEach(() => {
 });
 
 describe("App", () => {
+	test("keeps Files recovery reachable after a channel is deleted", async () => {
+		fake.overrides.set("transcripts:list_deletions", {
+			page: [{ channelId: "deleted-channel", name: "Old team" }],
+			continueCursor: "",
+			isDone: true,
+		});
+		fake.overrides.set("transcripts:status", {
+			status: "blocked",
+			deletionPhase: "copy",
+			canConnect: true,
+			canReconcile: false,
+			indexStatus: "ready",
+			folderPath: "/chitchat/private/old-team",
+			folderNodeId: "folder",
+			readerMode: "attached",
+			error: "File is locked",
+		});
+		render(<App client={client()} />);
+		fireEvent.click(screen.getByRole("button", { name: "Files sync" }));
+		expect(screen.getByRole("heading", { name: "#Old team" })).toBeTruthy();
+		expect(screen.getByText("Channel deleted. Its Files copies need attention.")).toBeTruthy();
+		fireEvent.click(screen.getByRole("button", { name: "Retry sync" }));
+		await waitFor(() =>
+			expect(fake.mutation).toHaveBeenCalledWith("transcripts:retry", { channelId: "deleted-channel" }),
+		);
+		fake.overrides.set("transcripts:list_deletions", { page: [], continueCursor: "", isDone: true });
+		publish();
+		expect(screen.getByText("No deleted channel copies need attention on this page.")).toBeTruthy();
+		expect(screen.queryByRole("button", { name: "Retry sync" })).toBeNull();
+	});
 	test("keeps channel pages, menu choices, and focus through a verified refresh", async () => {
 		fake.channels.push(
 			channel("archived", { archivedAt: 2 }),
@@ -925,6 +955,31 @@ describe("App", () => {
 			await vi.advanceTimersByTimeAsync(5000);
 		});
 		expect(fake.mutation.mock.calls.filter(([name]) => name === "read_states:mark_read")).toHaveLength(1);
+	});
+	test("stops thread read retries when the private channel is no longer readable", async () => {
+		vi.useFakeTimers();
+		fake.mutation.mockImplementation(async (name: string) =>
+			name === "read_states:mark_thread_read" ? { _nay: { message: "Try again" } } : { _yay: null },
+		);
+		render(<App client={client()} />);
+		await act(async () => {
+			fireEvent.click(screen.getByRole("button", { name: "#private-room (private)" }));
+		});
+		await act(async () => {
+			fireEvent.click(screen.getByRole("button", { name: "Reply in thread" }));
+		});
+		const before = fake.mutation.mock.calls.filter(([name]) => name === "read_states:mark_thread_read").length;
+		expect(before).toBeGreaterThan(0);
+		fake.channels = (fake.channels as Doc<"channels">[]).filter((entry) => entry.visibility !== "private");
+		fake.overrides.set("messages:latest_roots", null);
+		fake.overrides.set("messages:latest_replies", null);
+		fake.overrides.set("messages:get", null);
+		publish();
+		expect(screen.queryByText("Message in private-room")).toBeNull();
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(5000);
+		});
+		expect(fake.mutation.mock.calls.filter(([name]) => name === "read_states:mark_thread_read")).toHaveLength(before);
 	});
 	test("stops read retries during a disconnected lease and resumes after reconnect", async () => {
 		vi.useFakeTimers();

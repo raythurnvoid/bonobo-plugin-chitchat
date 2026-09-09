@@ -147,6 +147,7 @@ export async function channels_queue_transcript(
 		error: null,
 	});
 	await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, { channelId });
+	return sequence;
 }
 
 export async function channels_queue_index(ctx: MutationCtx, channel: Doc<"channels">) {

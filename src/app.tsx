@@ -311,6 +311,42 @@ function ThreadsView(props: {
 	);
 }
 
+function TranscriptDeletionsView(props: {
+	client: BonoboClient;
+	scopeKey: string;
+	session: ReturnType<typeof use_chat_session>;
+}) {
+	const page = use_chat_page(props.scopeKey);
+	const rows = use_chat_query(props.session, api.transcripts.list_deletions, {
+		paginationOpts: { numItems: 20, cursor: page.cursor },
+	});
+	return (
+		<section className="view" aria-label="Files sync">
+			<header className="view-head">
+				<h2 className="view-title">Deleted channel copies</h2>
+			</header>
+			<p className="view-note">Finish saving and archiving the Files copies for deleted channels.</p>
+			{!rows ? (
+				<p className="channel-status" role="status">
+					Checking Files sync…
+				</p>
+			) : rows.page.length === 0 ? (
+				<p className="channel-status">No deleted channel copies need attention on this page.</p>
+			) : (
+				<ul className="view-rows">
+					{rows.page.map((row) => (
+						<li key={row.channelId} className="view-row">
+							<h3 className="view-row-title">#{row.name}</h3>
+							<TranscriptStatus client={props.client} channelId={row.channelId} />
+						</li>
+					))}
+				</ul>
+			)}
+			<ChatPageControls page={page} result={rows} label="Deleted channel copies" />
+		</section>
+	);
+}
+
 // #endregion overview views
 
 // #region sidebar
@@ -444,6 +480,59 @@ export class ChatErrorBoundary extends Component<{ client: BonoboClient; childre
 	}
 }
 
+function use_read_position(
+	position:
+		| ({ scopeKey: string } & (
+				| { channelId: Id<"channels">; rootSequence: number }
+				| { rootMessageId: Id<"messages">; replySequence: number }
+		  ))
+		| null,
+	enabled: boolean,
+) {
+	const convex = useConvex();
+	const [retryVersion, setRetryVersion] = useState(0);
+	const failures = useRef(0);
+	const saved = useRef<string | null>(null);
+	useEffect(() => {
+		if (!position || !enabled) return;
+		const key = JSON.stringify(position);
+		if (saved.current === key) return;
+		let cancelled = false;
+		let retryTimer: ReturnType<typeof setTimeout> | undefined;
+		const retry = () => {
+			if (cancelled) return;
+			failures.current += 1;
+			retryTimer = setTimeout(
+				() => setRetryVersion((value) => value + 1),
+				Math.min(30_000, 1000 * 2 ** Math.min(failures.current - 1, 5)),
+			);
+		};
+		const request =
+			"rootMessageId" in position
+				? convex.mutation(api.read_states.mark_thread_read, {
+						rootMessageId: position.rootMessageId,
+						replySequence: position.replySequence,
+					})
+				: convex.mutation(api.read_states.mark_read, {
+						channelId: position.channelId,
+						rootSequence: position.rootSequence,
+					});
+		void request
+			.then((result) => {
+				if ("_nay" in result) retry();
+				else if (!cancelled) {
+					saved.current = key;
+					failures.current = 0;
+				}
+			})
+			.catch(retry);
+		return () => {
+			cancelled = true;
+			if (retryTimer) clearTimeout(retryTimer);
+		};
+	}, [convex, position, enabled, retryVersion]);
+}
+
 export function App(props: { client: BonoboClient }) {
 	const convex = useConvex();
 	const session = use_chat_session();
@@ -475,7 +564,7 @@ export function App(props: { client: BonoboClient }) {
 	);
 	const [selection, setSelection] = useState<
 		| { kind: "channel"; id: Id<"channels">; openedAtReadSequence: number }
-		| { kind: "unreads" | "activity" | "threads" }
+		| { kind: "unreads" | "activity" | "threads" | "transcripts" }
 		| null
 	>(null);
 	const [threadRootId, setThreadRootId] = useState<Id<"messages"> | null>(null);
@@ -484,12 +573,15 @@ export function App(props: { client: BonoboClient }) {
 	const [railExpanded, setRailExpanded] = useState(false);
 	const [isNarrow, setIsNarrow] = useState(() => window.matchMedia("(max-width: 719px)").matches);
 	const [sendRequests, setSendRequests] = useState(0);
-	const [readRetry, setReadRetry] = useState(0);
-	const readFailures = useRef(0);
 	const [announcement, setAnnouncement] = useState({ sequence: 0, text: "" });
 	const [desiredRead, setDesiredRead] = useState<{
+		scopeKey: string;
 		channelId: Id<"channels">;
 		rootSequence: number;
+	} | null>(null);
+	const [desiredThreadRead, setDesiredThreadRead] = useState<{
+		scopeKey: string;
+		rootMessageId: Id<"messages">;
 		replySequence: number;
 	} | null>(null);
 	// Keep covered panes mounted so resizing does not discard drafts.
@@ -508,7 +600,6 @@ export function App(props: { client: BonoboClient }) {
 	const focusOwner = useRef<"sidebar" | "drawer" | "separator" | "main" | null>(null);
 	const pendingFocus = useRef<"drawer" | "thread" | "selected" | null>(null);
 	const selectionRequest = useRef(0);
-	const lastReadWrite = useRef<string | null>(null);
 	useEffect(() => {
 		// A late read must not reopen a channel from an expired membership.
 		selectionRequest.current += 1;
@@ -550,58 +641,52 @@ export function App(props: { client: BonoboClient }) {
 	const onRequestStart = useCallback(() => setSendRequests((count) => count + 1), []);
 	const onRequestSettled = useCallback(() => setSendRequests((count) => Math.max(0, count - 1)), []);
 	const onObservedRead = useCallback(
-		(position: { rootSequence: number; replySequence: number }) => {
+		(position: { rootSequence: number }) => {
 			if (!selectedId) return;
 			setDesiredRead((current) =>
 				current?.channelId === selectedId &&
-				current.rootSequence >= position.rootSequence &&
-				current.replySequence >= position.replySequence
+				current.scopeKey === scopeKey &&
+				current.rootSequence >= position.rootSequence
 					? current
 					: {
+							scopeKey,
 							channelId: selectedId,
 							rootSequence: Math.max(
-								current?.channelId === selectedId ? current.rootSequence : 0,
+								current?.channelId === selectedId && current.scopeKey === scopeKey ? current.rootSequence : 0,
 								position.rootSequence,
-							),
-							replySequence: Math.max(
-								current?.channelId === selectedId ? current.replySequence : 0,
-								position.replySequence,
 							),
 						},
 			);
 		},
-		[selectedId],
+		[selectedId, scopeKey],
 	);
-	useEffect(() => {
-		if (!desiredRead || desiredRead.channelId !== selected?._id || !session.connected || !session.can_request_now())
-			return;
-		const key = JSON.stringify(desiredRead);
-		if (lastReadWrite.current === key) return;
-		lastReadWrite.current = key;
-		let cancelled = false;
-		let retryTimer: ReturnType<typeof setTimeout> | undefined;
-		const retry = () => {
-			if (cancelled || lastReadWrite.current !== key) return;
-			lastReadWrite.current = null;
-			readFailures.current += 1;
-			retryTimer = setTimeout(
-				() => setReadRetry((value) => value + 1),
-				Math.min(30_000, 1000 * 2 ** Math.min(readFailures.current - 1, 5)),
+	const onObservedThreadRead = useCallback(
+		(position: { rootMessageId: Id<"messages">; replySequence: number }) => {
+			setDesiredThreadRead((current) =>
+				current?.scopeKey === scopeKey &&
+				current.rootMessageId === position.rootMessageId &&
+				current.replySequence >= position.replySequence
+					? current
+					: { scopeKey, ...position },
 			);
-		};
-		void convex
-			.mutation(api.read_states.mark_read, desiredRead)
-			.then((result) => {
-				if ("_nay" in result) retry();
-				else readFailures.current = 0;
-			})
-			.catch(retry);
-		return () => {
-			cancelled = true;
-			if (retryTimer) clearTimeout(retryTimer);
-			if (lastReadWrite.current === key) lastReadWrite.current = null;
-		};
-	}, [convex, desiredRead, selected?._id, session.connected, session.can_request_now, readRetry]);
+		},
+		[scopeKey],
+	);
+	use_read_position(
+		desiredRead,
+		desiredRead?.scopeKey === scopeKey &&
+			session.connected &&
+			session.can_request_now() &&
+			desiredRead?.channelId === selected?._id,
+	);
+	use_read_position(
+		desiredThreadRead,
+		desiredThreadRead?.scopeKey === scopeKey &&
+			session.connected &&
+			session.can_request_now() &&
+			!!selected &&
+			desiredThreadRead?.rootMessageId === threadRootId,
+	);
 
 	const open_channel = useCallback(
 		async (entry: Doc<"channels">, rootId?: Id<"messages">) => {
@@ -768,7 +853,7 @@ export function App(props: { client: BonoboClient }) {
 						</button>
 					</div>
 					<ul className="view-list" aria-label="Views">
-						{(["unreads", "threads", "activity"] as const).map((kind) => (
+						{(["unreads", "threads", "activity", "transcripts"] as const).map((kind) => (
 							<li key={kind} className="view-item">
 								<button
 									type="button"
@@ -784,13 +869,15 @@ export function App(props: { client: BonoboClient }) {
 										setSelection({ kind });
 										setThreadRootId(null);
 										setDrawerOpen(false);
-										announce(`Opened ${kind}`);
+										announce(`Opened ${kind === "transcripts" ? "Files sync" : kind}`);
 									}}
 								>
 									<span className="channel-initial" aria-hidden="true">
-										{kind[0].toUpperCase()}
+										{kind === "transcripts" ? "F" : kind[0].toUpperCase()}
 									</span>
-									<span className="channel-name">{kind[0].toUpperCase() + kind.slice(1)}</span>
+									<span className="channel-name">
+										{kind === "transcripts" ? "Files sync" : kind[0].toUpperCase() + kind.slice(1)}
+									</span>
 									{kind === "unreads" && unreadCount > 0 ? (
 										<span className="mention-badge">
 											{unreadCount}
@@ -867,6 +954,8 @@ export function App(props: { client: BonoboClient }) {
 					/>
 				) : selection?.kind === "threads" ? (
 					<ThreadsView scopeKey={scopeKey} session={session} memberNames={memberNames} onOpen={open_channel} />
+				) : selection?.kind === "transcripts" ? (
+					<TranscriptDeletionsView client={props.client} scopeKey={scopeKey} session={session} />
 				) : selection?.kind === "channel" ? (
 					<ChannelView
 						key={`channel:${selection.id}`}
@@ -886,6 +975,7 @@ export function App(props: { client: BonoboClient }) {
 						online={session.connected}
 						openedAtReadSequence={selection.openedAtReadSequence}
 						onObservedRead={onObservedRead}
+						onObservedThreadRead={onObservedThreadRead}
 						onRequestStart={onRequestStart}
 						onRequestSettled={onRequestSettled}
 						sendInFlight={sendRequests > 0}

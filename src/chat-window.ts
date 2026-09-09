@@ -17,8 +17,13 @@ export function use_chat_window(props: {
 	retain: boolean;
 }) {
 	const replies = "rootMessageId" in props.target;
-	const byteLimit = WINDOW_BYTES - (replies ? 32 * 1024 : 0);
+	const byteLimit = WINDOW_BYTES - 32 * 1024 - (replies ? 32 * 1024 : 0);
 	const subscribed = props.enabled || props.retain;
+	const [editingMessage, setEditingMessage] = useState<Doc<"messages"> | null>(null);
+	const observedEdit = useQuery(
+		api.messages.get,
+		subscribed && editingMessage ? { messageId: editingMessage._id } : "skip",
+	);
 	const rootHead = useQuery(
 		api.messages.latest_roots,
 		subscribed && "channelId" in props.target ? props.target : "skip",
@@ -77,7 +82,18 @@ export function use_chat_window(props: {
 		(page): page is { descriptor: Page; result: PaginationResult<Doc<"messages">> } =>
 			page.result !== undefined && !(page.result instanceof Error),
 	);
-	const loadedRows = window === null ? (head?.messages ?? []) : readyPages.flatMap((page) => page.result.page);
+	const pageRows = window === null ? (head?.messages ?? []) : readyPages.flatMap((page) => page.result.page);
+	const pinned = observedEdit === undefined ? editingMessage : observedEdit;
+	const pinBelongsToWindow =
+		pinned &&
+		("rootMessageId" in props.target
+			? pinned.rootMessageId === props.target.rootMessageId
+			: pinned.rootMessageId === null);
+	// Keep the edited entry under the same React parent when its normal page leaves the window.
+	const loadedRows =
+		pinBelongsToWindow && pinned.deletedAt === null && !pageRows.some((doc) => doc._id === pinned._id)
+			? [...pageRows, pinned].sort((left, right) => right.sequence - left.sequence)
+			: pageRows;
 	const rows = props.retain ? retained.current.rows : denied ? [] : props.enabled ? loadedRows : [];
 	const bytes = new TextEncoder().encode(JSON.stringify({ rows, head })).byteLength;
 	const lastPage = readyPages.at(-1);
@@ -85,6 +101,15 @@ export function use_chat_window(props: {
 		props.enabled &&
 		observedHead !== null &&
 		(head === null || pages.some((page) => results[String(page.descriptor.id)] === undefined));
+
+	useEffect(() => {
+		if (
+			(!props.enabled && !props.retain) ||
+			denied ||
+			(!props.retain && (observedEdit === null || observedEdit?.deletedAt != null))
+		)
+			setEditingMessage(null);
+	}, [props.enabled, props.retain, denied, observedEdit]);
 
 	useEffect(() => {
 		if (!props.enabled && !props.retain) {
@@ -99,7 +124,7 @@ export function use_chat_window(props: {
 		const changed = readyPages.some(({ descriptor, result }) => !descriptor.endCursor && !result.isDone);
 		const split = readyPages.some(({ result }) => result.pageStatus === "SplitRequired");
 		if (split) {
-			const anchor = rows[0]?.sequence ?? window.anchor;
+			const anchor = pageRows[0]?.sequence ?? window.anchor;
 			setWindow({
 				anchor,
 				pages: [{ id: ++nextPageId.current, cursor: null }],
@@ -108,7 +133,7 @@ export function use_chat_window(props: {
 			});
 		} else if (bytes > byteLimit && window.pages.length > 1) {
 			// Drop the newest history page when loading older rows. It can be fetched again by sequence.
-			setWindow({ ...window, pages: window.pages.slice(1), newerAnchor: rows[0]?.sequence ?? window.anchor });
+			setWindow({ ...window, pages: window.pages.slice(1), newerAnchor: pageRows[0]?.sequence ?? window.anchor });
 		} else if (window.extend && lastPage) {
 			setWindow({
 				...window,
@@ -152,7 +177,7 @@ export function use_chat_window(props: {
 		setWindow({
 			...window,
 			pages: next.slice(-maximum),
-			newerAnchor: next.length > maximum ? (rows[0]?.sequence ?? window.anchor) : window.newerAnchor,
+			newerAnchor: next.length > maximum ? (pageRows[0]?.sequence ?? window.anchor) : window.newerAnchor,
 		});
 	};
 	const newer = () => {
@@ -168,6 +193,8 @@ export function use_chat_window(props: {
 	};
 	return {
 		rows,
+		editingMessageId: editingMessage?._id ?? null,
+		setEditingMessage,
 		denied,
 		loading,
 		error: denied

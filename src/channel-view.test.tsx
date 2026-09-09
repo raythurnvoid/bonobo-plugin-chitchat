@@ -53,7 +53,8 @@ vi.mock("convex/react", async () => {
 			const all = (name.endsWith("roots") ? roots : replies).filter((row) => row.sequence <= upper);
 			const page = all.slice(0, options.numItems);
 			result = { page, isDone: all.length <= page.length, continueCursor: String((page.at(-1)?.sequence ?? 1) - 1) };
-		} else if (name === "messages:get") result = roots.find((row) => row._id === args.messageId) ?? null;
+		} else if (name === "messages:get")
+			result = fake.readDenied ? null : ([...roots, ...replies].find((row) => row._id === args.messageId) ?? null);
 		else if (name === "reactions:get_for_message") result = [];
 		else if (name === "threads:get_summary")
 			result = { totalReplyCount: replies.length, latestReplyAt: replies[0]?.createdAt ?? null };
@@ -153,6 +154,7 @@ function props(): ChannelViewProps {
 		online: true,
 		openedAtReadSequence: 0,
 		onObservedRead: vi.fn(),
+		onObservedThreadRead: vi.fn(),
 		onRequestStart: vi.fn(),
 		onRequestSettled: vi.fn(),
 		sendInFlight: false,
@@ -361,6 +363,44 @@ describe("ChannelView", () => {
 		fireEvent.keyDown(thread, { key: "Escape" });
 		expect(initial.setThreadRootId).toHaveBeenCalledWith(null);
 	});
+	test("does not mark covered roots or unopened replies read", () => {
+		const initial = props();
+		initial.channel = { ...channel(), visibility: "private", lastReplySequence: 7 };
+		const view = render(<ChannelView {...initial} threadRootId={"message-1" as Id<"messages">} isNarrow />);
+		expect(initial.onObservedRead).not.toHaveBeenCalled();
+		view.rerender(<ChannelView {...initial} />);
+		expect(initial.onObservedRead).toHaveBeenCalledWith({ rootSequence: 1 });
+	});
+	test("marks only the visible thread head after scrolling and tab visibility changes", () => {
+		const initial = props();
+		const rootMessageId = "message-1" as Id<"messages">;
+		fake.replies = [message(1, { _id: "reply-1" as Id<"messages">, rootMessageId })];
+		render(<ChannelView {...initial} threadRootId={rootMessageId} />);
+		expect(initial.onObservedThreadRead).toHaveBeenCalledWith({ rootMessageId, replySequence: 1 });
+		vi.mocked(initial.onObservedThreadRead).mockClear();
+		const log = screen.getByRole("region", { name: "Thread" }).querySelector(".thread-replies") as HTMLDivElement;
+		Object.defineProperties(log, {
+			scrollHeight: { configurable: true, value: 1000 },
+			clientHeight: { configurable: true, value: 100 },
+		});
+		log.scrollTop = 0;
+		fireEvent.scroll(log);
+		fake.replies.unshift(message(2, { _id: "reply-2" as Id<"messages">, rootMessageId }));
+		publish();
+		expect(initial.onObservedThreadRead).not.toHaveBeenCalled();
+		log.scrollTop = 900;
+		fireEvent.scroll(log);
+		expect(initial.onObservedThreadRead).toHaveBeenCalledWith({ rootMessageId, replySequence: 2 });
+		vi.mocked(initial.onObservedThreadRead).mockClear();
+		const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+		fake.replies.unshift(message(3, { _id: "reply-3" as Id<"messages">, rootMessageId }));
+		publish();
+		expect(initial.onObservedThreadRead).not.toHaveBeenCalled();
+		visibility.mockReturnValue("visible");
+		fireEvent(document, new Event("visibilitychange"));
+		expect(initial.onObservedThreadRead).toHaveBeenCalledWith({ rootMessageId, replySequence: 3 });
+		visibility.mockRestore();
+	});
 });
 
 describe("MessageRow", () => {
@@ -471,6 +511,91 @@ describe("MessageRow", () => {
 		);
 		expect(screen.getByText("Message deleted")).toBeTruthy();
 		expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+	});
+	test("keeps an edit draft when new roots and history navigation evict its page", () => {
+		fake.roots = Array.from({ length: 350 }, (_, index) => message(350 - index, { authorHostUserId: "alice" }));
+		render(<ChannelView {...props()} />);
+		const oldRow = screen.getByText("Message 301").closest("li")!;
+		fireEvent.click(within(oldRow).getByRole("button", { name: "Edit" }));
+		const editor = screen.getByRole("textbox", { name: "Edit message" }) as HTMLTextAreaElement;
+		fireEvent.change(editor, { target: { value: "Unsaved draft" } });
+		fake.roots.unshift(message(351));
+		publish();
+		expect(screen.getByRole("textbox", { name: "Edit message" })).toBe(editor);
+		for (let i = 0; i < 5; i++) fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+		expect(screen.getByRole("textbox", { name: "Edit message" })).toBe(editor);
+		fireEvent.click(screen.getByRole("button", { name: /Latest messages/ }));
+		expect(editor.value).toBe("Unsaved draft");
+		expect(screen.getByRole("textbox", { name: "Edit message" })).toBe(editor);
+		fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+		expect(screen.queryByText("Message 301")).toBeNull();
+	});
+	test("keeps the draft revision and mentions after a newer saved edit arrives", async () => {
+		const initial = props();
+		const doc = message(1, { authorHostUserId: "alice", text: "@Bob old", mentions: ["bob"] });
+		const view = render(
+			<ul>
+				<MessageRow {...initial} doc={doc} isContinuation={false} />
+			</ul>,
+		);
+		fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+		fireEvent.change(screen.getByRole("textbox", { name: "Edit message" }), { target: { value: "@Bob my draft" } });
+		view.rerender(
+			<ul>
+				<MessageRow
+					{...initial}
+					doc={{ ...doc, revision: 2, text: "new saved edit", mentions: [] }}
+					isContinuation={false}
+				/>
+			</ul>,
+		);
+		fake.mutation.mockResolvedValueOnce({
+			_nay: { name: "conflict", message: "This message changed. Reload it before editing." },
+		});
+		fireEvent.click(screen.getByRole("button", { name: "Save" }));
+		await waitFor(() =>
+			expect(fake.mutation).toHaveBeenCalledWith(
+				"messages:edit",
+				expect.objectContaining({ expectedRevision: 1, mentions: ["bob"] }),
+			),
+		);
+		expect((screen.getByRole("textbox", { name: "Edit message" }) as HTMLTextAreaElement).value).toBe("@Bob my draft");
+		fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+		fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+		expect((screen.getByRole("textbox", { name: "Edit message" }) as HTMLTextAreaElement).value).toBe("new saved edit");
+	});
+	test("keeps one edited reply through eviction and clears it when access is refused", () => {
+		const rootMessageId = "message-1" as Id<"messages">;
+		fake.replies = Array.from({ length: 50 }, (_, index) =>
+			message(50 - index, { _id: `reply-${50 - index}` as Id<"messages">, rootMessageId, authorHostUserId: "alice" }),
+		);
+		render(<ChannelView {...props()} threadRootId={rootMessageId} />);
+		const thread = screen.getByRole("region", { name: "Thread" });
+		const reply = thread.querySelector('[data-key="reply-1"]') as HTMLElement;
+		fireEvent.click(within(reply).getByRole("button", { name: "Edit" }));
+		const editor = within(thread).getByRole("textbox", { name: "Edit message" }) as HTMLTextAreaElement;
+		fireEvent.change(editor, { target: { value: "Reply draft" } });
+		fake.replies.unshift(message(51, { _id: "reply-51" as Id<"messages">, rootMessageId, authorHostUserId: "alice" }));
+		publish();
+		expect(within(thread).getByRole("textbox", { name: "Edit message" })).toBe(editor);
+		expect(editor.value).toBe("Reply draft");
+		expect(thread.querySelectorAll(".thread-replies [data-key]")).toHaveLength(51);
+		expect(
+			within(thread)
+				.getAllByRole("button", { name: "Edit" })
+				.every((button) => (button as HTMLButtonElement).disabled),
+		).toBe(true);
+		fake.session.ready = false;
+		fake.session.refreshing = true;
+		fake.readDenied = true;
+		publish();
+		expect(within(thread).getByRole("textbox", { name: "Edit message" })).toBe(editor);
+		expect(editor.value).toBe("Reply draft");
+		fake.session.ready = true;
+		fake.session.refreshing = false;
+		fake.readDenied = true;
+		publish();
+		expect(screen.queryByRole("textbox", { name: "Edit message" })).toBeNull();
 	});
 	test("uses desired reaction state and keeps keyboard palette focus", async () => {
 		render(

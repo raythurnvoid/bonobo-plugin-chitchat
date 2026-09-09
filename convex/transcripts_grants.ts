@@ -262,6 +262,12 @@ export const save_destination = internalMutation({
 				error: null,
 				nextAttemptAt: Date.now(),
 			});
+		const deletion = await ctx.db
+			.query("transcript_deletions")
+			.withIndex("by_channel", (q) => q.eq("channelId", channel._id))
+			.unique();
+		if (deletion && deletion.completedAt === null)
+			await ctx.db.patch("transcript_deletions", deletion._id, { nextAttemptAt: Date.now(), error: null });
 		await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, { channelId: channel._id });
 		const index = await ctx.db
 			.query("transcript_indexes")

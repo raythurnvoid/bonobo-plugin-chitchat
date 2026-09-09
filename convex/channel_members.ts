@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { chat_CHANNEL_MEMBER_LIMIT, chat_member_level, chat_write_result, type chat_WriteResult } from "../shared/chat";
 import { auth_get_current_access } from "./auth";
+import { transcripts_deletions_queue } from "./transcripts_deletions";
 import {
 	channels_get_access,
 	channels_get_request,
@@ -509,12 +510,26 @@ export async function channel_members_remove_host_member(
 				membershipRevision: readerRevision,
 				deletedAt: remaining.length === 0 ? Date.now() : null,
 			});
-			await channels_queue_transcript(ctx, channel._id, {
+			const sequence = await channels_queue_transcript(ctx, channel._id, {
 				kind: "readers",
 				readerRevision,
 				readers: remaining.map((entry) => ({ userId: entry.hostUserId, membershipLifetime: entry.membershipLifetime })),
 				deleted: remaining.length === 0,
 			});
+			if (remaining.length === 0) {
+				const [connection, destination] = await Promise.all([
+					ctx.db
+						.query("host_grants")
+						.withIndex("by_channel", (q) => q.eq("channelId", channel._id))
+						.unique(),
+					ctx.db
+						.query("transcript_destinations")
+						.withIndex("by_channel", (q) => q.eq("channelId", channel._id))
+						.unique(),
+				]);
+				// The departed sponsor may be unable to remove Files readers. Keep owner recovery available now.
+				if (connection || destination) await transcripts_deletions_queue(ctx, channel, sequence, readerRevision);
+			}
 		}),
 	);
 	const cursors = await ctx.db
@@ -525,5 +540,13 @@ export async function channel_members_remove_host_member(
 		})
 		.take(20);
 	await Promise.all(cursors.map((entry) => ctx.db.delete("read_states", entry._id)));
-	return grants.length < 20 && cursors.length < 20;
+	const threads = await ctx.db
+		.query("thread_read_states")
+		.withIndex("by_installation_hostUserId_membershipLifetime", (q) => {
+			const range = q.eq("installationId", args.installationId).eq("hostUserId", args.hostUserId);
+			return args.membershipLifetime >= 0 ? range.lt("membershipLifetime", args.membershipLifetime) : range;
+		})
+		.take(20);
+	await Promise.all(threads.map((entry) => ctx.db.delete("thread_read_states", entry._id)));
+	return grants.length < 20 && cursors.length < 20 && threads.length < 20;
 }

@@ -25,6 +25,7 @@ import type * as threads from "../threads.js";
 import type * as transcripts from "../transcripts.js";
 import type * as transcripts_cleanup from "../transcripts_cleanup.js";
 import type * as transcripts_db from "../transcripts_db.js";
+import type * as transcripts_deletions from "../transcripts_deletions.js";
 import type * as transcripts_grants from "../transcripts_grants.js";
 import type * as transcripts_index from "../transcripts_index.js";
 import type * as transcripts_secrets from "../transcripts_secrets.js";
@@ -55,6 +56,7 @@ declare const fullApi: ApiFromModules<{
   transcripts: typeof transcripts;
   transcripts_cleanup: typeof transcripts_cleanup;
   transcripts_db: typeof transcripts_db;
+  transcripts_deletions: typeof transcripts_deletions;
   transcripts_grants: typeof transcripts_grants;
   transcripts_index: typeof transcripts_index;
   transcripts_secrets: typeof transcripts_secrets;

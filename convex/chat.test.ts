@@ -428,16 +428,95 @@ describe("read_states", () => {
 			attachments: [],
 			mentions: [],
 		});
-		await h.alice.mutation(api.read_states.mark_read, { channelId, rootSequence: 1, replySequence: 0 });
+		await h.alice.mutation(api.read_states.mark_read, { channelId, rootSequence: 1 });
 		expect(await h.alice.query(api.read_states.get_for_channel, { channelId })).toMatchObject({ hasUnread: true });
-		await h.alice.mutation(api.read_states.mark_read, { channelId, rootSequence: 1, replySequence: 1 });
-		await h.alice.mutation(api.read_states.mark_read, { channelId, rootSequence: 0, replySequence: 0 });
+		await h.alice.mutation(api.read_states.mark_thread_read, { rootMessageId: root.messageId, replySequence: 1 });
+		await h.alice.mutation(api.read_states.mark_read, { channelId, rootSequence: 0 });
 		expect(await h.alice.query(api.read_states.get_for_channel, { channelId })).toMatchObject({
 			hasUnread: false,
 			state: { rootSequence: 1, replySequence: 1 },
 		});
 	});
 
+	test("reading a later thread never clears an earlier unread reply", async () => {
+		const h = await fixture();
+		const channelId = await create_channel(h, "private", ["bob"]);
+		const first = await send(h, channelId, "first thread");
+		const second = await send(h, channelId, "second thread");
+		for (const root of [first, second])
+			await h.bob.mutation(api.messages.reply, {
+				rootMessageId: root.messageId,
+				clientRequestId: crypto.randomUUID(),
+				text: "reply",
+				attachments: [],
+				mentions: [],
+			});
+		await h.alice.mutation(api.read_states.mark_read, { channelId, rootSequence: 2 });
+		await h.alice.mutation(api.read_states.mark_thread_read, { rootMessageId: second.messageId, replySequence: 1 });
+		expect(await h.alice.query(api.read_states.get_for_channel, { channelId })).toMatchObject({
+			hasUnread: true,
+			state: { replySequence: 0 },
+		});
+		await h.alice.mutation(api.messages.reply, {
+			rootMessageId: second.messageId,
+			clientRequestId: "own-reply",
+			text: "my reply",
+			attachments: [],
+			mentions: [],
+		});
+		await h.alice.mutation(api.read_states.mark_thread_read, { rootMessageId: second.messageId, replySequence: 2 });
+		expect(await h.alice.query(api.read_states.get_for_channel, { channelId })).toMatchObject({
+			hasUnread: true,
+			state: { replySequence: 0 },
+		});
+		await h.alice.mutation(api.read_states.mark_thread_read, { rootMessageId: first.messageId, replySequence: 1 });
+		await h.alice.mutation(api.read_states.mark_thread_read, { rootMessageId: second.messageId, replySequence: 0 });
+		expect(await h.alice.query(api.read_states.get_for_channel, { channelId })).toMatchObject({
+			hasUnread: false,
+			state: { rootSequence: 2, replySequence: 3 },
+		});
+		expect(
+			await h.viewer.mutation(api.read_states.mark_thread_read, { rootMessageId: first.messageId, replySequence: 1 }),
+		).toHaveProperty("_nay");
+	});
+	test("continues long read ranges and ignores an old membership continuation", async () => {
+		const h = await fixture();
+		const channelId = await create_channel(h, "private", ["bob"]);
+		const root = await send(h, channelId);
+		for (let index = 0; index < 205; index++)
+			await h.bob.mutation(api.messages.reply, {
+				rootMessageId: root.messageId,
+				clientRequestId: `long-${index}`,
+				text: "reply",
+				attachments: [],
+				mentions: [],
+			});
+		await h.alice.mutation(api.read_states.mark_read, { channelId, rootSequence: 1 });
+		await h.alice.mutation(api.read_states.mark_thread_read, { rootMessageId: root.messageId, replySequence: 205 });
+		const read = await h.alice.query(api.read_states.get_for_channel, { channelId });
+		expect(read).toMatchObject({ hasUnread: true, state: { replySequence: 100 } });
+		const scheduled = await h.t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect());
+		expect(scheduled.some((job) => job.name === "read_states:continue_replies" && job.state.kind === "pending")).toBe(
+			true,
+		);
+		await h.t.mutation(internal.read_states.continue_replies, { readStateId: read!.state!._id, membershipLifetime: 1 });
+		expect(await h.alice.query(api.read_states.get_for_channel, { channelId })).toMatchObject({
+			state: { replySequence: 200 },
+		});
+		await h.t.mutation(internal.read_states.continue_replies, { readStateId: read!.state!._id, membershipLifetime: 1 });
+		expect(await h.alice.query(api.read_states.get_for_channel, { channelId })).toMatchObject({
+			hasUnread: false,
+			state: { replySequence: 205 },
+		});
+		await h.t.run(async (ctx) => {
+			await ctx.db.patch("read_states", read!.state!._id, { membershipLifetime: 2, replySequence: 0 });
+		});
+		await h.t.mutation(internal.read_states.continue_replies, { readStateId: read!.state!._id, membershipLifetime: 1 });
+		expect(await h.t.run((ctx) => ctx.db.get("read_states", read!.state!._id))).toMatchObject({
+			membershipLifetime: 2,
+			replySequence: 0,
+		});
+	});
 	test("deduplicates mentions and keeps an edit at its original sequence", async () => {
 		const h = await fixture();
 		const channelId = await create_channel(h);
@@ -450,7 +529,7 @@ describe("read_states", () => {
 		});
 		if (message._yay?.kind !== "message") throw new Error("Send failed");
 		expect(await h.alice.query(api.read_states.get_for_channel, { channelId })).toMatchObject({ mentionCount: 1 });
-		await h.alice.mutation(api.read_states.mark_read, { channelId, rootSequence: 1, replySequence: 0 });
+		await h.alice.mutation(api.read_states.mark_read, { channelId, rootSequence: 1 });
 		await h.bob.mutation(api.messages.edit, {
 			messageId: message._yay.messageId,
 			clientRequestId: "edit-mention",
@@ -705,7 +784,9 @@ describe("channel_members", () => {
 		const h = await fixture();
 		const channelId = await create_channel(h, "private", ["bob"]);
 		await send(h, channelId);
-		await h.bob.mutation(api.read_states.mark_read, { channelId, rootSequence: 1, replySequence: 0 });
+		await h.bob.mutation(api.read_states.mark_read, { channelId, rootSequence: 1 });
+		const root = (await h.bob.query(api.messages.latest_roots, { channelId }))!.messages[0]!;
+		await h.bob.mutation(api.read_states.mark_thread_read, { rootMessageId: root._id, replySequence: 0 });
 		await h.t.run(async (ctx) => {
 			const member = await ctx.db
 				.query("workspace_members")
@@ -731,6 +812,7 @@ describe("channel_members", () => {
 			),
 		).toBe(true);
 		expect(await h.t.run((ctx) => ctx.db.query("read_states").collect())).toEqual([]);
+		expect(await h.t.run((ctx) => ctx.db.query("thread_read_states").collect())).toEqual([]);
 		expect(await h.alice.query(api.channels.get, { channelId })).toMatchObject({ memberCount: 1 });
 	});
 });

@@ -76,17 +76,23 @@ export function TranscriptStatus(props: { client: BonoboClient; channelId: Id<"c
 	};
 	const copy = !status
 		? "Checking transcript access…"
-		: status.status === "ready"
-			? status.indexStatus === "blocked"
-				? "Chat is saved. The channel index needs attention."
-				: status.indexStatus === "ready"
-					? "Saved in Files"
-					: "Channel saved. Updating the channel index…"
-			: status.status === "not_connected"
-				? "Chat is saved. Connect Files to keep Markdown copies."
-				: status.status === "blocked"
-					? "Chat is saved. Transcript sync needs attention."
-					: "Chat is saved. Updating Files…";
+		: status.deletionPhase
+			? status.status === "blocked"
+				? "Channel deleted. Its Files copies need attention."
+				: status.deletionPhase === "copy"
+					? "Channel deleted. Saving its last messages in Files…"
+					: "Channel deleted. Archiving its Files copies…"
+			: status.status === "ready"
+				? status.indexStatus === "blocked"
+					? "Chat is saved. The channel index needs attention."
+					: status.indexStatus === "ready"
+						? "Saved in Files"
+						: "Channel saved. Updating the channel index…"
+				: status.status === "not_connected"
+					? "Chat is saved. Connect Files to keep Markdown copies."
+					: status.status === "blocked"
+						? "Chat is saved. Transcript sync needs attention."
+						: "Chat is saved. Updating Files…";
 	return (
 		<>
 			<div className="transcript-status">

@@ -137,7 +137,7 @@ async function readers_step(
 					rollbackToken === token
 				)
 					throw error;
-				// A definite mismatch proves this bearer did not commit the journal. Save the new proof before retrying.
+				// An upgrade can retire the saved bearer. Save current authority before retrying its exact operation.
 				await ctx.runMutation(internal.transcripts_db.set_reader_rollback_source, {
 					...checkpoint,
 					sourceSecret: await transcripts_encrypt(token),
@@ -240,21 +240,6 @@ async function readers_step(
 			return;
 		}
 	}
-	if (operation.deleted && !destination.detached && run.readerStep === 0) {
-		await transcripts_host_post(
-			"/api/internal/plugins/files/archive",
-			{
-				writerId: destination.writerId,
-				operationId: `${run._id}:delete`,
-				writerGeneration: run.writerGeneration,
-				path: destination.folderPath,
-				nodeId: destination.folderNodeId,
-				sequence: run.barrier,
-			},
-			token,
-			transcripts_receipt,
-		);
-	}
 	await ctx.runMutation(internal.transcripts_db.complete_control, {
 		...checkpoint,
 		readerRevision: Math.max(context.channel.membershipRevision, operation.readerRevision),
@@ -280,6 +265,37 @@ export const run_channel = internalAction({
 				await ctx.runMutation(internal.transcripts_db.release_readers, {
 					...checkpoint,
 					error: transcripts_get_error_message(error, "Files readers could not be updated."),
+				});
+			}
+			return;
+		}
+		const deletion = await ctx.runMutation(internal.transcripts_deletions.claim, args);
+		if (deletion) {
+			const prepared = deletion.deletion.prepared!;
+			const checkpoint = { deletionId: deletion.deletion._id, claim: deletion.deletion.claim };
+			try {
+				const { token } = await transcripts_get_token(ctx, args.channelId);
+				// Archive after the copy boundary, preserving this exact file's current text and manual edits.
+				const receipt = await transcripts_host_post(
+					"/api/internal/plugins/files/archive",
+					{
+						writerId: deletion.destination.writerId,
+						operationId: prepared.operationId,
+						writerGeneration: prepared.writerGeneration,
+						path: prepared.path,
+						nodeId: prepared.nodeId,
+						sequence: deletion.deletion.barrier + 1,
+					},
+					token,
+					transcripts_receipt,
+				);
+				if (receipt.nodeId !== prepared.nodeId || receipt.operationId !== prepared.operationId)
+					throw new Error("Press did not confirm this transcript archive.");
+				await ctx.runMutation(internal.transcripts_deletions.release, { ...checkpoint, error: null });
+			} catch (error) {
+				await ctx.runMutation(internal.transcripts_deletions.release, {
+					...checkpoint,
+					error: transcripts_get_error_message(error, "The transcript could not be archived."),
 				});
 			}
 			return;
@@ -607,6 +623,12 @@ export const sweep = internalMutation({
 			for (const state of states)
 				await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, { channelId: state.channelId });
 		}
+		const deletions = await ctx.db
+			.query("transcript_deletions")
+			.withIndex("by_completedAt_nextAttemptAt", (q) => q.eq("completedAt", null).lte("nextAttemptAt", Date.now()))
+			.take(20);
+		for (const deletion of deletions)
+			await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, { channelId: deletion.channelId });
 		for (const phase of ["exchange", "renew", "seal"] as const) {
 			const grants = await ctx.db
 				.query("host_grants")

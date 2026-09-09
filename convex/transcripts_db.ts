@@ -10,6 +10,7 @@ import {
 	chatbe_ROLLOVER_MAX_BYTES,
 } from "../shared/transcript-markdown";
 import schema from "./schema";
+import { transcripts_deletions_queue } from "./transcripts_deletions";
 
 async function pending_readers(ctx: MutationCtx, channelId: Id<"channels">) {
 	for (const status of ["pending", "running", "blocked"] as const) {
@@ -965,6 +966,15 @@ export const complete_control = internalMutation({
 					q.eq("channelId", current.run.channelId).eq("sequence", current.run.barrier),
 				)
 				.unique())!;
+			const channel = (await ctx.db.get("channels", current.run.channelId))!;
+			if (
+				job.operation.kind === "readers" &&
+				job.operation.deleted &&
+				current.run.readerStep === 0 &&
+				channel.deletedAt !== null &&
+				channel.membershipRevision === job.operation.readerRevision
+			)
+				await transcripts_deletions_queue(ctx, channel, job.sequence, job.operation.readerRevision);
 			await ctx.db.patch("transcript_jobs", job._id, { status: "complete", error: null });
 			await ctx.db.patch("transcript_destinations", current.destination._id, { readerRunId: null, readerError: null });
 			await ctx.db.delete("transcript_runs", current.run._id);

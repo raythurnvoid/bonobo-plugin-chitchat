@@ -724,6 +724,8 @@ type RowProps = {
 	memberNames: chat_MemberNamesApi;
 	canWrite: boolean;
 	isContinuation: boolean;
+	editingMessageId?: Id<"messages"> | null;
+	onEditingChange?: (message: Doc<"messages"> | null) => void;
 	onOpenThread?: (id: Id<"messages">) => void;
 	threadDisabled?: boolean;
 	onRequestStart: () => void;
@@ -744,6 +746,7 @@ export function MessageRow(props: RowProps) {
 	const react = useMutation(api.reactions.set);
 	const [editing, setEditing] = useState(false);
 	const [text, setText] = useState("");
+	const editSource = useRef<{ revision: number; mentions: string[] } | null>(null);
 	const [confirmDelete, setConfirmDelete] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
@@ -762,6 +765,9 @@ export function MessageRow(props: RowProps) {
 		if (deleted) {
 			const focused = row.current?.contains(document.activeElement);
 			setEditing(false);
+			setText("");
+			editSource.current = null;
+			if (editing) props.onEditingChange?.(null);
 			setConfirmDelete(false);
 			if (focused) row.current?.focus();
 		}
@@ -782,6 +788,9 @@ export function MessageRow(props: RowProps) {
 			operation.current = null;
 			setUncertain(false);
 			setEditing(false);
+			setText("");
+			editSource.current = null;
+			if (editing) props.onEditingChange?.(null);
 			setConfirmDelete(false);
 			queueMicrotask(() => (deleted ? row.current : editButton.current)?.focus());
 		} catch (cause) {
@@ -795,7 +804,8 @@ export function MessageRow(props: RowProps) {
 	const save = () => {
 		if (!canWrite && !operation.current) return;
 		if (!operation.current) {
-			const mentions = doc.mentions.filter((id) => {
+			const source = editSource.current!;
+			const mentions = source.mentions.filter((id) => {
 				const name = props.memberNames.get(id);
 				return !!name && text.includes(`@${name}`);
 			});
@@ -807,7 +817,7 @@ export function MessageRow(props: RowProps) {
 			const args = {
 				messageId: doc._id,
 				clientRequestId: crypto.randomUUID(),
-				expectedRevision: doc.revision,
+				expectedRevision: source.revision,
 				text: text.trim(),
 				mentions,
 			};
@@ -834,6 +844,9 @@ export function MessageRow(props: RowProps) {
 			operation.current = null;
 			setUncertain(false);
 			setEditing(false);
+			setText("");
+			editSource.current = null;
+			if (editing) props.onEditingChange?.(null);
 			setConfirmDelete(false);
 			setError(null);
 			queueMicrotask(() => editButton.current?.focus());
@@ -967,10 +980,12 @@ export function MessageRow(props: RowProps) {
 								ref={editButton}
 								type="button"
 								className="button message-action"
-								disabled={busy || uncertain}
+								disabled={busy || uncertain || (props.editingMessageId != null && props.editingMessageId !== doc._id)}
 								onClick={() => {
+									editSource.current = { revision: doc.revision, mentions: doc.mentions };
 									setText(doc.text);
 									setEditing(true);
+									props.onEditingChange?.(doc);
 									setError(null);
 								}}
 							>
@@ -1195,7 +1210,8 @@ export type ChannelViewProps = {
 	canWrite: boolean;
 	online: boolean;
 	openedAtReadSequence: number;
-	onObservedRead: (position: { rootSequence: number; replySequence: number }) => void;
+	onObservedRead: (position: { rootSequence: number }) => void;
+	onObservedThreadRead: (position: { rootMessageId: Id<"messages">; replySequence: number }) => void;
 	onRequestStart: () => void;
 	onRequestSettled: () => void;
 	sendInFlight: boolean;
@@ -1224,6 +1240,7 @@ export function ThreadPanel(props: ChannelViewProps & { rootMessageId: Id<"messa
 	const log = useRef<HTMLDivElement | null>(null);
 	const nearBottom = useRef(true);
 	const anchor = useRef<{ id: string; top: number } | null>(null);
+	const [visibleSequence, setVisibleSequence] = useState(0);
 	useEffect(() => {
 		close.current?.focus();
 	}, []);
@@ -1235,14 +1252,42 @@ export function ThreadPanel(props: ChannelViewProps & { rootMessageId: Id<"messa
 	}, [window.rows, shownRoot, props.memberNames]);
 	useLayoutEffect(() => {
 		if (!log.current) return;
-		if (nearBottom.current && window.atLatest) log.current.scrollTop = log.current.scrollHeight;
-		else if (anchor.current) {
+		if (nearBottom.current && window.atLatest) {
+			log.current.scrollTop = log.current.scrollHeight;
+			setVisibleSequence(window.sequence);
+		} else if (anchor.current) {
 			const element = [...log.current.querySelectorAll<HTMLElement>("[data-key]")].find(
 				(item) => item.dataset.key === anchor.current!.id,
 			);
 			if (element) log.current.scrollTop += element.getBoundingClientRect().top - anchor.current.top;
 		}
-	}, [window.rows, window.atLatest]);
+	}, [window.rows, window.atLatest, window.sequence]);
+	useEffect(() => {
+		const mark = () => {
+			if (
+				enabled &&
+				shownRoot &&
+				!window.denied &&
+				window.atLatest &&
+				nearBottom.current &&
+				document.visibilityState === "visible" &&
+				visibleSequence === window.sequence
+			)
+				props.onObservedThreadRead({ rootMessageId: props.rootMessageId, replySequence: visibleSequence });
+		};
+		mark();
+		document.addEventListener("visibilitychange", mark);
+		return () => document.removeEventListener("visibilitychange", mark);
+	}, [
+		enabled,
+		shownRoot,
+		window.denied,
+		window.atLatest,
+		visibleSequence,
+		window.sequence,
+		props.rootMessageId,
+		props.onObservedThreadRead,
+	]);
 	return (
 		<section
 			className="thread"
@@ -1264,7 +1309,13 @@ export function ThreadPanel(props: ChannelViewProps & { rootMessageId: Id<"messa
 			</div>
 			{shownRoot ? (
 				<ul className="message-list thread-root">
-					<MessageRow {...props} doc={shownRoot} isContinuation={false} />
+					<MessageRow
+						{...props}
+						doc={shownRoot}
+						isContinuation={false}
+						editingMessageId={window.editingMessageId}
+						onEditingChange={window.setEditingMessage}
+					/>
 				</ul>
 			) : (
 				<p className="channel-status">
@@ -1278,6 +1329,7 @@ export function ThreadPanel(props: ChannelViewProps & { rootMessageId: Id<"messa
 					const element = log.current;
 					if (!element) return;
 					nearBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+					if (nearBottom.current && window.atLatest) setVisibleSequence(window.sequence);
 					const first = [...element.querySelectorAll<HTMLElement>("[data-key]")].find(
 						(item) => item.getBoundingClientRect().bottom >= element.getBoundingClientRect().top,
 					);
@@ -1294,7 +1346,12 @@ export function ThreadPanel(props: ChannelViewProps & { rootMessageId: Id<"messa
 					<p className="channel-status">No replies yet</p>
 				) : null}
 				<ul className="message-list">
-					<MessageList {...props} rows={window.rows} />
+					<MessageList
+						{...props}
+						rows={window.rows}
+						editingMessageId={window.editingMessageId}
+						onEditingChange={window.setEditingMessage}
+					/>
 					<PendingRows draft={draft} queue={queue} disabled={!session.ready || !session.can_request_now()} />
 				</ul>
 			</div>
@@ -1367,7 +1424,7 @@ function ChannelContent(props: ChannelViewProps) {
 		if (ids.length) void props.memberNames.resolve(ids, authors);
 	}, [window.rows, props.memberNames]);
 	useLayoutEffect(() => {
-		if (!log.current) return;
+		if (!log.current || threadCoversChannel) return;
 		if (nearBottom.current && window.atLatest) {
 			log.current.scrollTop = log.current.scrollHeight;
 			setVisibleSequence(window.sequence);
@@ -1377,7 +1434,7 @@ function ChannelContent(props: ChannelViewProps) {
 			);
 			if (element) log.current.scrollTop += element.getBoundingClientRect().top - anchor.current.top;
 		}
-	}, [window.rows, window.atLatest, window.sequence]);
+	}, [window.rows, window.atLatest, window.sequence, threadCoversChannel]);
 	useEffect(() => {
 		if (previousSequence.current !== null && window.sequence > previousSequence.current && window.atLatest)
 			props.announce("New messages in this channel.");
@@ -1387,12 +1444,14 @@ function ChannelContent(props: ChannelViewProps) {
 		const mark = () => {
 			if (
 				enabled &&
+				!threadCoversChannel &&
+				!window.denied &&
 				window.atLatest &&
 				nearBottom.current &&
 				document.visibilityState === "visible" &&
 				visibleSequence === window.sequence
 			)
-				props.onObservedRead({ rootSequence: visibleSequence, replySequence: props.channel?.lastReplySequence ?? 0 });
+				props.onObservedRead({ rootSequence: visibleSequence });
 		};
 		mark();
 		document.addEventListener("visibilitychange", mark);
@@ -1402,7 +1461,8 @@ function ChannelContent(props: ChannelViewProps) {
 		window.atLatest,
 		visibleSequence,
 		window.sequence,
-		props.channel?.lastReplySequence,
+		threadCoversChannel,
+		window.denied,
 		props.onObservedRead,
 	]);
 	const closeThread = () => {
@@ -1462,6 +1522,8 @@ function ChannelContent(props: ChannelViewProps) {
 						<MessageList
 							{...props}
 							rows={window.rows}
+							editingMessageId={window.editingMessageId}
+							onEditingChange={window.setEditingMessage}
 							readSequence={props.openedAtReadSequence}
 							onOpenThread={(id) => {
 								if (!props.sendInFlight) props.setThreadRootId(id);
