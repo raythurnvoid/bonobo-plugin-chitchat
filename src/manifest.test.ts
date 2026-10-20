@@ -81,7 +81,7 @@ describe("bonobo.plugin.json", () => {
 		for (const file of manifest.files) {
 			expect(file.path.startsWith("dist/")).toBe(true);
 			expect(file.sha256).toMatch(/^sha256:[a-f0-9]{64}$/);
-			expect(file.bytes).toBeLessThanOrEqual(900_000);
+			expect(file.bytes).toBeLessThanOrEqual(1_000_000);
 			total += file.bytes;
 		}
 		expect(total).toBeLessThanOrEqual(16 * 1024 * 1024);

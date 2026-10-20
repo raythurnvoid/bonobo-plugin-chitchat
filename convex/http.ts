@@ -46,7 +46,7 @@ router.route({
 			const answer = await press_get_lease(body.data.pressToken);
 			if (!answer.lease)
 				return Response.json(
-					{ message: "Press could not confirm access to Chitchat." },
+					{ message: "Bonobo Senate could not confirm access to Chitchat." },
 					{ status: answer.status === 401 || answer.status === 403 ? answer.status : 503, headers },
 				);
 			const { jwt, facts } = answer.lease;

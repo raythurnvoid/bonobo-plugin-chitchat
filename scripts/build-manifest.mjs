@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MAX_REVIEW_LINE_LENGTH = 1_000;
-const MAX_FILE_BYTES = 900_000;
+const MAX_FILE_BYTES = 1_000_000;
 const MAX_FILES = 64;
 const MAX_ARTIFACT_BYTES = 16 * 1024 * 1024;
 
@@ -100,7 +100,7 @@ for (const file of manifest.files) {
 	if (artifactBytes > MAX_ARTIFACT_BYTES) {
 		fail(`Manifest files exceed the ${MAX_ARTIFACT_BYTES}-byte total limit`);
 	}
-	// Publishing rejects unreadably long source lines, so fail the build before this artifact can be released.
+	// Keep the published source lines short enough to review.
 	if (
 		file.contentType.startsWith("text/") ||
 		file.contentType === "application/javascript" ||

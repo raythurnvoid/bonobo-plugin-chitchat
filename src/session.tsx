@@ -81,7 +81,7 @@ function create_chat_connection(host: BonoboClient) {
 					update({
 						phase: denied ? "denied" : "unavailable",
 						message: denied
-							? "Press no longer allows this Chitchat session."
+							? "Bonobo Senate no longer allows this Chitchat session."
 							: "Chitchat is reconnecting. Your draft is kept.",
 					});
 					throw new Error("Chitchat lease was refused");

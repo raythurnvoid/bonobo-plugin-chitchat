@@ -58,7 +58,7 @@ async function setup() {
 			const path = new URL(url).pathname;
 			requests.push(path);
 			if (path === "/.well-known/jwks.json") return Response.json({ keys: [jwk] });
-			if (typeof init?.body !== "string") throw new Error("Missing Press request");
+			if (typeof init?.body !== "string") throw new Error("Missing Bonobo Senate request");
 			const body = JSON.parse(init.body);
 			if (path === "/api/v1/plugins/identity/exchange") {
 				const hostSessionId = new Headers(init.headers).get("Authorization")!.slice("Bearer plu_".length);

@@ -99,7 +99,7 @@ async function serve_selection(facts: Awaited<ReturnType<typeof setup>>["facts"]
 }
 
 describe("authorize_selection", () => {
-	test("uses the current Press file name and saves only a bounded proof", async () => {
+	test("uses the current Bonobo Senate file name and saves only a bounded proof", async () => {
 		const { t, user, facts, channelId } = await setup();
 		await serve_selection(
 			facts,
@@ -122,7 +122,7 @@ describe("authorize_selection", () => {
 		expect(JSON.stringify(proofs)).not.toContain("secret-signed-url");
 	});
 
-	test("rejects a bearer from a different Press session before reading files", async () => {
+	test("rejects a bearer from a different Bonobo Senate session before reading files", async () => {
 		const { t, user, facts } = await setup();
 		const fetchMock = await serve_selection(
 			{ ...facts, hostSessionId: "other-session", hostUserId: "other-member" },

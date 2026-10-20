@@ -162,7 +162,7 @@ describe("sessions.current", () => {
 describe("wake_installations", () => {
 	test("repeated outage polls leave no extra retry chain", async () => {
 		const { t } = await setup();
-		const fetchMock = vi.fn(async () => { throw new TypeError("Press is unavailable"); });
+		const fetchMock = vi.fn(async () => { throw new TypeError("Bonobo Senate is unavailable"); });
 		vi.stubGlobal("fetch", fetchMock);
 		for (let poll = 0; poll < 4; poll++) {
 			await t.mutation(internal.access.wake_installations, { paginationOpts: { numItems: 50, cursor: null } });

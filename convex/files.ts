@@ -107,10 +107,10 @@ export const authorize_selection = action({
 		const authority = await ctx.runQuery(internal.files.selection_authority, {});
 		if (!authority) return { _nay: { message: "Unauthorized" } };
 		try {
-			// Bind the supplied Press bearer to this native session before checking its file access.
+			// Bind the supplied Bonobo Senate bearer to this native session before checking its file access.
 			const lease = await press_get_lease(args.pressToken, authority.expiresAt);
 			if (lease.status !== 200 || !lease.lease)
-				return { _nay: { message: "Press could not confirm attachment access." } };
+				return { _nay: { message: "Bonobo Senate could not confirm attachment access." } };
 			const facts = lease.lease.facts;
 			if (
 				facts.hostSessionId !== authority.hostSessionId ||
@@ -146,7 +146,7 @@ export const authorize_selection = action({
 			});
 			return saved ? { _yay: body.data.items } : { _nay: { message: "Attachment access expired. Try again." } };
 		} catch {
-			return { _nay: { message: "Could not reach Press. Try again." } };
+			return { _nay: { message: "Could not reach Bonobo Senate. Try again." } };
 		}
 	},
 });

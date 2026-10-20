@@ -125,7 +125,7 @@ function host() {
 					beforeWrite = null;
 					await callback();
 				}
-				// Press checks its current generation before both receipt replay and finalization.
+				// Bonobo Senate checks its current generation before both receipt replay and finalization.
 				if (request.writerGeneration !== generation) return Response.json({ message: "Stale writer" }, { status: 409 });
 				const saved = receipts.get(request.operationId);
 				if (saved) {

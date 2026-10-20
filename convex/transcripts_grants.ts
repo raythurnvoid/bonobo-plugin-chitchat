@@ -57,7 +57,7 @@ export async function transcripts_host_post<Path extends BonoboHttpApiPath, T>(
 		);
 	}
 	const parsed = schema.safeParse(response.body);
-	if (!parsed.success) throw new Error("Press returned an invalid Files response.");
+	if (!parsed.success) throw new Error("Bonobo Senate returned an invalid Files response.");
 	return parsed.data;
 }
 
@@ -130,7 +130,7 @@ export const get_by_id = internalQuery({
 	handler: async (ctx, args) => await ctx.db.get("host_grants", args.grantId),
 });
 
-// Rollback keeps a proof even after the sponsor loses chat access. Press limits it to cancellation.
+// Rollback keeps a proof even after the sponsor loses chat access. Bonobo Senate limits it to cancellation.
 export const reader_source = internalQuery({
 	args: { channelId: v.id("channels") },
 	returns: v.union(v.string(), v.null()),
@@ -363,7 +363,7 @@ export const connect = internalAction({
 				}
 				const parsed = (operation === "renew" ? grant_response : scoped_grant_response).safeParse(response.body);
 				if (!parsed.success || parsed.data.expiresAt <= Date.now())
-					throw new Error("Press returned an invalid Files grant.");
+					throw new Error("Bonobo Senate returned an invalid Files grant.");
 				if (operation !== "renew") {
 					const scoped = scoped_grant_response.parse(response.body);
 					if (
@@ -372,7 +372,7 @@ export const connect = internalAction({
 						scoped.organizationId !== current.installation.hostOrganizationId ||
 						scoped.workspaceId !== current.installation.hostWorkspaceId
 					)
-						throw new Error("This Press session belongs to another workspace or person.");
+						throw new Error("This Bonobo Senate session belongs to another workspace or person.");
 				}
 				await ctx.runMutation(internal.transcripts_grants.save_step, {
 					grantId: grant._id,

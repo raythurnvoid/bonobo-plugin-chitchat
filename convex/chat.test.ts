@@ -589,7 +589,7 @@ describe("channel_members", () => {
 		expect(await h.bob.query(api.channels.permissions, { channelId })).toMatchObject({ canManage: true });
 	});
 
-	test("promotes a successor after the manager is removed from Press", async () => {
+	test("promotes a successor after the manager is removed from Bonobo Senate", async () => {
 		const h = await fixture();
 		const channelId = await create_channel(h, "private", ["viewer", "bob"]);
 		await h.t.mutation(internal.access.apply_event, {

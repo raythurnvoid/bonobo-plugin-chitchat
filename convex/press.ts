@@ -52,7 +52,7 @@ export const press_access_event = z.discriminatedUnion("kind", [
 	}),
 ]);
 
-// Only backend actions use the service proof. The browser supplies its current Press session separately.
+// Only backend actions use the service proof. The browser supplies its current Bonobo Senate session separately.
 export async function press_post<Path extends BonoboHttpApiPath>(
 	path: Path,
 	body: BonoboHttpApi[Path]["POST"]["body"],
@@ -96,7 +96,7 @@ export async function press_get_lease(pressToken: string, requestedExpiresAt = D
 		facts.expiresAt > facts.validatedAt + 30_000 ||
 		verified.payload.exp !== Math.floor(facts.expiresAt / 1000)
 	) {
-		throw new Error("Press lease does not match its request");
+		throw new Error("Bonobo Senate lease does not match its request");
 	}
 	return { status: 200, lease: { jwt: signed.jwt, facts } };
 }

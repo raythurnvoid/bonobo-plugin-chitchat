@@ -258,10 +258,10 @@ export const connect = action({
 		try {
 			answer = await press_get_lease(args.pluginToken);
 		} catch {
-			return { _nay: { message: "Press could not confirm this Files connection. Refresh and try again." } };
+			return { _nay: { message: "Bonobo Senate could not confirm this Files connection. Refresh and try again." } };
 		}
 		if (!answer.lease)
-			return { _nay: { message: "Press could not confirm this Files connection. Refresh and try again." } };
+			return { _nay: { message: "Bonobo Senate could not confirm this Files connection. Refresh and try again." } };
 		return (await ctx.runMutation(internal.transcripts.begin_connect, {
 			channelId: args.channelId,
 			clientRequestId: args.clientRequestId,

@@ -1,8 +1,8 @@
 # Chitchat
 
-Chitchat is team chat inside Bonobo Senate Press. It uses React 19 and its own Convex backend and database. People use their existing Press account. There is no separate signup.
+Chitchat is team chat inside Bonobo Senate. It uses React 19 and its own Convex backend and database. People use their existing Bonobo Senate account. There is no separate signup.
 
-The plugin stays in its own Git repository, mounted in Press at `plugins/bonobo-plugin-chitchat`. Its frontend, native backend, schema, tests, and built UI assets belong here. Press owns login, workspace membership, plugin installation, and Files. The SDK stays a separate package.
+The plugin stays in its own Git repository, mounted in Bonobo Senate at `plugins/bonobo-plugin-chitchat`. Its frontend, native backend, schema, tests, and built UI assets belong here. Bonobo Senate owns login, workspace membership, plugin installation, and Files. The SDK stays a separate package.
 
 ## Chat and UI
 
@@ -15,11 +15,11 @@ The plugin stays in its own Git repository, mounted in Press at `plugins/bonobo-
 
 The organization owner can read private channels. The plugin lists only private channels the person joined. Files copies have their own sharing settings. File managers can share them with other people, including later updates.
 
-Internet access is required. New sends are blocked without a valid lease and live socket. Drafts stay in the open frame. Already-submitted uncertain requests keep their original ID and payload. No offline send queue is created. A Chitchat outage does not stop the rest of Press.
+Internet access is required. New sends are blocked without a valid lease and live socket. Drafts stay in the open frame. Already-submitted uncertain requests keep their original ID and payload. No offline send queue is created. A Chitchat outage does not stop the rest of Bonobo Senate.
 
 ## Native data and queries
 
-`convex/schema.ts` defines channels, channel members, messages, thread summaries, reactions, read states, request receipts, access mirrors, sessions, and transcript work. Native IDs link chat docs. Press user, membership, workspace, installation, and account IDs remain source identifiers.
+`convex/schema.ts` defines channels, channel members, messages, thread summaries, reactions, read states, request receipts, access mirrors, sessions, and transcript work. Native IDs link chat docs. Bonobo Senate user, membership, workspace, installation, and account IDs remain source identifiers.
 
 Root messages have a stable per-channel sequence. Replies have both a per-thread sequence and a per-channel reply sequence. Timestamps display time; they do not decide pagination or unread order. Mutations save the message, summaries, request receipt, and transcript job in one transaction.
 
@@ -33,14 +33,14 @@ The main log marks only visible roots read. A narrow thread covers that log and 
 
 Channel and overview pages request at most 50 entries; the member picker requests at most 100. Empty filtered pages keep their continuation cursor. The name cache holds at most 1,000 entries for five minutes. Partial unread totals show a plus sign.
 
-## Press login and access
+## Bonobo Senate login and access
 
-Press is the only identity authority for this release. `src/session.tsx` owns a separate Convex client for Chitchat. The SDK client still points to Press for the host bridge, theme, and Files.
+Bonobo Senate is the only identity authority for this release. `src/session.tsx` owns a separate Convex client for Chitchat. The SDK client still points to Bonobo Senate for the host bridge, theme, and Files.
 
-1. The frame sends its current Press plugin bearer to Chitchat's `/auth/lease`.
+1. The frame sends its current Bonobo Senate plugin bearer to Chitchat's `/auth/lease`.
 2. Chitchat calls `/api/v1/plugins/identity/exchange` with its server-held service proof.
-3. Press checks the current user, membership, installation, version, capabilities, service account, and plugin session.
-4. Press signs a short ES256 JWT with audience `bonobo-plugin:chitchat`, issuer `<PRESS_HTTP_URL>/plugins-services`, and the exact exchange and membership lifetime.
+3. Bonobo Senate checks the current user, membership, installation, version, capabilities, service account, and plugin session.
+4. Bonobo Senate signs a short ES256 JWT with audience `bonobo-plugin:chitchat`, issuer `<PRESS_HTTP_URL>/plugins-services`, and the exact exchange and membership lifetime.
 5. Chitchat catches up to the signed required access revision before admitting that lease. A ready installation already at that revision or later skips the immediate access-feed read. Admission still checks current local access.
 
 The target lease is 30 seconds. Membership and permission changes can reach Chitchat sooner through durable access events. If catch-up or renewal fails, access closes when the current lease expires. This is an explicit brief revocation window. Scheduled expiry writes also invalidate idle subscriptions. The browser checks a conservative monotonic deadline before submitting.
@@ -66,7 +66,7 @@ Connect Files from the channel's transcript status. The server uses `/api/v1/plu
 Files writes use the public plugin folder, access, and archive APIs plus `/api/v1/files/write`.
 Writer inspection, generation advance, and reader undo are general public Files capabilities.
 `JSON.stringify([generation, channelPublicId])` is the opaque writer resource key; `__root` identifies
-the README writer inside Chitchat only. Press never parses this value. Chitchat sends the original
+the README writer inside Chitchat only. Bonobo Senate never parses this value. Chitchat sends the original
 saved operation ID, sequence, target and revision checks on every retry. Its 100,000-byte Markdown
 limit remains local even though the public API supports other editable text and larger bounds.
 
@@ -96,20 +96,20 @@ Private deletion removes chat access first. It then finishes all transcript copi
 
 The current development projects are separate:
 
-| Project  | Convex deployment            |
-| -------- | ---------------------------- |
-| Press    | `grand-finch-267`            |
-| Chitchat | `exuberant-hippopotamus-790` |
+| Project       | Convex deployment            |
+| ------------- | ---------------------------- |
+| Bonobo Senate | `grand-finch-267`            |
+| Chitchat      | `exuberant-hippopotamus-790` |
 
 Local frontend variables live in ignored `.env.local`; see `.env.example`. Build-time URLs must match the exact HTTPS and WSS origins declared in `bonobo.plugin.json`.
 
 Set these secrets on the Chitchat deployment:
 
-- `PRESS_HTTP_URL`: configured Press HTTP origin.
-- `PRESS_CHITCHAT_SERVICE_SECRET`: Press-issued Chitchat service proof.
+- `PRESS_HTTP_URL`: configured Bonobo Senate HTTP origin.
+- `PRESS_CHITCHAT_SERVICE_SECRET`: Bonobo Senate-issued Chitchat service proof.
 - `CHITCHAT_GRANT_ENCRYPTION_KEY`: base64 of 32 random bytes for AES-GCM.
 
-Press needs no Chitchat URL, callback secret, or product-specific environment value. The publisher
+Bonobo Senate needs no Chitchat URL, callback secret, or product-specific environment value. The publisher
 registers Chitchat through the normal service controls. Never put server secrets in Vite variables,
 source, logs, or built assets.
 
@@ -124,13 +124,15 @@ vp env exec pnpm run build
 vp env exec pnpm run test:once
 ```
 
-Run these from this repository, one command at a time. The manifest tests read `dist`, which the build replaces. Never run that test suite in parallel with a build. Deploy the configured Chitchat development backend with `vp env exec pnpm exec convex dev --once`. Check the deployment name first. Press integration changes deploy from the Press repository.
+Run these from this repository, one command at a time. The manifest tests read `dist`, which the build replaces. Never run that test suite in parallel with a build. Deploy the configured Chitchat development backend with `vp env exec pnpm exec convex dev --once`. Check the deployment name first. Bonobo Senate integration changes deploy from the Bonobo Senate repository.
 
-Backend tests use `convex-test`. Frontend tests feed native query snapshots to the real React components. They do not replace live embedded checks. Verify real login renewal, two members, private access loss, Files sharing and locks, transcript readback, large history, keyboard use, and small screens with Press's Playwriter harness.
+Backend tests use `convex-test`. Frontend tests feed native query snapshots to the real React components. They do not replace live embedded checks. Verify real login renewal, two members, private access loss, Files sharing and locks, transcript readback, large history, keyboard use, and small screens with Bonobo Senate's Playwriter harness.
 
-The build writes the three frontend assets and both manifest copies. It checks per-file and total size limits, review line lengths, and hashes. Build twice and confirm stable bytes. Commit built assets because Press fetches them from GitHub. No generic backend worker ships.
+The build writes the three frontend assets and both manifest copies. It checks the 1,000,000-byte file limit, the 16 MiB total limit, review line lengths, and hashes. Build twice and confirm stable bytes. Commit built assets because Bonobo Senate fetches them from GitHub. No generic backend worker ships.
 
 The SDK is pinned to a real mirror commit. Review the host and SDK changes first, mirror the SDK, pin it here, then publish the exact reviewed plugin commit. Update the installation and accept its declared origins and capabilities. Finally verify the served version and bytes. Never point the parent gitlink past the published commit.
+
+Published versions cannot change. Before publishing changed source or assets, use the first unused patch version and rebuild. Source and build work alone does not publish or update installed versions.
 
 ## Recovery
 
@@ -142,4 +144,4 @@ Unfinished private deletion appears in **Files sync** for the current owner or t
 
 When the last channel member leaves the workspace, cleanup saves owner recovery before trying to update Files readers. This lets a current owner reconnect if the old sponsor can no longer write. A channel that never started Files setup needs no recovery entry.
 
-Verify access, pending jobs, and the served bundle after a repair. Uninstall is not a temporary pause: it retires the installation's authority. Never uninstall, reset the plugin registry, or wipe Press as a shortcut to recover this plugin.
+Verify access, pending jobs, and the served bundle after a repair. Uninstall is not a temporary pause: it retires the installation's authority. Never uninstall, reset the plugin registry, or wipe Bonobo Senate as a shortcut to recover this plugin.

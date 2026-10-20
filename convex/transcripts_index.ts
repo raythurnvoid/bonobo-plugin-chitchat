@@ -51,7 +51,7 @@ async function active_run(ctx: MutationCtx, args: { runId: Id<"transcript_index_
 	return index.activeRunId === run._id ? { run, index } : null;
 }
 
-// The caller checks channel management. Press checks the Files sponsor on every host operation.
+// The caller checks channel management. Bonobo Senate checks the Files sponsor on every host operation.
 export async function transcripts_index_request(
 	ctx: MutationCtx,
 	args: { indexId: Id<"transcript_indexes">; reconcile: boolean },
@@ -183,7 +183,7 @@ export const fenced = internalMutation({
 			args.operationId !== `${run._id}:fence` ||
 			args.writerGeneration !== run.writerGeneration + 1
 		)
-			throw new Error("Press returned a different README fence receipt.");
+			throw new Error("Bonobo Senate returned a different README fence receipt.");
 		await ctx.db.patch("transcript_indexes", index._id, { writerGeneration: args.writerGeneration });
 		await ctx.db.patch("transcript_index_runs", run._id, { writerGeneration: args.writerGeneration, phase: "fold" });
 	},
@@ -260,7 +260,7 @@ export const release = internalMutation({
 				!receipt.contentRevision ||
 				(run.expectedNodeId !== null && receipt.nodeId !== run.expectedNodeId)
 			)
-				throw new Error("Press returned a different README write receipt.");
+				throw new Error("Bonobo Senate returned a different README write receipt.");
 			await ctx.db.patch("transcript_index_runs", run._id, {
 				phase: "complete",
 				leaseUntil: 0,

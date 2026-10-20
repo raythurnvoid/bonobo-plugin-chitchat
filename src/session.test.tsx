@@ -68,7 +68,7 @@ afterEach(() => {
 });
 
 describe("ChatSessionProvider", () => {
-	test("refreshes a rejected Press bearer once before reconnecting", async () => {
+	test("refreshes a rejected Bonobo Senate bearer once before reconnecting", async () => {
 		const getToken = vi.fn().mockResolvedValue("plu_old");
 		const refreshToken = vi.fn().mockResolvedValue("plu_new");
 		const fetchMock = vi
@@ -89,7 +89,7 @@ describe("ChatSessionProvider", () => {
 		expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({ pressToken: "plu_new" });
 	});
 
-	test("does not rotate the Press bearer for routine native renewal", async () => {
+	test("does not rotate the Bonobo Senate bearer for routine native renewal", async () => {
 		const getToken = vi.fn().mockResolvedValue("plu_current");
 		const refreshToken = vi.fn();
 		vi.stubGlobal(

@@ -348,7 +348,7 @@ export const sync = internalAction({
 						});
 						continue;
 					}
-					if (answer.status !== 200 || !page.success) throw new Error("Press snapshot is unavailable");
+					if (answer.status !== 200 || !page.success) throw new Error("Bonobo Senate snapshot is unavailable");
 					await ctx.runMutation(internal.access.accept_snapshot_page, {
 						installationId: installation._id,
 						expectedStartRevision: installation.bootstrapStartRevision,
@@ -375,11 +375,11 @@ export const sync = internalAction({
 					continue;
 				}
 				const page = events_response.safeParse(answer.body);
-				if (answer.status !== 200 || !page.success) throw new Error("Press events are unavailable");
+				if (answer.status !== 200 || !page.success) throw new Error("Bonobo Senate events are unavailable");
 				let expectedRevision = installation.appliedAccessRevision + 1;
 				let complete = true;
 				for (const entry of page.data.events) {
-					if (entry.revision !== expectedRevision++) throw new Error("Press access events contain a gap");
+					if (entry.revision !== expectedRevision++) throw new Error("Bonobo Senate access events contain a gap");
 					if (!(await ctx.runMutation(internal.access.apply_event, { installationId: installation._id, ...entry }))) {
 						complete = false;
 						break;
@@ -399,7 +399,7 @@ export const sync = internalAction({
 				}
 			}
 		} catch {
-			console.warn("Press membership sync will retry", { installationId: args.installationId });
+			console.warn("Bonobo Senate membership sync will retry", { installationId: args.installationId });
 		}
 		// The cron resumes saved progress. A failed call must not start another retry chain.
 		return false;

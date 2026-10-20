@@ -3,7 +3,7 @@
 	"name": "chitchat",
 	"displayName": "Chitchat",
 	"version": "0.8.9",
-	"description": "Team chat inside Bonobo Senate Press. Use your Press account and workspace with channels, threads, reactions, file attachments, unread and mention badges, and activity views. Chitchat has its own Convex database and live connections. A connected service keeps Markdown transcript copies in Press Files with current sharing and write permissions.",
+	"description": "Team chat inside Bonobo Senate. Use your Bonobo Senate account and workspace with channels, threads, reactions, file attachments, unread and mention badges, and activity views. Chitchat has its own Convex database and live connections. A connected service keeps Markdown transcript copies in Bonobo Senate Files with current sharing and write permissions.",
 	"compatibility": {
 		"bonoboPluginRuntime": "1"
 	},
@@ -42,14 +42,14 @@
 		},
 		{
 			"path": "dist/frontend/assets/index.js",
-			"sha256": "sha256:fe9c735940e1ffe9f317d1b5dcc36fe8a24ae6c97d9f112d355072691a6ecadb",
-			"bytes": 761729,
+			"sha256": "sha256:87ccd45f010f62ab2c51063b0aa3f44a377547e9e5ef8c3e59f3a137044d449e",
+			"bytes": 929372,
 			"contentType": "application/javascript"
 		},
 		{
 			"path": "dist/frontend/assets/index.css",
-			"sha256": "sha256:79505f4624b5874cae85ff461113778ecb56ee39000cd7196f2ce29fd04565fe",
-			"bytes": 45052,
+			"sha256": "sha256:7621fb1393f234996c1a551a176ff054fa8ad3c6417c1f2a4e45902dcbb3a9fd",
+			"bytes": 46175,
 			"contentType": "text/css"
 		}
 	]

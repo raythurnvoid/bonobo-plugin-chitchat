@@ -315,7 +315,7 @@ function host(isPrivate = false) {
 					},
 				});
 			}
-			throw new Error(`Unexpected Press call: ${path}`);
+			throw new Error(`Unexpected Bonobo Senate call: ${path}`);
 		}),
 	);
 	return {

@@ -468,8 +468,8 @@ export class ChatErrorBoundary extends Component<{ client: BonoboClient; childre
 		return this.state.failed ? (
 			<main className="page-dead" role="alert">
 				<h1>Chitchat</h1>
-				<p>Chitchat could not load this view. Press is still available.</p>
-				{/* A frame navigation ends the Press session. Retry the React view in place. */}
+				<p>Chitchat could not load this view. Bonobo Senate is still available.</p>
+				{/* A frame navigation ends the Bonobo Senate session. Retry the React view in place. */}
 				<button type="button" className="button" onClick={() => this.setState({ failed: false })}>
 					Retry Chitchat
 				</button>

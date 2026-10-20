@@ -1379,7 +1379,7 @@ describe("ChatErrorBoundary", () => {
 				<FailedView />
 			</ChatErrorBoundary>,
 		);
-		expect(screen.getByRole("alert").textContent).toContain("Press is still available.");
+		expect(screen.getByRole("alert").textContent).toContain("Bonobo Senate is still available.");
 		failed = false;
 		fireEvent.click(screen.getByRole("button", { name: /Chitchat/ }));
 		expect(reload).not.toHaveBeenCalled();
@@ -1417,7 +1417,7 @@ describe("TranscriptStatus", () => {
 		expect(screen.getByRole("status").textContent).toBe("Chat is saved. Transcript sync needs attention.");
 		fireEvent.click(screen.getByText("Transcript details"));
 		expect(screen.getByText("A file marker is missing")).toBeTruthy();
-		expect(screen.getByText("Files sharing is managed in Press.")).toBeTruthy();
+		expect(screen.getByText("Files sharing is managed in Bonobo Senate.")).toBeTruthy();
 		expect(screen.getByText("/fresh-transcripts/general")).toBeTruthy();
 	});
 	test("keeps open transcript details and their query during a verified session refresh", () => {
@@ -1479,7 +1479,7 @@ describe("TranscriptStatus", () => {
 		);
 		publish();
 		fireEvent.click(screen.getByText("Transcript details"));
-		expect(screen.getByText(/Planned folder in Press Files/)).toBeTruthy();
+		expect(screen.getByText(/Planned folder in Bonobo Senate Files/)).toBeTruthy();
 		expect(screen.getByText(/If permissions blocked setup, ask a workspace admin to connect/)).toBeTruthy();
 		expect(
 			screen.getByText(/Both the person connecting and the Chitchat service account need Can manage/),
@@ -1511,7 +1511,7 @@ describe("TranscriptStatus", () => {
 		fireEvent.click(screen.getByRole("button", { name: "Retry sync" }));
 		await waitFor(() => expect(fake.mutation).toHaveBeenCalledWith("transcripts:retry", { channelId: "general" }));
 	});
-	test("connects through the current Press token and retries the same connection ID", async () => {
+	test("connects through the current Bonobo Senate token and retries the same connection ID", async () => {
 		fake.action.mockRejectedValueOnce(new Error("Lost response"));
 		const host = client();
 		render_status(host);
@@ -1560,7 +1560,7 @@ describe("TranscriptStatus", () => {
 			expect(screen.queryByText("Chitchat is reconnecting. Try again shortly.")).toBeNull();
 		},
 	);
-	test("does not start a connection if access expires while fetching its Press token", async () => {
+	test("does not start a connection if access expires while fetching its Bonobo Senate token", async () => {
 		const token = deferred<string>();
 		const host = client();
 		vi.mocked(host.getToken).mockImplementationOnce(() => token.promise);

@@ -437,7 +437,7 @@ export const complete_without_files = internalMutation({
 				.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
 				.unique(),
 		]);
-		// A saved connection intent may already have created a private folder in Press.
+		// A saved connection intent may already have created a private folder in Bonobo Senate.
 		if (grant || destination) return false;
 		const pending = await ctx.db
 			.query("channel_access_changes")

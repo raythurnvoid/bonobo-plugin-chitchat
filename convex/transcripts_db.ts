@@ -177,7 +177,7 @@ export const release = internalMutation({
 		await ctx.db.patch("transcript_runs", current.run._id, {
 			leaseUntil: 0,
 			error: args.error,
-			// An unsent call or a first-attempt refusal cannot have advanced Press.
+			// An unsent call or a first-attempt refusal cannot have advanced Bonobo Senate.
 			...(current.run.phase === "fence" && (!current.run.fenceUncertain || args.definiteRefusal)
 				? { claim: "", fenceUncertain: false }
 				: {}),

@@ -147,7 +147,7 @@ async function readers_step(
 				return;
 			}
 			if (!rollback.restored && !rollback.detached)
-				throw new Error("Press has not restored the previous Files readers.");
+				throw new Error("Bonobo Senate has not restored the previous Files readers.");
 			await ctx.runMutation(internal.transcripts_db.reader_receipt, {
 				...checkpoint,
 				receiptId: rollback._id ?? `manual:${run._id}:${job.sequence}`,
@@ -298,7 +298,7 @@ export const run_channel = internalAction({
 					transcripts_file_result,
 				);
 				if (receipt.nodeId !== prepared.nodeId || receipt.operationId !== prepared.operationId)
-					throw new Error("Press did not confirm this transcript archive.");
+					throw new Error("Bonobo Senate did not confirm this transcript archive.");
 				await ctx.runMutation(internal.transcripts_deletions.release, { ...checkpoint, error: null });
 			} catch (error) {
 				await ctx.runMutation(internal.transcripts_deletions.release, {
@@ -409,7 +409,7 @@ export const run_channel = internalAction({
 							transcripts_file_result,
 						);
 						if (!receipt.nodeId || !receipt.contentRevision)
-							throw new Error("Press did not confirm the transcript content.");
+							throw new Error("Bonobo Senate did not confirm the transcript content.");
 						await ctx.runMutation(internal.transcripts_db.save_receipt, {
 							...checkpoint,
 							writeId: write._id,
@@ -600,7 +600,7 @@ export const run_channel = internalAction({
 						transcripts_file_result,
 					);
 					if (!receipt.nodeId || !receipt.contentRevision)
-						throw new Error("Press did not confirm the transcript content.");
+						throw new Error("Bonobo Senate did not confirm the transcript content.");
 					await ctx.runMutation(internal.transcripts_db.save_receipt, {
 						...checkpoint,
 						writeId: write._id,
