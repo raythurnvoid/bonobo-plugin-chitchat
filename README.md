@@ -118,7 +118,7 @@ source, logs, or built assets.
 Use the pinned Node version through Vite Plus:
 
 ```powershell
-vp env exec pnpm --ignore-workspace install
+vp env exec pnpm install
 vp env exec pnpm run typecheck
 vp env exec pnpm run build
 vp env exec pnpm run test:once
