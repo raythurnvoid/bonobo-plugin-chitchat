@@ -773,7 +773,15 @@ function Lr(e) {
 var yy = 16384;
 function kr(e) {
   const n = JSON.stringify(e, (a, u) =>
-    u === void 0 ? "undefined" : typeof u == "bigint" ? `${u.toString()}n` : u,
+    u === void 0
+      ? "undefined"
+      : typeof u == "function"
+        ? "[Function]"
+        : typeof u == "symbol"
+          ? String(u)
+          : typeof u == "bigint"
+            ? `${u.toString()}n`
+            : u,
   );
   if (n.length > yy) {
     const a = "[...truncated]";
@@ -877,8 +885,11 @@ var sn = class {
     get json() {
       return { type: "id", tableName: this.tableName };
     }
-    asOptional() {
+    optional() {
       return new nb({ isOptional: "optional", tableName: this.tableName });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   by = class ib extends sn {
@@ -888,8 +899,11 @@ var sn = class {
     get json() {
       return { type: "number" };
     }
-    asOptional() {
+    optional() {
       return new ib({ isOptional: "optional" });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   py = class ab extends sn {
@@ -899,8 +913,11 @@ var sn = class {
     get json() {
       return { type: "bigint" };
     }
-    asOptional() {
+    optional() {
       return new ab({ isOptional: "optional" });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   T1 = class rb extends sn {
@@ -910,8 +927,11 @@ var sn = class {
     get json() {
       return { type: this.kind };
     }
-    asOptional() {
+    optional() {
       return new rb({ isOptional: "optional" });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   A1 = class ub extends sn {
@@ -921,8 +941,11 @@ var sn = class {
     get json() {
       return { type: this.kind };
     }
-    asOptional() {
+    optional() {
       return new ub({ isOptional: "optional" });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   R1 = class sb extends sn {
@@ -932,8 +955,11 @@ var sn = class {
     get json() {
       return { type: this.kind };
     }
-    asOptional() {
+    optional() {
       return new sb({ isOptional: "optional" });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   O1 = class lb extends sn {
@@ -943,8 +969,11 @@ var sn = class {
     get json() {
       return { type: this.kind };
     }
-    asOptional() {
+    optional() {
       return new lb({ isOptional: "optional" });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   N1 = class ob extends sn {
@@ -954,8 +983,11 @@ var sn = class {
     get json() {
       return { type: this.kind };
     }
-    asOptional() {
+    optional() {
       return new ob({ isOptional: "optional" });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   M1 = class cb extends sn {
@@ -965,8 +997,11 @@ var sn = class {
     get json() {
       return { type: this.kind };
     }
-    asOptional() {
+    optional() {
       return new cb({ isOptional: "optional" });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   z1 = class Or extends sn {
@@ -991,8 +1026,11 @@ var sn = class {
         ),
       };
     }
-    asOptional() {
+    optional() {
       return new Or({ isOptional: "optional", fields: this.fields });
+    }
+    asOptional() {
+      return this.optional();
     }
     omit(...n) {
       const a = { ...this.fields };
@@ -1036,8 +1074,11 @@ var sn = class {
     get json() {
       return { type: this.kind, value: Un(this.value) };
     }
-    asOptional() {
+    optional() {
       return new fb({ isOptional: "optional", value: this.value });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   D1 = class db extends sn {
@@ -1051,8 +1092,11 @@ var sn = class {
     get json() {
       return { type: this.kind, value: this.element.json };
     }
-    asOptional() {
+    optional() {
       return new db({ isOptional: "optional", element: this.element });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   j1 = class hb extends sn {
@@ -1070,7 +1114,7 @@ var sn = class {
       if (u.isOptional === "optional")
         throw new Error("Record validator cannot have optional values");
       if (!a.isConvexValidator || !u.isConvexValidator)
-        throw new Error("Key and value of v.record() but be validators");
+        throw new Error("Key and value of v.record() must be validators");
       ((this.key = a), (this.value = u));
     }
     get json() {
@@ -1080,12 +1124,15 @@ var sn = class {
         values: { fieldType: this.value.json, optional: !1 },
       };
     }
-    asOptional() {
+    optional() {
       return new hb({
         isOptional: "optional",
         key: this.key,
         value: this.value,
       });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   q1 = class mb extends sn {
@@ -1105,8 +1152,11 @@ var sn = class {
     get json() {
       return { type: this.kind, value: this.members.map((n) => n.json) };
     }
-    asOptional() {
+    optional() {
       return new mb({ isOptional: "optional", members: this.members });
+    }
+    asOptional() {
+      return this.optional();
     }
   },
   ce = {
@@ -1147,7 +1197,7 @@ var sn = class {
         (this.data = e));
     }
   },
-  _y = "1.44.0",
+  _y = "1.47.0",
   $1 = Object.defineProperty,
   B1 = (e, n, a) =>
     n in e
