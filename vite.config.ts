@@ -5,7 +5,6 @@ import { defineConfig } from "vite";
 // (dist/frontend/index.html + assets/index.js + assets/index.css), so the build
 // must emit fixed, unhashed names and a single JS chunk.
 export default defineConfig({
-	esbuild: { minifyIdentifiers: true, minifySyntax: true, minifyWhitespace: true },
 	plugins: [
 		react(),
 		{
@@ -34,7 +33,8 @@ export default defineConfig({
 		outDir: "dist/frontend",
 		// Keep the stylesheet readable for review.
 		cssMinify: false,
-		// The build formats the minified JavaScript again for review.
+		// A plugin file may have at most 900,000 bytes, and React alone is bigger than that unminified.
+		// So minify the JavaScript, and let the build format it again with prettier for review.
 		minify: "esbuild",
 		rollupOptions: {
 			output: {

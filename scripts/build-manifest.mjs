@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MAX_REVIEW_LINE_LENGTH = 1_000;
-const MAX_FILE_BYTES = 1_000_000;
+const MAX_FILE_BYTES = 900_000;
 const MAX_FILES = 64;
 const MAX_ARTIFACT_BYTES = 16 * 1024 * 1024;
 

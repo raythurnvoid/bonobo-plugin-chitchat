@@ -19,330 +19,330 @@
  * dark block stands, which is what the plugin shipped before the theme channel existed.
  */
 :root {
-  /* Tells the browser which way to paint the parts this file cannot reach: scrollbars first, plus
+	/* Tells the browser which way to paint the parts this file cannot reach: scrollbars first, plus
 	   any native control. Without it Chrome paints a light scrollbar with stepper arrows down the
 	   middle of the dark message list. The frame is its own document, so the host app's own
 	   `color-scheme` never reaches it — this has to be declared here, next to the palette it belongs
 	   to, and a new palette block needs its own. */
-  color-scheme: dark;
+	color-scheme: dark;
 
-  --cc-surface: var(--color-base-1-01, #0b0b0e);
-  --cc-surface-sunken: #0e0e12;
-  --cc-surface-log: #131318;
-  --cc-surface-raised: var(--color-base-1-03, #16161a);
-  --cc-surface-field: #121216;
-  --cc-surface-control: #1a1a1f;
-  --cc-surface-hover: var(--color-base-1-06, #232329);
+	--cc-surface: var(--color-base-1-01, #0b0b0e);
+	--cc-surface-sunken: #0e0e12;
+	--cc-surface-log: #131318;
+	--cc-surface-raised: var(--color-base-1-03, #16161a);
+	--cc-surface-field: #121216;
+	--cc-surface-control: #1a1a1f;
+	--cc-surface-hover: var(--color-base-1-06, #232329);
 
-  --cc-border: var(--color-base-1-08, #1d1d22);
-  --cc-border-strong: var(--color-base-1-11, #2c2c33);
-  --cc-border-hover: #3a3a42;
+	--cc-border: var(--color-base-1-08, #1d1d22);
+	--cc-border-strong: var(--color-base-1-11, #2c2c33);
+	--cc-border-hover: #3a3a42;
 
-  --cc-text: var(--color-fg-12, #ececef);
-  --cc-text-strong: #cfcfd6;
-  --cc-text-muted: var(--color-fg-09, #9a9aa3);
-  --cc-text-subtle: var(--color-fg-07, #8b8b94);
-  --cc-text-thread-summary: #b1aca2;
+	--cc-text: var(--color-fg-12, #ececef);
+	--cc-text-strong: #cfcfd6;
+	--cc-text-muted: var(--color-fg-09, #9a9aa3);
+	--cc-text-subtle: var(--color-fg-07, #8b8b94);
+	--cc-text-thread-summary: #b1aca2;
 
-  --cc-accent: var(--color-accent-05, #8ab4ff);
-  --cc-accent-surface: #24304a;
-  --cc-accent-surface-hover: #2b3a59;
-  /* The selected channel row only. It is a stronger blue than the tinted primary button, because
+	--cc-accent: var(--color-accent-05, #8ab4ff);
+	--cc-accent-surface: #24304a;
+	--cc-accent-surface-hover: #2b3a59;
+	/* The selected channel row only. It is a stronger blue than the tinted primary button, because
 	   one row out of a list has to be findable at a glance while a button already stands alone. */
-  --cc-accent-surface-selected: #25488a;
-  --cc-accent-border: #3a4c74;
-  --cc-accent-border-strong: #5b79b4;
+	--cc-accent-surface-selected: #25488a;
+	--cc-accent-border: #3a4c74;
+	--cc-accent-border-strong: #5b79b4;
 
-  --cc-danger-text: var(--color-red-09, #ff8f8f);
-  --cc-danger-text-strong: #ff9f9f;
-  --cc-danger-border: #5a2c33;
-  --cc-warning-text: #c9a44a;
-  --cc-warning-border: #4a3d1e;
+	--cc-danger-text: var(--color-red-09, #ff8f8f);
+	--cc-danger-text-strong: #ff9f9f;
+	--cc-danger-border: #5a2c33;
+	--cc-warning-text: #c9a44a;
+	--cc-warning-border: #4a3d1e;
 
-  /* Design decision 1's amber: unread and mention emphasis ONLY, never selection — a channel
+	/* Design decision 1's amber: unread and mention emphasis ONLY, never selection — a channel
 	   can be selected and unread at once, and the two states must stay readable together. */
-  --cc-unread-accent: oklch(0.617 0.15 52);
-  --cc-unread-badge-text: #101014;
+	--cc-unread-accent: oklch(0.617 0.15 52);
+	--cc-unread-badge-text: #101014;
 
-  --cc-overlay: rgba(0, 0, 0, 0.6);
-  --cc-shadow-popover: rgba(0, 0, 0, 0.55);
-  --cc-shadow-dialog: rgba(0, 0, 0, 0.6);
-  --cc-shadow-panel: rgba(0, 0, 0, 0.7);
+	--cc-overlay: rgba(0, 0, 0, 0.6);
+	--cc-shadow-popover: rgba(0, 0, 0, 0.55);
+	--cc-shadow-dialog: rgba(0, 0, 0, 0.6);
+	--cc-shadow-panel: rgba(0, 0, 0, 0.7);
 }
 
 :root.light {
-  color-scheme: light;
+	color-scheme: light;
 
-  --cc-surface: var(--color-base-1-01, #ffffff);
-  --cc-surface-sunken: #f5f5f7;
-  --cc-surface-log: #fafafb;
-  --cc-surface-raised: var(--color-base-1-03, #ffffff);
-  --cc-surface-field: #ffffff;
-  --cc-surface-control: #f0f0f3;
-  --cc-surface-hover: var(--color-base-1-06, #e8e8ec);
+	--cc-surface: var(--color-base-1-01, #ffffff);
+	--cc-surface-sunken: #f5f5f7;
+	--cc-surface-log: #fafafb;
+	--cc-surface-raised: var(--color-base-1-03, #ffffff);
+	--cc-surface-field: #ffffff;
+	--cc-surface-control: #f0f0f3;
+	--cc-surface-hover: var(--color-base-1-06, #e8e8ec);
 
-  --cc-border: var(--color-base-1-08, #e2e2e7);
-  --cc-border-strong: var(--color-base-1-11, #c9c9d1);
-  --cc-border-hover: #b0b0ba;
+	--cc-border: var(--color-base-1-08, #e2e2e7);
+	--cc-border-strong: var(--color-base-1-11, #c9c9d1);
+	--cc-border-hover: #b0b0ba;
 
-  --cc-text: var(--color-fg-12, #1b1b20);
-  --cc-text-strong: #0e0e12;
-  --cc-text-muted: var(--color-fg-09, #5c5c66);
-  --cc-text-subtle: var(--color-fg-07, #6b6b75);
-  --cc-text-thread-summary: #5e5a52;
+	--cc-text: var(--color-fg-12, #1b1b20);
+	--cc-text-strong: #0e0e12;
+	--cc-text-muted: var(--color-fg-09, #5c5c66);
+	--cc-text-subtle: var(--color-fg-07, #6b6b75);
+	--cc-text-thread-summary: #5e5a52;
 
-  --cc-accent: var(--color-accent-05, #1f5bd0);
-  --cc-accent-surface: #dbe6fb;
-  --cc-accent-surface-hover: #c7d8f7;
-  /* Same job on light: clearly the chosen row, still dark text on it. Measured 8.6:1. */
-  --cc-accent-surface-selected: #b3cdf6;
-  --cc-accent-border: #a9c3f0;
-  --cc-accent-border-strong: #5b79b4;
+	--cc-accent: var(--color-accent-05, #1f5bd0);
+	--cc-accent-surface: #dbe6fb;
+	--cc-accent-surface-hover: #c7d8f7;
+	/* Same job on light: clearly the chosen row, still dark text on it. Measured 8.6:1. */
+	--cc-accent-surface-selected: #b3cdf6;
+	--cc-accent-border: #a9c3f0;
+	--cc-accent-border-strong: #5b79b4;
 
-  --cc-danger-text: var(--color-red-09, #b3261e);
-  --cc-danger-text-strong: #8c1d18;
-  --cc-danger-border: #f0b4b0;
-  --cc-warning-text: #7a5a10;
-  --cc-warning-border: #e0cd94;
+	--cc-danger-text: var(--color-red-09, #b3261e);
+	--cc-danger-text-strong: #8c1d18;
+	--cc-danger-border: #f0b4b0;
+	--cc-warning-text: #7a5a10;
+	--cc-warning-border: #e0cd94;
 
-  /* The same amber identity on light. It only ever paints marks and tints, never body text, so
+	/* The same amber identity on light. It only ever paints marks and tints, never body text, so
 	   the mid lightness that reads on dark still reads here. */
-  --cc-unread-accent: oklch(0.617 0.15 52);
-  --cc-unread-badge-text: #101014;
+	--cc-unread-accent: oklch(0.617 0.15 52);
+	--cc-unread-badge-text: #101014;
 
-  /* Shadows carry far less ink on a light ground, or every raised surface reads as a smudge. */
-  --cc-overlay: rgba(0, 0, 0, 0.35);
-  --cc-shadow-popover: rgba(0, 0, 0, 0.12);
-  --cc-shadow-dialog: rgba(0, 0, 0, 0.18);
-  --cc-shadow-panel: rgba(0, 0, 0, 0.22);
+	/* Shadows carry far less ink on a light ground, or every raised surface reads as a smudge. */
+	--cc-overlay: rgba(0, 0, 0, 0.35);
+	--cc-shadow-popover: rgba(0, 0, 0, 0.12);
+	--cc-shadow-dialog: rgba(0, 0, 0, 0.18);
+	--cc-shadow-panel: rgba(0, 0, 0, 0.22);
 }
 
 * {
-  box-sizing: border-box;
+	box-sizing: border-box;
 }
 
 html,
 body {
-  margin: 0;
-  padding: 0;
-  height: 100%;
+	margin: 0;
+	padding: 0;
+	height: 100%;
 }
 
 body {
-  background: var(--cc-surface);
-  color: var(--cc-text);
-  font-family:
-    system-ui,
-    -apple-system,
-    "Segoe UI",
-    Roboto,
-    "Helvetica Neue",
-    Arial,
-    sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
+	background: var(--cc-surface);
+	color: var(--cc-text);
+	font-family:
+		system-ui,
+		-apple-system,
+		"Segoe UI",
+		Roboto,
+		"Helvetica Neue",
+		Arial,
+		sans-serif;
+	font-size: 14px;
+	line-height: 1.5;
+	-webkit-font-smoothing: antialiased;
 }
 
 #root {
-  height: 100vh;
+	height: 100vh;
 }
 
 .visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  /* clip-path, not display:none — a hidden live region must stay in the accessibility tree. */
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	/* clip-path, not display:none — a hidden live region must stay in the accessibility tree. */
+	clip-path: inset(50%);
+	white-space: nowrap;
+	border: 0;
 }
 
 .boot-screen {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 100vh;
-  padding: 24px;
-  text-align: center;
-  color: var(--cc-text-muted);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	min-height: 100vh;
+	padding: 24px;
+	text-align: center;
+	color: var(--cc-text-muted);
 }
 
 .boot-screen.is-error {
-  color: var(--cc-danger-text);
+	color: var(--cc-danger-text);
 }
 
 .button {
-  appearance: none;
-  border: 1px solid var(--cc-border-strong);
-  border-radius: 8px;
-  background: var(--cc-surface-control);
-  color: var(--cc-text);
-  padding: 8px 16px;
-  min-height: 44px;
-  font: inherit;
-  font-size: 13px;
-  cursor: pointer;
-  transition:
-    background 120ms ease,
-    border-color 120ms ease;
+	appearance: none;
+	border: 1px solid var(--cc-border-strong);
+	border-radius: 8px;
+	background: var(--cc-surface-control);
+	color: var(--cc-text);
+	padding: 8px 16px;
+	min-height: 44px;
+	font: inherit;
+	font-size: 13px;
+	cursor: pointer;
+	transition:
+		background 120ms ease,
+		border-color 120ms ease;
 }
 
 .button:hover {
-  background: var(--cc-surface-hover);
-  border-color: var(--cc-border-hover);
+	background: var(--cc-surface-hover);
+	border-color: var(--cc-border-hover);
 }
 
 .button:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: 2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
 }
 
 .button:disabled {
-  opacity: 0.6;
-  cursor: default;
+	opacity: 0.6;
+	cursor: default;
 }
 
 .button-primary {
-  background: var(--cc-accent-surface);
-  border-color: var(--cc-accent-border);
+	background: var(--cc-accent-surface);
+	border-color: var(--cc-accent-border);
 }
 
 .button-primary:hover {
-  background: var(--cc-accent-surface-hover);
+	background: var(--cc-accent-surface-hover);
 }
 
 .button-danger {
-  border-color: var(--cc-danger-border);
-  color: var(--cc-danger-text-strong);
+	border-color: var(--cc-danger-border);
+	color: var(--cc-danger-text-strong);
 }
 
 .form-error {
-  margin: 8px 0 0;
-  color: var(--cc-danger-text);
+	margin: 8px 0 0;
+	color: var(--cc-danger-text);
 }
 
 .field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
 }
 
 /* The text inputs below are tall touch targets. A checkbox is not one, so it keeps its own size
    and the label carries the target height instead. */
 .checkbox-label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+	display: flex;
+	align-items: center;
+	gap: 8px;
 
-  min-height: 32px;
+	min-height: 32px;
 }
 
 .checkbox-label input,
 .people-item input {
-  min-height: 0;
-  width: 16px;
-  height: 16px;
-  padding: 0;
+	min-height: 0;
+	width: 16px;
+	height: 16px;
+	padding: 0;
 }
 
 .field-label {
-  margin: 0;
+	margin: 0;
 
-  font-weight: 600;
+	font-weight: 600;
 }
 
 /* Says who reads a private channel. Muted, because it repeats on every screen that word appears on. */
 .field-note {
-  margin: 0;
+	margin: 0;
 
-  font-size: 12px;
-  color: var(--cc-text-muted);
+	font-size: 12px;
+	color: var(--cc-text-muted);
 }
 
 /* Scrolls on its own: a workspace picker can hold 100 rows and the dialog must stay reachable. */
 .people-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
 
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  max-height: 220px;
-  overflow-y: auto;
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	max-height: 220px;
+	overflow-y: auto;
 }
 
 .people-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
 
-  min-height: 32px;
+	min-height: 32px;
 }
 
 .people-item label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+	display: flex;
+	align-items: center;
+	gap: 8px;
 
-  flex: 1;
-  min-height: 32px;
+	flex: 1;
+	min-height: 32px;
 }
 
 .field input {
-  border: 1px solid var(--cc-border-strong);
-  border-radius: 8px;
-  background: var(--cc-surface-field);
-  color: var(--cc-text);
-  padding: 10px 12px;
-  min-height: 44px;
-  font: inherit;
+	border: 1px solid var(--cc-border-strong);
+	border-radius: 8px;
+	background: var(--cc-surface-field);
+	color: var(--cc-text);
+	padding: 10px 12px;
+	min-height: 44px;
+	font: inherit;
 }
 
 .field input:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: 2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
 }
 
 /* #region layout */
 
 .chitchat {
-  display: flex;
-  height: 100vh;
+	display: flex;
+	height: 100vh;
 }
 
 .page-dead {
-  padding: 24px;
-  max-width: 560px;
+	padding: 24px;
+	max-width: 560px;
 }
 
 .page-dead h1 {
-  margin: 0 0 12px;
-  font-size: 18px;
+	margin: 0 0 12px;
+	font-size: 18px;
 }
 
 .drawer-toggle {
-  display: none;
-  position: fixed;
-  top: 8px;
-  left: 8px;
-  z-index: 30;
+	display: none;
+	position: fixed;
+	top: 8px;
+	left: 8px;
+	z-index: 30;
 }
 
 .sidebar {
-  display: flex;
-  flex-direction: column;
-  width: 240px;
-  flex-shrink: 0;
-  padding: 16px 12px;
-  border-right: 1px solid var(--cc-border);
-  background: var(--cc-surface-sunken);
-  overflow-y: auto;
+	display: flex;
+	flex-direction: column;
+	width: 240px;
+	flex-shrink: 0;
+	padding: 16px 12px;
+	border-right: 1px solid var(--cc-border);
+	background: var(--cc-surface-sunken);
+	overflow-y: auto;
 }
 
 /*
@@ -351,17 +351,17 @@ body {
  * a single flex item and the 12px rhythm between the head and the channel lists would collapse.
  */
 .sidebar-inner {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  flex: 1;
-  min-height: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	flex: 1;
+	min-height: 0;
 }
 
 .sidebar-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+	display: flex;
+	align-items: center;
+	gap: 8px;
 }
 
 /*
@@ -369,145 +369,145 @@ body {
  * closed, inert drawer cannot take the document's only level-1 heading with it.
  */
 .sidebar-title {
-  flex: 1;
-  min-width: 0;
+	flex: 1;
+	min-width: 0;
 
-  margin: 0;
-  font-size: 16px;
-  font-weight: 600;
+	margin: 0;
+	font-size: 16px;
+	font-weight: 600;
 }
 
 /* Small, and on the wordmark's line. As a full-width block it was the loudest thing in the sidebar
    and pushed the section list down, while the reference sidebar opens straight into that list. */
 .sidebar-create {
-  flex: none;
+	flex: none;
 
-  padding: 4px 10px;
-  min-height: 28px;
+	padding: 4px 10px;
+	min-height: 28px;
 
-  font-size: 12px;
+	font-size: 12px;
 }
 
 .channel-section {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
 }
 
 .channel-section-title {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--cc-text-subtle);
+	margin: 0;
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	color: var(--cc-text-subtle);
 }
 
 .channel-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
 }
 
 /* The row actions overlay this box, so it is the positioning context. */
 .channel-item {
-  display: flex;
-  flex-direction: column;
-  position: relative;
+	display: flex;
+	flex-direction: column;
+	position: relative;
 }
 
 .channel-link {
-  appearance: none;
-  border: none;
-  border-radius: 10px;
-  background: transparent;
-  /* A read channel is the quiet default and an unread one is the exception that stands out. The
+	appearance: none;
+	border: none;
+	border-radius: 10px;
+	background: transparent;
+	/* A read channel is the quiet default and an unread one is the exception that stands out. The
 	   rail reads as a list of names, not as a wall of equally loud rows (V1 findings 1 and 2). */
-  color: var(--cc-text-muted);
-  padding: 10px 10px;
-  min-height: 48px;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
+	color: var(--cc-text-muted);
+	padding: 10px 10px;
+	min-height: 48px;
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
 
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 /* Only the collapsed rail shows it. It is aria-hidden, so it is never part of the button's name. */
 .channel-initial {
-  display: none;
+	display: none;
 }
 
 .channel-link:hover:not(:disabled) {
-  background: var(--cc-surface-control);
+	background: var(--cc-surface-control);
 }
 
 .channel-link:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
+	opacity: 0.55;
+	cursor: not-allowed;
 }
 
 .channel-link:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: -2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: -2px;
 }
 
 .channel-link[aria-current="page"] {
-  background: var(--cc-accent-surface-selected);
-  color: var(--cc-text);
+	background: var(--cc-accent-surface-selected);
+	color: var(--cc-text);
 }
 
 /* Unread: a heavier, brighter name plus an amber mark. Selection stays blue (decision 1).
    `--cc-text`, not `--cc-text-strong`: in the dark palette "strong" is the DIMMER of the two, so it
    would flatten the very step this rule exists to make. */
 .channel-link.is-unread {
-  font-weight: 600;
-  color: var(--cc-text);
+	font-weight: 600;
+	color: var(--cc-text);
 }
 
 .unread-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  margin-left: 6px;
-  border-radius: 50%;
-  background: var(--cc-unread-accent);
-  vertical-align: middle;
+	display: inline-block;
+	width: 8px;
+	height: 8px;
+	margin-left: 6px;
+	border-radius: 50%;
+	background: var(--cc-unread-accent);
+	vertical-align: middle;
 }
 
 .mention-badge {
-  display: inline-block;
-  min-width: 18px;
-  margin-left: 6px;
-  padding: 0 5px;
-  border-radius: 9px;
-  background: var(--cc-unread-accent);
-  color: var(--cc-unread-badge-text);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 18px;
-  text-align: center;
-  vertical-align: middle;
+	display: inline-block;
+	min-width: 18px;
+	margin-left: 6px;
+	padding: 0 5px;
+	border-radius: 9px;
+	background: var(--cc-unread-accent);
+	color: var(--cc-unread-badge-text);
+	font-size: 11px;
+	font-weight: 700;
+	line-height: 18px;
+	text-align: center;
+	vertical-align: middle;
 }
 
 /* The three view rows sit above the channel sections and reuse the channel row look. */
 .view-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
 }
 
 .view-item {
-  display: flex;
-  flex-direction: column;
+	display: flex;
+	flex-direction: column;
 }
 
 /*
@@ -521,17 +521,17 @@ body {
  * lies over the channel button, and is restored only on the buttons themselves.
  */
 .channel-item-actions {
-  position: absolute;
-  top: 50%;
-  right: 6px;
-  transform: translateY(-50%);
-  z-index: 1;
+	position: absolute;
+	top: 50%;
+	right: 6px;
+	transform: translateY(-50%);
+	z-index: 1;
 
-  display: flex;
-  gap: 4px;
+	display: flex;
+	gap: 4px;
 
-  opacity: 0;
-  pointer-events: none;
+	opacity: 0;
+	pointer-events: none;
 }
 
 /*
@@ -542,13 +542,13 @@ body {
 .channel-item:hover .channel-item-actions,
 .channel-item:has(:focus-visible) .channel-item-actions,
 .channel-item:has([aria-expanded="true"]) .channel-item-actions {
-  opacity: 1;
+	opacity: 1;
 }
 
 .channel-item:hover .channel-item-actions *,
 .channel-item:has(:focus-visible) .channel-item-actions *,
 .channel-item:has([aria-expanded="true"]) .channel-item-actions * {
-  pointer-events: auto;
+	pointer-events: auto;
 }
 
 /*
@@ -558,7 +558,7 @@ body {
 .channel-item:hover .channel-link,
 .channel-item:has(:focus-visible) .channel-link,
 .channel-item:has([aria-expanded="true"]) .channel-link {
-  padding-right: 42px;
+	padding-right: 42px;
 }
 
 /* #region channel row menu */
@@ -569,78 +569,78 @@ body {
  * name instead.
  */
 .ChannelRowMenu-trigger {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
 
-  appearance: none;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  /* Transparent at rest, like the composer's icon buttons. A filled chip read as bolted onto the
+	appearance: none;
+	border: 1px solid transparent;
+	border-radius: 6px;
+	/* Transparent at rest, like the composer's icon buttons. A filled chip read as bolted onto the
 	   row, worst on the selected row where a dark box sat on the blue. The row only shows this
 	   button when it is hovered, focused, or open, so a muted rest colour bought nothing and cost
 	   contrast on that blue. */
-  background: transparent;
-  color: var(--cc-text);
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  cursor: pointer;
+	background: transparent;
+	color: var(--cc-text);
+	width: 28px;
+	height: 28px;
+	padding: 0;
+	cursor: pointer;
 }
 
 .ChannelRowMenu-trigger:hover {
-  background: var(--cc-surface-hover);
-  color: var(--cc-text);
+	background: var(--cc-surface-hover);
+	color: var(--cc-text);
 }
 
 .ChannelRowMenu-trigger:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: 2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
 }
 
 .ChannelRowMenu-popover {
-  display: flex;
-  flex-direction: column;
+	display: flex;
+	flex-direction: column;
 
-  z-index: 40;
-  border: 1px solid var(--cc-border-strong);
-  border-radius: 10px;
-  background: var(--cc-surface-raised);
-  padding: 4px;
-  min-width: 180px;
+	z-index: 40;
+	border: 1px solid var(--cc-border-strong);
+	border-radius: 10px;
+	background: var(--cc-surface-raised);
+	padding: 4px;
+	min-width: 180px;
 
-  /* Keep the shared alpha token; only this popover's spread is tuned. A small two-item menu carried
+	/* Keep the shared alpha token; only this popover's spread is tuned. A small two-item menu carried
 	   a dialog-sized shadow and read heavier than the surface it floats over. */
-  box-shadow: 0 8px 24px var(--cc-shadow-popover);
+	box-shadow: 0 8px 24px var(--cc-shadow-popover);
 }
 
 .ChannelRowMenu-item {
-  display: flex;
-  align-items: center;
+	display: flex;
+	align-items: center;
 
-  border-radius: 6px;
-  background: transparent;
-  color: var(--cc-text);
-  padding: 0 12px;
-  min-height: 32px;
+	border-radius: 6px;
+	background: transparent;
+	color: var(--cc-text);
+	padding: 0 12px;
+	min-height: 32px;
 
-  font-size: 13px;
-  cursor: pointer;
+	font-size: 13px;
+	cursor: pointer;
 }
 
 /* Ariakit moves this with the keyboard as well as the pointer, so it is the one hover-ish state. */
 .ChannelRowMenu-item[data-active-item] {
-  background: var(--cc-surface-hover);
+	background: var(--cc-surface-hover);
 }
 
 .ChannelRowMenu-item-danger {
-  color: var(--cc-danger-text);
+	color: var(--cc-danger-text);
 }
 
 .ChannelRowMenu-separator {
-  height: 1px;
-  margin: 4px 6px;
-  background: var(--cc-border);
+	height: 1px;
+	margin: 4px 6px;
+	background: var(--cc-border);
 }
 
 /* #endregion channel row menu */
@@ -652,45 +652,45 @@ body {
  * spill would give the frame a horizontal scrollbar.
  */
 .sidebar-expand {
-  display: none;
+	display: none;
 }
 
 .main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
 }
 
 .main-notices {
-  flex-shrink: 0;
+	flex-shrink: 0;
 }
 
 .page-controls {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 12px;
-  font-size: 12px;
-  color: var(--cc-text-muted);
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	padding: 8px 12px;
+	font-size: 12px;
+	color: var(--cc-text-muted);
 }
 
 .connection-status,
 .transcript-status {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--cc-border);
-  font-size: 12px;
-  color: var(--cc-text-muted);
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+	flex-shrink: 0;
+	padding: 8px 16px;
+	border-bottom: 1px solid var(--cc-border);
+	font-size: 12px;
+	color: var(--cc-text-muted);
 }
 
 .transcript-status code {
-  overflow-wrap: anywhere;
+	overflow-wrap: anywhere;
 }
 
 /* #endregion layout */
@@ -698,108 +698,108 @@ body {
 /* #region channel */
 
 .channel {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  min-height: 0;
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	min-height: 0;
 }
 
 .channel-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--cc-border);
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 12px 16px;
+	border-bottom: 1px solid var(--cc-border);
 }
 
 /* Title and topic stack, so the badge and any head control stay on the head's own row. */
 .channel-head-main {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
 }
 
 .channel-title {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+	margin: 0;
+	font-size: 15px;
+	font-weight: 600;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 /* One line only. A wrapping topic would spend log height that the density budget has not got. */
 .channel-topic {
-  margin: 0;
+	margin: 0;
 
-  font-size: 13px;
-  font-weight: 400;
-  color: var(--cc-text-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+	font-size: 13px;
+	font-weight: 400;
+	color: var(--cc-text-muted);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .channel-privacy {
-  margin: 0;
+	margin: 0;
 
-  font-size: 12px;
-  font-weight: 400;
-  color: var(--cc-text-muted);
+	font-size: 12px;
+	font-weight: 400;
+	color: var(--cc-text-muted);
 }
 
 .channel-archived-badge {
-  font-size: 12px;
-  color: var(--cc-warning-text);
-  border: 1px solid var(--cc-warning-border);
-  border-radius: 6px;
-  padding: 1px 8px;
+	font-size: 12px;
+	color: var(--cc-warning-text);
+	border: 1px solid var(--cc-warning-border);
+	border-radius: 6px;
+	padding: 1px 8px;
 }
 
 .channel-body {
-  display: flex;
-  flex: 1;
-  min-height: 0;
+	display: flex;
+	flex: 1;
+	min-height: 0;
 
-  /* The resize handle is absolutely positioned over the panel edge, so it needs this ancestor. */
-  position: relative;
+	/* The resize handle is absolutely positioned over the panel edge, so it needs this ancestor. */
+	position: relative;
 }
 
 .channel-dead {
-  margin: 24px;
-  padding: 16px;
-  border: 1px solid var(--cc-danger-border);
-  border-radius: 10px;
-  color: var(--cc-danger-text-strong);
-  max-width: 560px;
+	margin: 24px;
+	padding: 16px;
+	border: 1px solid var(--cc-danger-border);
+	border-radius: 10px;
+	color: var(--cc-danger-text-strong);
+	max-width: 560px;
 }
 
 .message-log {
-  flex: 1;
-  min-width: 0;
-  overflow-y: auto;
-  padding: 12px 16px;
+	flex: 1;
+	min-width: 0;
+	overflow-y: auto;
+	padding: 12px 16px;
 }
 
 .log-older {
-  display: flex;
-  justify-content: center;
-  margin-bottom: 12px;
+	display: flex;
+	justify-content: center;
+	margin-bottom: 12px;
 }
 
 .channel-status {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  padding: 24px 12px;
-  text-align: center;
-  color: var(--cc-text-muted);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 12px;
+	padding: 24px 12px;
+	text-align: center;
+	color: var(--cc-text-muted);
 }
 
 .channel-status.is-error {
-  color: var(--cc-danger-text);
-  flex-wrap: wrap;
+	color: var(--cc-danger-text);
+	flex-wrap: wrap;
 }
 
 /* #endregion channel */
@@ -807,144 +807,144 @@ body {
 /* #region views */
 
 .view {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  min-height: 0;
-  overflow-y: auto;
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	min-height: 0;
+	overflow-y: auto;
 }
 
 .view-head {
-  padding: 12px 16px 0;
+	padding: 12px 16px 0;
 }
 
 .view-title {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
+	margin: 0;
+	font-size: 15px;
+	font-weight: 600;
 }
 
 /* Every view says its own limits in one visible sentence. */
 .view-note {
-  margin: 4px 16px 8px;
-  font-size: 12px;
-  color: var(--cc-text-muted);
+	margin: 4px 16px 8px;
+	font-size: 12px;
+	color: var(--cc-text-muted);
 }
 
 .view-rows {
-  list-style: none;
-  margin: 0;
-  padding: 0 12px 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+	list-style: none;
+	margin: 0;
+	padding: 0 12px 16px;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
 }
 
 .view-row-button {
-  appearance: none;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  color: inherit;
-  padding: 8px 10px;
-  width: 100%;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
+	appearance: none;
+	border: none;
+	border-radius: 8px;
+	background: transparent;
+	color: inherit;
+	padding: 8px 10px;
+	width: 100%;
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
 
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  column-gap: 8px;
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	column-gap: 8px;
 }
 
 .view-row-button:hover {
-  background: var(--cc-surface-control);
+	background: var(--cc-surface-control);
 }
 
 .view-row-button:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: -2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: -2px;
 }
 
 .view-row-title {
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+	font-weight: 600;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .view-row-time {
-  font-size: 12px;
-  color: var(--cc-text-subtle);
-  white-space: nowrap;
+	font-size: 12px;
+	color: var(--cc-text-subtle);
+	white-space: nowrap;
 }
 
 .view-row-preview {
-  grid-column: 1 / -1;
-  font-size: 13px;
-  color: var(--cc-text-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+	grid-column: 1 / -1;
+	font-size: 13px;
+	color: var(--cc-text-muted);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 /* Activity groups messages under channel headers; those rows carry text, not a button. */
 .view-groups {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 0 12px 16px;
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	padding: 0 12px 16px;
 }
 
 .view-groups .view-rows {
-  padding: 0;
+	padding: 0;
 }
 
 .view-groups .view-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  column-gap: 8px;
-  padding: 6px 10px;
-  border-radius: 8px;
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	column-gap: 8px;
+	padding: 6px 10px;
+	border-radius: 8px;
 }
 
 /* A message that names you: decision 1's amber, as a tint under the row. */
 .view-row.mention-self {
-  background: color-mix(in oklab, var(--cc-unread-accent) 14%, transparent);
-  border-left: 2px solid var(--cc-unread-accent);
+	background: color-mix(in oklab, var(--cc-unread-accent) 14%, transparent);
+	border-left: 2px solid var(--cc-unread-accent);
 }
 
 .view-group-title {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+	margin: 0;
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
 }
 
 .view-group-link {
-  appearance: none;
-  border: none;
-  background: transparent;
-  color: var(--cc-text-subtle);
-  padding: 4px 10px;
-  border-radius: 6px;
-  font: inherit;
-  font-size: inherit;
-  font-weight: inherit;
-  letter-spacing: inherit;
-  text-transform: inherit;
-  cursor: pointer;
+	appearance: none;
+	border: none;
+	background: transparent;
+	color: var(--cc-text-subtle);
+	padding: 4px 10px;
+	border-radius: 6px;
+	font: inherit;
+	font-size: inherit;
+	font-weight: inherit;
+	letter-spacing: inherit;
+	text-transform: inherit;
+	cursor: pointer;
 }
 
 .view-group-link:hover {
-  background: var(--cc-surface-control);
-  color: var(--cc-text);
+	background: var(--cc-surface-control);
+	color: var(--cc-text);
 }
 
 .view-group-link:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: -2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: -2px;
 }
 
 /* #endregion views */
@@ -956,12 +956,12 @@ body {
  * leader instead, so rows inside one group sit flush and only the gap between groups survives.
  */
 .message-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0;
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 0;
 }
 
 /*
@@ -970,33 +970,33 @@ body {
  * attachments list and the row-level error into the 54px track and print them one character per line.
  */
 .message {
-  position: relative;
-  display: grid;
-  grid-template-columns: 54px minmax(0, 1fr);
-  border-radius: 10px;
-  min-height: 52px;
-  padding: 4px 10px;
+	position: relative;
+	display: grid;
+	grid-template-columns: 54px minmax(0, 1fr);
+	border-radius: 10px;
+	min-height: 52px;
+	padding: 4px 10px;
 }
 
 .message > * {
-  grid-column: 2;
+	grid-column: 2;
 }
 
 .message-avatar {
-  grid-column: 1;
-  grid-row: 1 / span 2;
+	grid-column: 1;
+	grid-row: 1 / span 2;
 
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border-radius: 8px;
-  background: var(--cc-accent-surface);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	height: 32px;
+	border-radius: 8px;
+	background: var(--cc-accent-surface);
 
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--cc-text);
+	font-size: 13px;
+	font-weight: 600;
+	color: var(--cc-text);
 }
 
 /*
@@ -1004,12 +1004,12 @@ body {
  * line is all that remains and min-height supplies the last pixel of §5's 24px.
  */
 .message.is-continuation {
-  min-height: 24px;
-  padding: 0 10px;
+	min-height: 24px;
+	padding: 0 10px;
 }
 
 .message.is-continuation .message-avatar {
-  display: none;
+	display: none;
 }
 
 /*
@@ -1017,21 +1017,21 @@ body {
  * would auto-place into the avatar track and every continuation would lose its leader's alignment.
  */
 .message.is-continuation .message-text {
-  grid-column: 2;
+	grid-column: 2;
 }
 
 .message.is-leader {
-  margin-top: 16px;
+	margin-top: 16px;
 }
 
 /* The first group in the log needs no gap above it. */
 .message-list > .message.is-leader:first-child {
-  margin-top: 0;
+	margin-top: 0;
 }
 
 .message:hover,
 .message:focus-within {
-  background: var(--cc-surface-log);
+	background: var(--cc-surface-log);
 }
 
 /*
@@ -1042,15 +1042,15 @@ body {
  */
 .message:hover .message-text,
 .message:focus-within .message-text {
-  padding-right: min(304px, 45%);
+	padding-right: min(304px, 45%);
 }
 
 .message.is-pending {
-  opacity: 0.85;
+	opacity: 0.85;
 }
 
 .message.is-failed {
-  opacity: 1;
+	opacity: 1;
 }
 
 /*
@@ -1058,14 +1058,14 @@ body {
  * announced from its own content, so the date is read once with no role and no label.
  */
 .day-divider {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 32px;
-  padding: 0 10px;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	min-height: 32px;
+	padding: 0 10px;
 
-  font-size: 12px;
-  color: var(--cc-text-subtle);
+	font-size: 12px;
+	color: var(--cc-text-subtle);
 }
 
 /*
@@ -1075,80 +1075,80 @@ body {
  * gives amber to unread and mention emphasis, and this is the log's own unread boundary.
  */
 .new-divider {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 32px;
-  padding: 0 10px;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	min-height: 32px;
+	padding: 0 10px;
 
-  color: var(--cc-unread-accent);
-  font-size: 12px;
-  font-weight: 600;
+	color: var(--cc-unread-accent);
+	font-size: 12px;
+	font-weight: 600;
 }
 
 .new-divider::before {
-  content: "";
-  flex: 1;
-  height: 1px;
-  background: var(--cc-unread-accent);
+	content: "";
+	flex: 1;
+	height: 1px;
+	background: var(--cc-unread-accent);
 }
 
 .new-divider-label {
-  flex-shrink: 0;
+	flex-shrink: 0;
 }
 
 .message-head {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
 }
 
 .message-author {
-  /* A display name has no break opportunity of its own — an anonymous member's is one 32-character
+	/* A display name has no break opportunity of its own — an anonymous member's is one 32-character
 	   token. In the 340px thread panel that token was wider than the head, so the panel grew a
 	   horizontal scrollbar and pushed the time out of sight. Break it like message text instead of
 	   truncating it: the name is how a reader tells two people apart. */
-  min-width: 0;
-  overflow-wrap: anywhere;
+	min-width: 0;
+	overflow-wrap: anywhere;
 
-  font-weight: 600;
+	font-weight: 600;
 }
 
 .message-time {
-  /* The clock is short and fixed, so the name takes the squeeze. */
-  flex-shrink: 0;
+	/* The clock is short and fixed, so the name takes the squeeze. */
+	flex-shrink: 0;
 
-  font-size: 12px;
-  color: var(--cc-text-subtle);
+	font-size: 12px;
+	color: var(--cc-text-subtle);
 }
 
 .message-text {
-  margin: 2px 0 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+	margin: 2px 0 0;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
 }
 
 .message-text.is-deleted {
-  color: var(--cc-text-subtle);
-  font-style: italic;
+	color: var(--cc-text-subtle);
+	font-style: italic;
 }
 
 /* A mention is a name, not a control. Only a mention of YOU takes decision 1's amber. */
 .mention {
-  font-weight: 600;
-  color: var(--cc-text-strong);
+	font-weight: 600;
+	color: var(--cc-text-strong);
 }
 
 .mention.mention-self {
-  border-radius: 4px;
-  background: color-mix(in oklab, var(--cc-unread-accent) 22%, transparent);
-  color: var(--cc-text);
-  padding: 0 3px;
+	border-radius: 4px;
+	background: color-mix(in oklab, var(--cc-unread-accent) 22%, transparent);
+	color: var(--cc-text);
+	padding: 0 3px;
 }
 
 .message-edited {
-  color: var(--cc-text-subtle);
-  font-size: 12px;
+	color: var(--cc-text-subtle);
+	font-size: 12px;
 }
 
 /* Actions reveal on hover AND on focus-within. The buttons hide with opacity, never
@@ -1167,39 +1167,39 @@ body {
    cluster's box covers text and attachment links beneath it, and only the buttons should
    catch a click. */
 .message-actions {
-  position: absolute;
-  right: 10px;
-  bottom: 0;
-  z-index: 1;
+	position: absolute;
+	right: 10px;
+	bottom: 0;
+	z-index: 1;
 
-  display: flex;
-  /* The cluster keeps to 45% so it never covers the message text, and in the 340px thread panel
+	display: flex;
+	/* The cluster keeps to 45% so it never covers the message text, and in the 340px thread panel
 	   three buttons do not fit in that budget. Wrapping is what keeps the overflow inside the
 	   cluster: with nowrap the buttons spilled past the row and the whole panel scrolled sideways. */
-  flex-wrap: wrap;
-  justify-content: end;
-  gap: 4px;
-  max-width: 45%;
-  margin-top: 0;
+	flex-wrap: wrap;
+	justify-content: end;
+	gap: 4px;
+	max-width: 45%;
+	margin-top: 0;
 
-  opacity: 0;
-  pointer-events: none;
+	opacity: 0;
+	pointer-events: none;
 }
 
 .message:hover .message-actions,
 .message:focus-within .message-actions {
-  opacity: 1;
+	opacity: 1;
 }
 
 .message:hover .message-actions *,
 .message:focus-within .message-actions * {
-  pointer-events: auto;
+	pointer-events: auto;
 }
 
 .message-action {
-  padding: 4px 10px;
-  min-height: 28px;
-  font-size: 12px;
+	padding: 4px 10px;
+	min-height: 28px;
+	font-size: 12px;
 }
 
 /*
@@ -1211,23 +1211,23 @@ body {
  * root with replies would outnumber all three.
  */
 .message-thread-summary {
-  appearance: none;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--cc-text-thread-summary);
-  padding: 2px 6px 2px 4px;
-  margin-left: -4px;
-  min-height: 24px;
-  font: inherit;
-  font-size: 12px;
-  text-align: left;
-  cursor: pointer;
+	appearance: none;
+	border: none;
+	border-radius: 8px;
+	background: transparent;
+	color: var(--cc-text-thread-summary);
+	padding: 2px 6px 2px 4px;
+	margin-left: -4px;
+	min-height: 24px;
+	font: inherit;
+	font-size: 12px;
+	text-align: left;
+	cursor: pointer;
 
-  /* The reply glyph and the recency sit on one line with the count. */
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
+	/* The reply glyph and the recency sit on one line with the count. */
+	display: inline-flex;
+	align-items: baseline;
+	gap: 6px;
 }
 
 /*
@@ -1236,54 +1236,54 @@ body {
  * decision 1 asks for. Colour stays neutral: blue would claim a state the member does not own.
  */
 .message-thread-summary-icon {
-  color: var(--cc-text-subtle);
+	color: var(--cc-text-subtle);
 }
 
 .message-thread-summary-count {
-  font-weight: 600;
-  text-decoration: underline;
-  text-underline-offset: 2px;
+	font-weight: 600;
+	text-decoration: underline;
+	text-underline-offset: 2px;
 }
 
 .message-thread-summary-recency {
-  color: var(--cc-text-subtle);
+	color: var(--cc-text-subtle);
 }
 
 .message-thread-summary:hover:not(:disabled) {
-  background: var(--cc-surface-control);
-  color: var(--cc-text);
+	background: var(--cc-surface-control);
+	color: var(--cc-text);
 }
 
 .message-thread-summary:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
+	opacity: 0.55;
+	cursor: not-allowed;
 }
 
 .message-thread-summary:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: 2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
 }
 
 .message-edit {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 4px;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	margin-top: 4px;
 }
 
 .message-edit-actions {
-  display: flex;
-  gap: 6px;
-  justify-content: end;
+	display: flex;
+	gap: 6px;
+	justify-content: end;
 }
 
 .message-send-error {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-top: 6px;
-  color: var(--cc-danger-text);
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	flex-wrap: wrap;
+	margin-top: 6px;
+	color: var(--cc-danger-text);
 }
 
 /* #endregion messages */
@@ -1291,95 +1291,95 @@ body {
 /* #region reactions */
 
 .message-reactions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 6px;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	margin-top: 6px;
 }
 
 /* Sits where the chips would sit, but reads as a note rather than as a reaction. */
 .message-reactions-unknown {
-  margin-top: 6px;
+	margin-top: 6px;
 
-  font-size: 12px;
-  font-style: italic;
-  color: var(--cc-text-subtle);
+	font-size: 12px;
+	font-style: italic;
+	color: var(--cc-text-subtle);
 }
 
 .reaction-chip {
-  appearance: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid var(--cc-border-strong);
-  border-radius: 999px;
-  background: var(--cc-surface-raised);
-  color: var(--cc-text);
-  padding: 4px 12px;
-  min-height: 28px;
-  font: inherit;
-  font-size: 13px;
-  cursor: pointer;
+	appearance: none;
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	border: 1px solid var(--cc-border-strong);
+	border-radius: 999px;
+	background: var(--cc-surface-raised);
+	color: var(--cc-text);
+	padding: 4px 12px;
+	min-height: 28px;
+	font: inherit;
+	font-size: 13px;
+	cursor: pointer;
 }
 
 .reaction-chip:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: 2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
 }
 
 /* Own reaction: border + background, never color alone. */
 .reaction-chip.is-mine {
-  background: var(--cc-accent-surface);
-  border-color: var(--cc-accent-border-strong);
+	background: var(--cc-accent-surface);
+	border-color: var(--cc-accent-border-strong);
 }
 
 .reaction-chip-count {
-  font-variant-numeric: tabular-nums;
+	font-variant-numeric: tabular-nums;
 }
 
 .add-reaction {
-  position: relative;
-  display: inline-flex;
+	position: relative;
+	display: inline-flex;
 }
 
 .reaction-palette {
-  position: absolute;
-  bottom: calc(100% + 4px);
-  left: 0;
-  z-index: 20;
-  display: flex;
-  gap: 2px;
-  padding: 4px;
-  border: 1px solid var(--cc-border-strong);
-  border-radius: 10px;
-  background: var(--cc-surface-raised);
-  box-shadow: 0 6px 18px var(--cc-shadow-popover);
+	position: absolute;
+	bottom: calc(100% + 4px);
+	left: 0;
+	z-index: 20;
+	display: flex;
+	gap: 2px;
+	padding: 4px;
+	border: 1px solid var(--cc-border-strong);
+	border-radius: 10px;
+	background: var(--cc-surface-raised);
+	box-shadow: 0 6px 18px var(--cc-shadow-popover);
 }
 
 .reaction-palette-item {
-  appearance: none;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
-  padding: 6px;
-  min-width: 44px;
-  min-height: 44px;
-  font-size: 18px;
-  cursor: pointer;
+	appearance: none;
+	border: 1px solid transparent;
+	border-radius: 8px;
+	background: transparent;
+	padding: 6px;
+	min-width: 44px;
+	min-height: 44px;
+	font-size: 18px;
+	cursor: pointer;
 }
 
 .reaction-palette-item:hover {
-  background: var(--cc-surface-hover);
+	background: var(--cc-surface-hover);
 }
 
 .reaction-palette-item:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: -2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: -2px;
 }
 
 .reaction-palette-item[aria-pressed="true"] {
-  background: var(--cc-accent-surface);
-  border-color: var(--cc-accent-border-strong);
+	background: var(--cc-accent-surface);
+	border-color: var(--cc-accent-border-strong);
 }
 
 /* #endregion reactions */
@@ -1387,56 +1387,56 @@ body {
 /* #region attachments */
 
 .message-attachments {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 6px;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	margin-top: 6px;
 }
 
 .attachment {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
 }
 
 .attachment-button {
-  appearance: none;
-  border: none;
-  background: transparent;
-  color: var(--cc-accent);
-  padding: 4px 0;
-  min-height: 24px;
-  font: inherit;
-  text-decoration: underline;
-  cursor: pointer;
-  text-align: left;
-  overflow-wrap: anywhere;
+	appearance: none;
+	border: none;
+	background: transparent;
+	color: var(--cc-accent);
+	padding: 4px 0;
+	min-height: 24px;
+	font: inherit;
+	text-decoration: underline;
+	cursor: pointer;
+	text-align: left;
+	overflow-wrap: anywhere;
 }
 
 .attachment-button:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: 2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
 }
 
 .attachment-link {
-  color: var(--cc-accent);
-  overflow-wrap: anywhere;
+	color: var(--cc-accent);
+	overflow-wrap: anywhere;
 }
 
 .attachment-link:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: 2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
 }
 
 .attachment-hint {
-  font-size: 12px;
-  color: var(--cc-text-subtle);
+	font-size: 12px;
+	color: var(--cc-text-subtle);
 }
 
 .attachment-error {
-  color: var(--cc-danger-text);
-  font-size: 13px;
+	color: var(--cc-danger-text);
+	font-size: 13px;
 }
 
 /* #endregion attachments */
@@ -1444,86 +1444,86 @@ body {
 /* #region composer */
 
 .composer {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 8px 16px 10px;
-  border-top: 1px solid var(--cc-border);
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 8px 16px 10px;
+	border-top: 1px solid var(--cc-border);
 }
 
 /* Portalled by Ariakit, so it is not positioned against the composer. The caret stays in the
    textarea (virtual focus). */
 .mention-menu {
-  display: flex;
-  flex-direction: column;
-  z-index: 40;
-  margin: 0;
-  padding: 4px;
-  min-width: 220px;
-  background: var(--cc-surface-raised);
-  border: 1px solid var(--cc-border-strong);
-  border-radius: 10px;
-  box-shadow: 0 8px 24px var(--cc-shadow-popover);
+	display: flex;
+	flex-direction: column;
+	z-index: 40;
+	margin: 0;
+	padding: 4px;
+	min-width: 220px;
+	background: var(--cc-surface-raised);
+	border: 1px solid var(--cc-border-strong);
+	border-radius: 10px;
+	box-shadow: 0 8px 24px var(--cc-shadow-popover);
 }
 
 .mention-menu-status {
-  padding: 8px 10px;
-  max-width: 260px;
-  color: var(--cc-text-muted);
-  font-size: 13px;
-  line-height: 1.35;
+	padding: 8px 10px;
+	max-width: 260px;
+	color: var(--cc-text-muted);
+	font-size: 13px;
+	line-height: 1.35;
 }
 
 .mention-option {
-  padding: 6px 10px;
-  border-radius: 6px;
-  cursor: pointer;
+	padding: 6px 10px;
+	border-radius: 6px;
+	cursor: pointer;
 }
 
 /* Ariakit moves this with the keyboard as well as the pointer, so it is the one hover-ish state. */
 .mention-option[data-active-item] {
-  background: var(--cc-surface-hover);
+	background: var(--cc-surface-hover);
 }
 
 .composer-attachments {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
 }
 
 .composer-attachment {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid var(--cc-border-strong);
-  border-radius: 999px;
-  background: var(--cc-surface-raised);
-  padding: 2px 4px 2px 12px;
-  font-size: 13px;
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	border: 1px solid var(--cc-border-strong);
+	border-radius: 999px;
+	background: var(--cc-surface-raised);
+	padding: 2px 4px 2px 12px;
+	font-size: 13px;
 }
 
 .composer-attachment-remove {
-  appearance: none;
-  border: none;
-  border-radius: 999px;
-  background: transparent;
-  color: var(--cc-text);
-  min-width: 32px;
-  min-height: 32px;
-  font-size: 14px;
-  cursor: pointer;
+	appearance: none;
+	border: none;
+	border-radius: 999px;
+	background: transparent;
+	color: var(--cc-text);
+	min-width: 32px;
+	min-height: 32px;
+	font-size: 14px;
+	cursor: pointer;
 }
 
 .composer-attachment-remove:hover {
-  background: var(--cc-surface-hover);
+	background: var(--cc-surface-hover);
 }
 
 .composer-attachment-remove:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: 2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
 }
 
 /*
@@ -1532,40 +1532,40 @@ body {
  * and not on the textarea, because the reference composer draws the controls inside the field.
  */
 .composer-bar {
-  display: flex;
-  align-items: end;
-  gap: 8px;
+	display: flex;
+	align-items: end;
+	gap: 8px;
 
-  border: 1px solid var(--cc-border-strong);
-  border-radius: 14px;
-  background: var(--cc-surface-field);
-  padding: 5px 6px 5px 0;
-  min-height: 44px;
+	border: 1px solid var(--cc-border-strong);
+	border-radius: 14px;
+	background: var(--cc-surface-field);
+	padding: 5px 6px 5px 0;
+	min-height: 44px;
 }
 
 /* Focus lands on the textarea, but the ring belongs on the box a member reads as the field. */
 .composer-bar:focus-within {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: 2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
 }
 
 .composer-input {
-  flex: 1;
-  min-width: 0;
+	flex: 1;
+	min-width: 0;
 
-  border: none;
-  background: transparent;
-  color: var(--cc-text);
-  padding: 8px 12px;
-  /* Growing past a few lines would eat the log; past that the box scrolls. */
-  max-height: 132px;
-  font: inherit;
-  resize: vertical;
+	border: none;
+	background: transparent;
+	color: var(--cc-text);
+	padding: 8px 12px;
+	/* Growing past a few lines would eat the log; past that the box scrolls. */
+	max-height: 132px;
+	font: inherit;
+	resize: vertical;
 }
 
 /* The box already shows the ring, and a second one inside it read as two nested fields. */
 .composer-input:focus-visible {
-  outline: none;
+	outline: none;
 }
 
 /*
@@ -1573,52 +1573,52 @@ body {
  * 32px keeps it above the 24px WCAG 2.5.8 AA target size even though it is inside a dense bar.
  */
 .composer-action {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex: none;
 
-  appearance: none;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--cc-text-muted);
-  width: 32px;
-  height: 32px;
-  padding: 0;
-  cursor: pointer;
+	appearance: none;
+	border: 1px solid transparent;
+	border-radius: 8px;
+	background: transparent;
+	color: var(--cc-text-muted);
+	width: 32px;
+	height: 32px;
+	padding: 0;
+	cursor: pointer;
 }
 
 .composer-action:hover:not(:disabled) {
-  background: var(--cc-surface-hover);
-  color: var(--cc-text);
+	background: var(--cc-surface-hover);
+	color: var(--cc-text);
 }
 
 .composer-action:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: 2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: 2px;
 }
 
 .composer-action:disabled {
-  opacity: 0.5;
-  cursor: default;
+	opacity: 0.5;
+	cursor: default;
 }
 
 /* Send is the one filled control in the bar, the way the reference draws it. */
 .composer-send {
-  background: var(--cc-accent-surface);
-  border-color: var(--cc-accent-border);
-  color: var(--cc-text);
+	background: var(--cc-accent-surface);
+	border-color: var(--cc-accent-border);
+	color: var(--cc-text);
 }
 
 .composer-send:hover:not(:disabled) {
-  background: var(--cc-accent-surface-hover);
+	background: var(--cc-accent-surface-hover);
 }
 
 .composer-hint {
-  min-width: 0;
-  font-size: 11px;
-  color: var(--cc-text-subtle);
+	min-width: 0;
+	font-size: 11px;
+	color: var(--cc-text-subtle);
 }
 
 /* #endregion composer */
@@ -1631,14 +1631,14 @@ body {
  * announced value counted down.
  */
 .thread {
-  display: flex;
-  flex-direction: column;
-  flex: 0 1 var(--thread-width, 340px);
-  min-width: 244px;
-  min-height: 0;
-  border-left: 1px solid var(--cc-border);
-  background: var(--cc-surface-sunken);
-  overflow: hidden;
+	display: flex;
+	flex-direction: column;
+	flex: 0 1 var(--thread-width, 340px);
+	min-width: 244px;
+	min-height: 0;
+	border-left: 1px solid var(--cc-border);
+	background: var(--cc-surface-sunken);
+	overflow: hidden;
 }
 
 /*
@@ -1647,59 +1647,59 @@ body {
  * derives, and the frame would gain the horizontal scrollbar those floors exist to prevent.
  */
 .thread-resize {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  /* Centre the strip on the panel's left border, which sits exactly one thread width in. */
-  right: calc(var(--thread-width, 340px) - 12px);
-  width: 24px;
-  z-index: 2;
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	/* Centre the strip on the panel's left border, which sits exactly one thread width in. */
+	right: calc(var(--thread-width, 340px) - 12px);
+	width: 24px;
+	z-index: 2;
 
-  appearance: none;
-  border: none;
-  padding: 0;
-  background: transparent;
-  cursor: col-resize;
+	appearance: none;
+	border: none;
+	padding: 0;
+	background: transparent;
+	cursor: col-resize;
 }
 
 .thread-resize:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: -2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: -2px;
 }
 
 .thread-head {
-  display: flex;
-  flex-shrink: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--cc-border);
+	display: flex;
+	flex-shrink: 0;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	padding: 10px 12px;
+	border-bottom: 1px solid var(--cc-border);
 }
 
 .thread-title {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
+	margin: 0;
+	font-size: 14px;
+	font-weight: 600;
 }
 
 .thread-root {
-  padding: 8px;
-  flex-shrink: 0;
-  max-height: 40%;
-  overflow-y: auto;
-  border-bottom: 1px solid var(--cc-border);
+	padding: 8px;
+	flex-shrink: 0;
+	max-height: 40%;
+	overflow-y: auto;
+	border-bottom: 1px solid var(--cc-border);
 }
 
 .thread-replies {
-  padding: 8px;
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
+	padding: 8px;
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
 }
 
 .thread > .composer {
-  flex-shrink: 0;
+	flex-shrink: 0;
 }
 
 /* #endregion thread */
@@ -1707,86 +1707,86 @@ body {
 /* #region dialogs */
 
 .dialog-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 40;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
-  background: var(--cc-overlay);
+	position: fixed;
+	inset: 0;
+	z-index: 40;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 16px;
+	background: var(--cc-overlay);
 }
 
 .dialog {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  width: min(440px, 100%);
-  max-height: min(560px, 100%);
-  overflow-y: auto;
-  padding: 16px;
-  border: 1px solid var(--cc-border-strong);
-  border-radius: 12px;
-  background: var(--cc-surface-field);
-  box-shadow: 0 12px 40px var(--cc-shadow-dialog);
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	width: min(440px, 100%);
+	max-height: min(560px, 100%);
+	overflow-y: auto;
+	padding: 16px;
+	border: 1px solid var(--cc-border-strong);
+	border-radius: 12px;
+	background: var(--cc-surface-field);
+	box-shadow: 0 12px 40px var(--cc-shadow-dialog);
 }
 
 .dialog-title {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
+	margin: 0;
+	font-size: 15px;
+	font-weight: 600;
 }
 
 .dialog-actions {
-  display: flex;
-  justify-content: end;
-  gap: 8px;
+	display: flex;
+	justify-content: end;
+	gap: 8px;
 }
 
 .picker-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
 }
 
 .picker-item {
-  appearance: none;
-  display: flex;
-  flex-direction: column;
-  align-items: start;
-  gap: 2px;
-  width: 100%;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--cc-text);
-  padding: 8px 10px;
-  min-height: 44px;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
+	appearance: none;
+	display: flex;
+	flex-direction: column;
+	align-items: start;
+	gap: 2px;
+	width: 100%;
+	border: none;
+	border-radius: 8px;
+	background: transparent;
+	color: var(--cc-text);
+	padding: 8px 10px;
+	min-height: 44px;
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
 }
 
 .picker-item:hover {
-  background: var(--cc-surface-control);
+	background: var(--cc-surface-control);
 }
 
 .picker-item:focus-visible {
-  outline: 2px solid var(--cc-accent);
-  outline-offset: -2px;
+	outline: 2px solid var(--cc-accent);
+	outline-offset: -2px;
 }
 
 .picker-item-name {
-  overflow-wrap: anywhere;
+	overflow-wrap: anywhere;
 }
 
 .picker-item-path {
-  font-size: 12px;
-  color: var(--cc-text-subtle);
-  overflow-wrap: anywhere;
+	font-size: 12px;
+	color: var(--cc-text-subtle);
+	overflow-wrap: anywhere;
 }
 
 /* #endregion dialogs */
@@ -1794,55 +1794,55 @@ body {
 /* Narrow layout (also 200% zoom): the sidebar becomes a toggle drawer, the thread panel
    becomes a full overlay. */
 @media (max-width: 719px) {
-  .drawer-toggle {
-    display: block;
-  }
+	.drawer-toggle {
+		display: block;
+	}
 
-  .sidebar {
-    position: fixed;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    z-index: 25;
-    width: min(280px, 90vw);
-    transform: translateX(-100%);
-    transition: transform 150ms ease;
-  }
+	.sidebar {
+		position: fixed;
+		top: 0;
+		bottom: 0;
+		left: 0;
+		z-index: 25;
+		width: min(280px, 90vw);
+		transform: translateX(-100%);
+		transition: transform 150ms ease;
+	}
 
-  .sidebar.is-open {
-    transform: translateX(0);
-    box-shadow: 0 0 40px var(--cc-shadow-panel);
-  }
+	.sidebar.is-open {
+		transform: translateX(0);
+		box-shadow: 0 0 40px var(--cc-shadow-panel);
+	}
 
-  .channel-head {
-    padding-left: 96px;
-  }
+	.channel-head {
+		padding-left: 96px;
+	}
 
-  /*
+	/*
 	 * With the thread open the panel is a full overlay, and the floating toggle would sit on top of
 	 * it at a higher z-index. The way out of the overlay is the back control in the thread head, so
 	 * the thread head needs no clearance for a button that is not there.
 	 */
-  .chitchat:has(.thread) .drawer-toggle {
-    display: none;
-  }
+	.chitchat:has(.thread) .drawer-toggle {
+		display: none;
+	}
 
-  /*
+	/*
 	 * The handle's containing block is .channel-body, which stays in flow, while the panel it resizes
 	 * is fixed over the whole frame. Left visible it would be a focusable separator announcing a
 	 * width nothing uses, behind an opaque overlay.
 	 */
-  .thread-resize {
-    display: none;
-  }
+	.thread-resize {
+		display: none;
+	}
 
-  .thread {
-    position: fixed;
-    inset: 0;
-    z-index: 20;
-    width: auto;
-    border-left: none;
-  }
+	.thread {
+		position: fixed;
+		inset: 0;
+		z-index: 20;
+		width: auto;
+		border-left: none;
+	}
 }
 
 /*
@@ -1851,10 +1851,10 @@ body {
  * would overflow horizontally by 85px.
  */
 @media (min-width: 720px) {
-  .message-log {
-    flex: 1 1 420px;
-    min-width: 420px;
-  }
+	.message-log {
+		flex: 1 1 420px;
+		min-width: 420px;
+	}
 }
 
 /*
@@ -1864,119 +1864,113 @@ body {
  * three classes to one.
  */
 @media (min-width: 720px) and (max-width: 903px) {
-  .chitchat:has(.thread) .sidebar:not(.is-expanded) .page-controls,
-  .chitchat:has(.thread) .sidebar:not(.is-expanded) .sidebar-archive-toggle {
-    display: none;
-  }
+	.chitchat:has(.thread) .sidebar:not(.is-expanded) .page-controls,
+	.chitchat:has(.thread) .sidebar:not(.is-expanded) .sidebar-archive-toggle {
+		display: none;
+	}
 
-  .chitchat:has(.thread) .sidebar {
-    width: 56px;
-  }
+	.chitchat:has(.thread) .sidebar {
+		width: 56px;
+	}
 
-  /* At 56px the button's content box is 12px, so the name is replaced by its initial rather than
+	/* At 56px the button's content box is 12px, so the name is replaced by its initial rather than
 	   clipped to one letter and an ellipsis. */
-  .chitchat:has(.thread) .channel-link {
-    padding: 10px 4px;
-    text-align: center;
-  }
+	.chitchat:has(.thread) .channel-link {
+		padding: 10px 4px;
+		text-align: center;
+	}
 
-  .chitchat:has(.thread) .channel-initial {
-    display: inline;
-  }
+	.chitchat:has(.thread) .channel-initial {
+		display: inline;
+	}
 
-  /*
+	/*
 	 * Hidden to the eye, kept in the accessibility tree: this is the button's accessible name, and a
 	 * rail of single letters would otherwise announce single letters.
 	 */
-  .chitchat:has(.thread) .channel-name {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
+	.chitchat:has(.thread) .channel-name {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+	}
 
-  /* The wordmark and the create button do not fit in 56px. Left in, they clipped mid-word
+	/* The wordmark and the create button do not fit in 56px. Left in, they clipped mid-word
 	   ("Chitch", "Crea chan") and gave the rail its own horizontal scrollbar. */
-  .chitchat:has(.thread) .channel-section-title,
-  .chitchat:has(.thread) .sidebar-title,
-  .chitchat:has(.thread) .sidebar-create,
-  .chitchat:has(.thread) .channel-item-actions {
-    display: none;
-  }
+	.chitchat:has(.thread) .channel-section-title,
+	.chitchat:has(.thread) .sidebar-title,
+	.chitchat:has(.thread) .sidebar-create,
+	.chitchat:has(.thread) .channel-item-actions {
+		display: none;
+	}
 
-  /* No actions here, so no room to reserve for them: the reserve would push the centred initial
+	/* No actions here, so no room to reserve for them: the reserve would push the centred initial
 	   out of a 56px row on hover. */
-  .chitchat:has(.thread) .channel-item:hover .channel-link,
-  .chitchat:has(.thread) .channel-item:has(:focus-visible) .channel-link {
-    padding-right: 4px;
-  }
+	.chitchat:has(.thread) .channel-item:hover .channel-link,
+	.chitchat:has(.thread) .channel-item:has(:focus-visible) .channel-link {
+		padding-right: 4px;
+	}
 
-  .chitchat:has(.thread) .sidebar-expand {
-    display: block;
-    align-self: center;
-    min-height: 32px;
-    padding: 4px;
-  }
+	.chitchat:has(.thread) .sidebar-expand {
+		display: block;
+		align-self: center;
+		min-height: 32px;
+		padding: 4px;
+	}
 
-  /* Expanding overlays the rail rather than returning it to the flow, which would overflow. */
-  .chitchat:has(.thread) .sidebar.is-expanded {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    z-index: 25;
-    width: 240px;
-    box-shadow: 0 0 40px var(--cc-shadow-panel);
-  }
+	/* Expanding overlays the rail rather than returning it to the flow, which would overflow. */
+	.chitchat:has(.thread) .sidebar.is-expanded {
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		left: 0;
+		z-index: 25;
+		width: 240px;
+		box-shadow: 0 0 40px var(--cc-shadow-panel);
+	}
 
-  .chitchat:has(.thread) .sidebar.is-expanded .channel-link {
-    padding: 10px 10px;
-    text-align: left;
-  }
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-link {
+		padding: 10px 10px;
+		text-align: left;
+	}
 
-  .chitchat:has(.thread) .sidebar.is-expanded .channel-initial {
-    display: none;
-  }
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-initial {
+		display: none;
+	}
 
-  .chitchat:has(.thread) .sidebar.is-expanded .channel-name {
-    position: static;
-    width: auto;
-    height: auto;
-    overflow: visible;
-    clip-path: none;
-  }
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-name {
+		position: static;
+		width: auto;
+		height: auto;
+		overflow: visible;
+		clip-path: none;
+	}
 
-  .chitchat:has(.thread) .sidebar.is-expanded .channel-section-title,
-  .chitchat:has(.thread) .sidebar.is-expanded .sidebar-title,
-  .chitchat:has(.thread) .sidebar.is-expanded .sidebar-create {
-    display: block;
-  }
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-section-title,
+	.chitchat:has(.thread) .sidebar.is-expanded .sidebar-title,
+	.chitchat:has(.thread) .sidebar.is-expanded .sidebar-create {
+		display: block;
+	}
 
-  .chitchat:has(.thread) .sidebar.is-expanded .channel-item-actions {
-    display: flex;
-  }
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-item-actions {
+		display: flex;
+	}
 
-  /* The drawer shows the same single trigger as the wide rail, so it reserves the same 42px. It
+	/* The drawer shows the same single trigger as the wide rail, so it reserves the same 42px. It
 	   used to reserve min(150px, 55%), which was written for the old three-text-button cluster: on a
 	   215px row that is 118px held for a 28px button, and the channel name was cut to 95px. */
-  .chitchat:has(.thread) .sidebar.is-expanded .channel-item:hover .channel-link,
-  .chitchat:has(.thread)
-    .sidebar.is-expanded
-    .channel-item:has(:focus-visible)
-    .channel-link,
-  .chitchat:has(.thread)
-    .sidebar.is-expanded
-    .channel-item:has([aria-expanded="true"])
-    .channel-link {
-    padding-right: 42px;
-  }
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-item:hover .channel-link,
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-item:has(:focus-visible) .channel-link,
+	.chitchat:has(.thread) .sidebar.is-expanded .channel-item:has([aria-expanded="true"]) .channel-link {
+		padding-right: 42px;
+	}
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .button,
-  .sidebar {
-    transition: none;
-  }
+	.button,
+	.sidebar {
+		transition: none;
+	}
 }
