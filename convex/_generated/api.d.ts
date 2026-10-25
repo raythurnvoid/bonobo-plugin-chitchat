@@ -9,10 +9,10 @@
  */
 
 import type * as access from "../access.js";
+import type * as access_notices from "../access_notices.js";
 import type * as auth from "../auth.js";
 import type * as channel_members from "../channel_members.js";
 import type * as channels from "../channels.js";
-import type * as crons from "../crons.js";
 import type * as files from "../files.js";
 import type * as http from "../http.js";
 import type * as members from "../members.js";
@@ -29,6 +29,7 @@ import type * as transcripts_deletions from "../transcripts_deletions.js";
 import type * as transcripts_grants from "../transcripts_grants.js";
 import type * as transcripts_index from "../transcripts_index.js";
 import type * as transcripts_secrets from "../transcripts_secrets.js";
+import type * as transcripts_wake from "../transcripts_wake.js";
 import type * as transcripts_worker from "../transcripts_worker.js";
 import type * as views from "../views.js";
 
@@ -40,10 +41,10 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   access: typeof access;
+  access_notices: typeof access_notices;
   auth: typeof auth;
   channel_members: typeof channel_members;
   channels: typeof channels;
-  crons: typeof crons;
   files: typeof files;
   http: typeof http;
   members: typeof members;
@@ -60,6 +61,7 @@ declare const fullApi: ApiFromModules<{
   transcripts_grants: typeof transcripts_grants;
   transcripts_index: typeof transcripts_index;
   transcripts_secrets: typeof transcripts_secrets;
+  transcripts_wake: typeof transcripts_wake;
   transcripts_worker: typeof transcripts_worker;
   views: typeof views;
 }>;

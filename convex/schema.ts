@@ -4,9 +4,18 @@ import {
 	chat_attachment,
 	chat_member_level,
 	chat_reaction_token,
+	chat_transcript_error_code,
 	chat_transcript_operation,
+	chat_transcript_retry,
 	chat_write_receipt,
 } from "../shared/chat";
+
+// Missing means no wake-up is armed for this doc. One pending job per doc runs its next step.
+const wake_job_id = v.optional(v.id("_scheduled_functions"));
+// Missing means no error, or an error whose reason is not known.
+const error_code = v.optional(chat_transcript_error_code);
+// Missing means the last attempt did not fail for a temporary reason.
+const retry = v.optional(chat_transcript_retry);
 
 export default defineSchema({
 	installations: defineTable({
@@ -68,6 +77,13 @@ export default defineSchema({
 		hostSessionId: v.string(),
 		revision: v.number(),
 	}).index("by_hostSessionId", ["hostSessionId"]),
+	// At most one doc: the cached signing key that checks Bonobo Senate access notices.
+	signing_keys: defineTable({
+		// The `whsec_` key, encrypted. Null until a key fetch worked.
+		key: v.union(v.string(), v.null()),
+		// The last time Chitchat asked Bonobo Senate for the key. It limits fetches to one per minute.
+		fetchedAt: v.number(),
+	}),
 	attachment_proofs: defineTable({
 		installationId: v.id("installations"),
 		hostUserId: v.string(),
@@ -252,11 +268,13 @@ export default defineSchema({
 		workerGeneration: v.number(),
 		status: v.union(v.literal("pending"), v.literal("running"), v.literal("blocked"), v.literal("ready")),
 		error: v.union(v.string(), v.null()),
+		errorCode: error_code,
+		retry,
 		nextAttemptAt: v.number(),
 		readerRevision: v.number(),
-	})
-		.index("by_channel", ["channelId"])
-		.index("by_status_nextAttemptAt", ["status", "nextAttemptAt"]),
+		// File runs, reader jobs, and deletions of this channel share this wake-up.
+		wakeJobId: wake_job_id,
+	}).index("by_channel", ["channelId"]),
 	// Deletion waits for its accepted copies, then archives exact transcript files in bounded steps.
 	transcript_deletions: defineTable({
 		channelId: v.id("channels"),
@@ -271,6 +289,8 @@ export default defineSchema({
 		leaseUntil: v.number(),
 		nextAttemptAt: v.number(),
 		error: v.union(v.string(), v.null()),
+		errorCode: error_code,
+		retry,
 		prepared: v.union(
 			v.object({
 				fileId: v.id("transcript_files"),
@@ -284,7 +304,6 @@ export default defineSchema({
 		),
 	})
 		.index("by_channel", ["channelId"])
-		.index("by_completedAt_nextAttemptAt", ["completedAt", "nextAttemptAt"])
 		.index("by_installation_completedAt", ["installationId", "completedAt"])
 		.index("by_installation_actor_lifetime_completedAt", ["installationId", "actorHostUserId", "actorLifetime", "completedAt"]),
 	transcript_jobs: defineTable({
@@ -303,10 +322,11 @@ export default defineSchema({
 		workerGeneration: v.number(),
 		createdAt: v.number(),
 		error: v.union(v.string(), v.null()),
+		// Reader jobs count their temporary failures here.
+		retry,
 	})
 		.index("by_channel_sequence", ["channelId", "sequence"])
 		.index("by_channel_kind_status_sequence", ["channelId", "operation.kind", "status", "sequence"])
-		.index("by_kind_status_nextAttemptAt", ["operation.kind", "status", "nextAttemptAt"])
 		.index("by_status_nextAttemptAt", ["status", "nextAttemptAt"]),
 	transcript_indexes: defineTable({
 		installationId: v.id("installations"),
@@ -325,9 +345,9 @@ export default defineSchema({
 		parentNodeId: v.union(v.string(), v.null()),
 		status: v.union(v.literal("pending"), v.literal("running"), v.literal("blocked"), v.literal("ready")),
 		error: v.union(v.string(), v.null()),
-	})
-		.index("by_installation_generation", ["installationId", "generation"])
-		.index("by_status", ["status"]),
+		errorCode: error_code,
+		wakeJobId: wake_job_id,
+	}).index("by_installation_generation", ["installationId", "generation"]),
 	transcript_index_jobs: defineTable({
 		indexId: v.id("transcript_indexes"),
 		sequence: v.number(),
@@ -361,12 +381,14 @@ export default defineSchema({
 		sealedSecret: v.union(v.string(), v.null()),
 		sealedExpiresAt: v.number(),
 		error: v.union(v.string(), v.null()),
+		errorCode: error_code,
+		retry,
 		updatedAt: v.number(),
+		wakeJobId: wake_job_id,
 	})
 		.index("by_channel", ["channelId"])
 		.index("by_installation", ["installationId"])
-		.index("by_updatedAt", ["updatedAt"])
-		.index("by_phase_updatedAt", ["phase", "updatedAt"]),
+		.index("by_updatedAt", ["updatedAt"]),
 	transcript_requests: defineTable({
 		installationId: v.id("installations"),
 		actorUserId: v.string(),
@@ -392,6 +414,7 @@ export default defineSchema({
 		runId: v.union(v.id("transcript_runs"), v.null()),
 		readerRunId: v.union(v.id("transcript_runs"), v.null()),
 		readerError: v.union(v.string(), v.null()),
+		readerErrorCode: error_code,
 	}).index("by_channel", ["channelId"]),
 	transcript_runs: defineTable({
 		channelId: v.id("channels"),

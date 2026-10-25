@@ -32,6 +32,7 @@ const fake = vi.hoisted(() => ({
 			| { generation: string; membershipLifetime: number; displayName: string }
 			| undefined,
 		message: null as string | null,
+		connection: "ready" as string,
 		retry: vi.fn(),
 	},
 }));
@@ -237,6 +238,7 @@ function set_connection(ready: boolean) {
 	fake.session.canSend = ready;
 	fake.session.member = ready ? { generation: "fresh", membershipLifetime: 1, displayName: "Alice" } : undefined;
 	fake.session.message = ready ? null : "Chitchat is reconnecting. Your draft is kept.";
+	fake.session.connection = ready ? "ready" : "reconnecting";
 	publish();
 }
 function resize(narrow: boolean) {
@@ -282,6 +284,7 @@ beforeEach(() => {
 		can_request_now: () => fake.session.ready && fake.session.connected,
 		member: { generation: "fresh", membershipLifetime: 1, displayName: "Alice" },
 		message: null,
+		connection: "ready",
 		retry: vi.fn(),
 	};
 	fake.query
@@ -316,6 +319,17 @@ afterEach(() => {
 });
 
 describe("App", () => {
+	test("shows a syncing pause as a status without Reconnect", () => {
+		render(<App client={client()} />);
+		set_connection(false);
+		fake.session.message = "Getting the member list ready… Chitchat will open by itself.";
+		fake.session.connection = "syncing";
+		publish();
+		expect(screen.queryByRole("button", { name: "Reconnect" })).toBeNull();
+		expect(document.querySelector("[data-chitchat-connection]")?.getAttribute("data-chitchat-connection")).toBe(
+			"syncing",
+		);
+	});
 	test("keeps Files recovery reachable after a channel is deleted", async () => {
 		fake.overrides.set("transcripts:list_deletions", {
 			page: [{ channelId: "deleted-channel", name: "Old team" }],
@@ -1398,8 +1412,13 @@ describe("TranscriptStatus", () => {
 			folderNodeId: "folder-general",
 			readerMode: "manual",
 			error: "A file marker is missing",
+			errorCode: null,
+			channelName: "general",
+			retryingSince: null,
+			nextAttemptAt: null,
 			indexStatus: "ready",
 			indexError: null,
+			indexErrorCode: null,
 			...changes,
 		};
 	}
@@ -1494,6 +1513,23 @@ describe("TranscriptStatus", () => {
 		expect(screen.getByText(/Give the Chitchat service account Can manage, then reconnect/)).toBeTruthy();
 		expect(document.body.textContent).not.toContain("Planned folder");
 		expect(document.body.textContent).not.toContain("ask a workspace admin to connect");
+	});
+	test("an expired Files connection offers Reconnect but not Retry", () => {
+		render_status();
+		fake.overrides.set("transcripts:status", status({ errorCode: "auth_expired" }));
+		publish();
+		expect(screen.getByRole("button", { name: "Reconnect Files" })).toBeTruthy();
+		expect(screen.queryByRole("button", { name: "Retry sync" })).toBeNull();
+	});
+	test("offers Retry now only after five minutes of temporary failures", () => {
+		render_status();
+		const running = { status: "running", error: "Bonobo Senate is busy (503)", errorCode: "temporary" };
+		fake.overrides.set("transcripts:status", status({ ...running, retryingSince: Date.now() - 4 * 60_000 }));
+		publish();
+		expect(screen.queryByRole("button", { name: "Retry now" })).toBeNull();
+		fake.overrides.set("transcripts:status", status({ ...running, retryingSince: Date.now() - 5 * 60_000 }));
+		publish();
+		expect(screen.getByRole("button", { name: "Retry now" })).toBeTruthy();
 	});
 	test("can retry a blocked channel index while the channel copy is saved", async () => {
 		render_status();

@@ -423,56 +423,58 @@ export const cancel_change = internalMutation({
 	handler: cancel_pending_change,
 });
 
+// Finish reader changes of a channel that never connected Files. The transcript dispatcher calls this first.
+export async function channel_members_complete_without_files(ctx: MutationCtx, args: { channelId: Id<"channels"> }) {
+	const [grant, destination] = await Promise.all([
+		ctx.db
+			.query("host_grants")
+			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
+			.unique(),
+		ctx.db
+			.query("transcript_destinations")
+			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
+			.unique(),
+	]);
+	// A saved connection intent may already have created a private folder in Bonobo Senate.
+	if (grant || destination) return false;
+	const pending = await ctx.db
+		.query("channel_access_changes")
+		.withIndex("by_channel_status", (q) => q.eq("channelId", args.channelId).eq("status", "pending"))
+		.first();
+	if (pending) {
+		const hostReceiptId = `no-output:${pending._id}`;
+		const completed = await complete_pending_change(ctx, {
+			changeId: pending._id,
+			readerRevision: pending.readerRevision,
+			hostReceiptId,
+		});
+		if (!completed) await cancel_pending_change(ctx, { changeId: pending._id, hostReceiptId });
+	}
+	const readerJobs = await ctx.db
+		.query("transcript_jobs")
+		.withIndex("by_channel_kind_status_sequence", (q) =>
+			q.eq("channelId", args.channelId).eq("operation.kind", "readers").eq("status", "pending"),
+		)
+		.take(20);
+	for (const job of readerJobs) await ctx.db.patch("transcript_jobs", job._id, { status: "complete", error: null });
+	if (readerJobs.length === 20) await ctx.scheduler.runAfter(0, internal.channel_members.complete_without_files, args);
+
+	const transcript = await ctx.db
+		.query("transcript_channels")
+		.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
+		.unique();
+	if (transcript)
+		await ctx.db.patch("transcript_channels", transcript._id, {
+			status: "blocked",
+			error: "Connect Files to save Markdown copies.",
+		});
+	return true;
+}
+
 export const complete_without_files = internalMutation({
 	args: { channelId: v.id("channels") },
 	returns: v.boolean(),
-	handler: async (ctx, args) => {
-		const [grant, destination] = await Promise.all([
-			ctx.db
-				.query("host_grants")
-				.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
-				.unique(),
-			ctx.db
-				.query("transcript_destinations")
-				.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
-				.unique(),
-		]);
-		// A saved connection intent may already have created a private folder in Bonobo Senate.
-		if (grant || destination) return false;
-		const pending = await ctx.db
-			.query("channel_access_changes")
-			.withIndex("by_channel_status", (q) => q.eq("channelId", args.channelId).eq("status", "pending"))
-			.first();
-		if (pending) {
-			const hostReceiptId = `no-output:${pending._id}`;
-			const completed = await complete_pending_change(ctx, {
-				changeId: pending._id,
-				readerRevision: pending.readerRevision,
-				hostReceiptId,
-			});
-			if (!completed) await cancel_pending_change(ctx, { changeId: pending._id, hostReceiptId });
-		}
-		const readerJobs = await ctx.db
-			.query("transcript_jobs")
-			.withIndex("by_channel_kind_status_sequence", (q) =>
-				q.eq("channelId", args.channelId).eq("operation.kind", "readers").eq("status", "pending"),
-			)
-			.take(20);
-		for (const job of readerJobs) await ctx.db.patch("transcript_jobs", job._id, { status: "complete", error: null });
-		if (readerJobs.length === 20)
-			await ctx.scheduler.runAfter(0, internal.channel_members.complete_without_files, args);
-
-		const transcript = await ctx.db
-			.query("transcript_channels")
-			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
-			.unique();
-		if (transcript)
-			await ctx.db.patch("transcript_channels", transcript._id, {
-				status: "blocked",
-				error: "Connect Files to save Markdown copies.",
-			});
-		return true;
-	},
+	handler: async (ctx, args) => await channel_members_complete_without_files(ctx, args),
 });
 
 export async function channel_members_remove_host_member(

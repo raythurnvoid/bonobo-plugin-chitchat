@@ -50,6 +50,7 @@ function Probe() {
 			</button>
 			<p>{sent}</p>
 			<p>{session.message}</p>
+			<p>{`connection: ${session.connection}`}</p>
 		</>
 	);
 }
@@ -62,6 +63,7 @@ beforeEach(() => {
 });
 afterEach(() => {
 	cleanup();
+	vi.useRealTimers();
 	vi.unstubAllGlobals();
 	vi.unstubAllEnvs();
 	vi.restoreAllMocks();
@@ -111,6 +113,73 @@ describe("ChatSessionProvider", () => {
 		});
 		expect(getToken).toHaveBeenCalledTimes(2);
 		expect(refreshToken).not.toHaveBeenCalled();
+	});
+
+	test("shows a status while access syncs and opens by itself", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce(Response.json({ code: "syncing", phase: "members", retryAfterMs: 1_000 }, { status: 503 }))
+			.mockResolvedValueOnce(
+				Response.json({ jwt: "signed-token", expiresAt: Date.now() + 30_000, validForMs: 30_000 }),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+		render(
+			<ChatSessionProvider client={{ getToken: async () => "plu_current" } as unknown as BonoboClient}>
+				<Probe />
+			</ChatSessionProvider>,
+		);
+		expect(await screen.findByText("Getting the member list ready… Chitchat will open by itself.")).toBeTruthy();
+		expect(screen.getByText("connection: syncing")).toBeTruthy();
+		await screen.findByRole("button", { name: "Ready" }, { timeout: 3_000 });
+		expect(screen.getByText("connection: ready")).toBeTruthy();
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	test("waits longer after each syncing answer", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		const fetchMock = vi
+			.fn()
+			.mockImplementation(async () =>
+				Response.json({ code: "syncing", phase: "members", retryAfterMs: 2_000 }, { status: 503 }),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+		render(
+			<ChatSessionProvider client={{ getToken: async () => "plu_current" } as unknown as BonoboClient}>
+				<Probe />
+			</ChatSessionProvider>,
+		);
+		const advance = async (ms: number) => await act(async () => await vi.advanceTimersByTimeAsync(ms));
+		await advance(0);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		// The first wait is the server's 2 s. The next one is 4 s.
+		await advance(2_000);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		await advance(2_000);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		await advance(2_000);
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+	});
+
+	test("shows a real error after two minutes of syncing", async () => {
+		let now = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => now);
+		vi.stubGlobal(
+			"fetch",
+			vi
+				.fn()
+				.mockImplementation(async () =>
+					Response.json({ code: "syncing", phase: "events", retryAfterMs: 1_000 }, { status: 503 }),
+				),
+		);
+		render(
+			<ChatSessionProvider client={{ getToken: async () => "plu_current" } as unknown as BonoboClient}>
+				<Probe />
+			</ChatSessionProvider>,
+		);
+		await screen.findByText("connection: syncing");
+		now = 120_001;
+		await screen.findByText("Chitchat is reconnecting. Your draft is kept.", undefined, { timeout: 3_000 });
+		expect(screen.getByText("connection: reconnecting")).toBeTruthy();
 	});
 
 	test("checks the live socket at submission time", async () => {

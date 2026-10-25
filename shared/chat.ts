@@ -57,6 +57,20 @@ export const chat_transcript_operation = v.union(
 	}),
 );
 
+// Why transcript work stopped or waits. Only "temporary" retries by itself; every other code waits for a person.
+export const chat_transcript_error_code = v.union(
+	v.literal("auth_expired"),
+	v.literal("permission"),
+	v.literal("sponsor_gone"),
+	v.literal("conflict"),
+	v.literal("too_large"),
+	v.literal("temporary"),
+);
+export type chat_TranscriptErrorCode = Infer<typeof chat_transcript_error_code>;
+
+// Temporary failures in a row since the last attempt that worked. Retry and Reconnect clear it.
+export const chat_transcript_retry = v.object({ failures: v.number(), since: v.number() });
+
 export function chat_validate_request_id(requestId: string) {
 	return requestId.length > 0 && requestId.length <= 64;
 }

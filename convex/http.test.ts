@@ -6,6 +6,8 @@ import { api, internal } from "./_generated/api";
 import schema from "./schema";
 
 const modules = import.meta.glob("./**/*.ts");
+// The cached signing key is saved encrypted.
+process.env.CHITCHAT_GRANT_ENCRYPTION_KEY = btoa("k".repeat(32));
 
 beforeEach(() => {
 	vi.useFakeTimers();
@@ -50,7 +52,10 @@ async function setup() {
 		status: 200,
 		events: [] as Array<Pick<FunctionArgs<typeof internal.access.apply_event>, "revision" | "event">>,
 	};
+	// 409 stands for a disabled installation, or one whose connection still names the old version.
+	const snapshot = { status: 200 };
 	const requests: string[] = [];
+	const key = `whsec_${btoa("s".repeat(32))}`;
 	vi.stubGlobal(
 		"fetch",
 		vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -60,6 +65,7 @@ async function setup() {
 			if (path === "/.well-known/jwks.json") return Response.json({ keys: [jwk] });
 			if (typeof init?.body !== "string") throw new Error("Missing Bonobo Senate request");
 			const body = JSON.parse(init.body);
+			if (path === "/api/v1/plugins/service-events/key") return Response.json({ key, createdAt: 1 });
 			if (path === "/api/v1/plugins/identity/exchange") {
 				const hostSessionId = new Headers(init.headers).get("Authorization")!.slice("Bearer plu_".length);
 				const jwt = await new SignJWT({
@@ -77,6 +83,11 @@ async function setup() {
 					.sign(keys.privateKey);
 				return Response.json({ jwt });
 			}
+			if (path === "/api/v1/plugins/members/list" && snapshot.status !== 200)
+				return Response.json(
+					{ code: "unavailable", message: "Installation is unavailable" },
+					{ status: snapshot.status },
+				);
 			if (path === "/api/v1/plugins/members/list")
 				return Response.json({
 					startRevision: facts.requiredRevision,
@@ -100,7 +111,38 @@ async function setup() {
 			headers: { Origin: "https://press.test", "Content-Type": "application/json" },
 			body: JSON.stringify({ pressToken: `plu_${session}` }),
 		});
-	return { t, facts, member, feed, requests, request_lease };
+	// Sign like Bonobo Senate: Standard Webhooks HMAC over "id.timestamp.body".
+	const send_notice = async (
+		revision: number,
+		options: { key?: string; sentAt?: number; badFirstEntry?: boolean } = {},
+	) => {
+		const id = `installation:${revision}`;
+		const timestamp = String(Math.floor((options.sentAt ?? Date.now()) / 1000));
+		const body = JSON.stringify({
+			type: "workspace.access.changed",
+			timestamp: new Date().toISOString(),
+			data: { installationId: "installation", revision },
+		});
+		const hmac = await crypto.subtle.importKey(
+			"raw",
+			Uint8Array.from(atob((options.key ?? key).slice("whsec_".length)), (character) => character.charCodeAt(0)),
+			{ name: "HMAC", hash: "SHA-256" },
+			false,
+			["sign"],
+		);
+		const signature = await crypto.subtle.sign("HMAC", hmac, new TextEncoder().encode(`${id}.${timestamp}.${body}`));
+		return await t.fetch("/bonobo/access-events", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"webhook-id": id,
+				"webhook-timestamp": timestamp,
+				"webhook-signature": `${options.badFirstEntry ? "v1,not-base64! " : ""}v1,${btoa(String.fromCharCode(...new Uint8Array(signature)))}`,
+			},
+			body,
+		});
+	};
+	return { t, facts, member, feed, snapshot, requests, request_lease, send_notice };
 }
 
 describe("POST /auth/lease", () => {
@@ -148,7 +190,10 @@ describe("POST /auth/lease", () => {
 		feed.status = 429;
 		requests.length = 0;
 		vi.advanceTimersByTime(15_000);
-		expect((await request_lease()).status).toBe(503);
+		const refused = await request_lease();
+		expect(refused.status).toBe(503);
+		expect(refused.headers.get("Retry-After")).toBe("2");
+		expect(await refused.json()).toEqual({ code: "syncing", phase: "events", retryAfterMs: 2_000 });
 		expect(requests).toContain("/api/v1/plugins/access/changes");
 		expect(await t.run((ctx) => ctx.db.query("sessions").unique())).toEqual(previous);
 	});
@@ -160,6 +205,7 @@ describe("POST /auth/lease", () => {
 		if (!installation) throw new Error("Missing installation");
 		await t.mutation(internal.access.apply_event, {
 			installationId: installation._id,
+			afterRevision: 0,
 			revision: 1,
 			event: { kind: "noop" },
 		});
@@ -214,17 +260,15 @@ describe("POST /auth/lease", () => {
 		});
 	});
 
-	test("background polling discovers a later revocation and current renewal still refuses it", async () => {
-		const { t, facts, feed, requests, request_lease } = await setup();
+	test("a signed notice applies a later revocation and current renewal still refuses it", async () => {
+		const { t, facts, feed, requests, request_lease, send_notice } = await setup();
 		expect((await request_lease()).status).toBe(200);
 		const previous = await t.run((ctx) => ctx.db.query("sessions").unique());
 		if (!previous) throw new Error("Missing session");
 		facts.requiredRevision = 1;
 		feed.events.push({ revision: 1, event: { kind: "session_revoked", hostSessionId: "session" } });
 		requests.length = 0;
-		await t.mutation(internal.access.wake_installations, { paginationOpts: { numItems: 50, cursor: null } });
-		vi.advanceTimersByTime(0);
-		await t.finishInProgressScheduledFunctions();
+		expect((await send_notice(1)).status).toBe(200);
 		expect(requests).toContain("/api/v1/plugins/access/changes");
 		expect(
 			await t
@@ -240,5 +284,132 @@ describe("POST /auth/lease", () => {
 		expect((await request_lease()).status).toBe(409);
 		expect(requests).not.toContain("/api/v1/plugins/access/changes");
 		expect(await t.run((ctx) => ctx.db.query("sessions").unique())).toMatchObject({ exchangeId: previous.exchangeId });
+	});
+});
+
+describe("POST /bonobo/access-events", () => {
+	const pending_jobs = async (t: Awaited<ReturnType<typeof setup>>["t"]) =>
+		(await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect())).filter(
+			(job) => job.state.kind === "pending",
+		).length;
+
+	test("a forged or stale notice answers 401 and schedules nothing", async () => {
+		const { t, facts, feed, requests, request_lease, send_notice } = await setup();
+		expect((await request_lease()).status).toBe(200);
+		facts.requiredRevision = 1;
+		feed.events.push({ revision: 1, event: { kind: "session_revoked", hostSessionId: "session" } });
+		const jobs = await pending_jobs(t);
+		requests.length = 0;
+		expect((await send_notice(1, { key: `whsec_${btoa("x".repeat(32))}` })).status).toBe(401);
+		expect((await send_notice(1, { sentAt: Date.now() - 301_000 })).status).toBe(401);
+		expect((await send_notice(1, { key: `whsec_${btoa("y".repeat(32))}` })).status).toBe(401);
+		expect((await t.fetch("/bonobo/access-events", { method: "POST", body: "x".repeat(5000) })).status).toBe(413);
+		// The first mismatch fetches the key once. Later mismatches in the same minute do not.
+		expect(requests).toEqual(["/api/v1/plugins/service-events/key"]);
+		expect(await pending_jobs(t)).toBe(jobs);
+		expect(await t.run((ctx) => ctx.db.query("installations").unique())).toMatchObject({ appliedAccessRevision: 0 });
+	});
+
+	test("answers 503 until access is caught up", async () => {
+		const { t, facts, feed, requests, request_lease, send_notice } = await setup();
+		// Chitchat starts an installation on its first lease, so a notice before that has nothing to do.
+		expect((await send_notice(0)).status).toBe(200);
+		expect(requests).not.toContain("/api/v1/plugins/access/changes");
+		expect((await request_lease()).status).toBe(200);
+		facts.requiredRevision = 1;
+		feed.events.push({ revision: 1, event: { kind: "noop" } });
+		feed.status = 429;
+		const busy = await send_notice(1);
+		expect(busy.status).toBe(503);
+		// Nothing was saved, so Bonobo Senate should use its normal backoff.
+		expect(busy.headers.get("Retry-After")).toBeNull();
+		feed.status = 200;
+		// The feed has only revision 1 so far. Saving it is progress, so ask again soon.
+		const partial = await send_notice(2);
+		expect(partial.status).toBe(503);
+		expect(partial.headers.get("Retry-After")).toBe("5");
+		expect((await send_notice(1)).status).toBe(200);
+		expect(await t.run((ctx) => ctx.db.query("installations").unique())).toMatchObject({ appliedAccessRevision: 1 });
+		requests.length = 0;
+		expect((await send_notice(1)).status).toBe(200);
+		expect(requests).toEqual([]);
+	});
+
+	test("answers 200 while Bonobo Senate says the installation needs a new lease", async () => {
+		const { t, facts, feed, snapshot, request_lease, send_notice } = await setup();
+		expect((await request_lease()).status).toBe(200);
+		facts.requiredRevision = 1;
+		// An upgrade sends a refresh, and the member list stays unavailable until the next lease.
+		feed.events.push({ revision: 1, event: { kind: "refresh", reason: "installation" } });
+		snapshot.status = 409;
+		expect((await send_notice(1)).status).toBe(200);
+		expect(await t.run((ctx) => ctx.db.query("installations").unique())).toMatchObject({
+			status: "bootstrapping",
+			bootstrapPhase: "members",
+		});
+	});
+
+	test("asks for a quick retry when only member cleanup moved", async () => {
+		const { t, facts, member, feed, request_lease, send_notice } = await setup();
+		expect((await request_lease()).status).toBe(200);
+		// One call removes at most 10 x 20 read positions, so 250 need a second notice.
+		await t.run(async (ctx) => {
+			const installation = (await ctx.db.query("installations").unique())!;
+			const channelId = await ctx.db.insert("channels", {
+				installationId: installation._id,
+				generation: installation.generation,
+				publicId: "channel",
+				visibility: "public",
+				name: "General",
+				sortName: "general",
+				topic: "",
+				createdBy: "owner",
+				createdAt: 0,
+				revision: 1,
+				membershipRevision: 1,
+				memberCount: 1,
+				archivedAt: null,
+				deletedAt: null,
+				lastRootSequence: 0,
+				lastReplySequence: 0,
+				lastRootAt: 0,
+				lastReplyAt: 0,
+				transcriptSlug: "general",
+			});
+			for (let index = 0; index < 250; index++)
+				await ctx.db.insert("read_states", {
+					installationId: installation._id,
+					channelId,
+					hostUserId: member.hostUserId,
+					membershipLifetime: 1,
+					rootSequence: index,
+					replySequence: 0,
+					revision: 1,
+				});
+		});
+		facts.requiredRevision = 1;
+		feed.events.push({ revision: 1, event: { kind: "member", member: { ...member, active: false } } });
+		const partial = await send_notice(1);
+		expect(partial.status).toBe(503);
+		expect(partial.headers.get("Retry-After")).toBe("5");
+		expect((await send_notice(1)).status).toBe(200);
+	});
+
+	test("fetches the key again when the saved key cannot be decrypted", async () => {
+		const { t, requests, request_lease, send_notice } = await setup();
+		expect((await request_lease()).status).toBe(200);
+		// For example after CHITCHAT_GRANT_ENCRYPTION_KEY changed.
+		await t.run(async (ctx) => {
+			await ctx.db.insert("signing_keys", { key: "not.decryptable", fetchedAt: 0 });
+		});
+		requests.length = 0;
+		expect((await send_notice(0)).status).toBe(200);
+		expect(requests).toEqual(["/api/v1/plugins/service-events/key"]);
+	});
+
+	test("accepts a valid signature after a malformed one in the list", async () => {
+		const { request_lease, send_notice } = await setup();
+		expect((await request_lease()).status).toBe(200);
+		expect((await send_notice(0, { badFirstEntry: true })).status).toBe(200);
 	});
 });

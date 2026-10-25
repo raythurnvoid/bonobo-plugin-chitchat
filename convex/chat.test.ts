@@ -594,6 +594,7 @@ describe("channel_members", () => {
 		const channelId = await create_channel(h, "private", ["viewer", "bob"]);
 		await h.t.mutation(internal.access.apply_event, {
 			installationId: h.installationId,
+			afterRevision: 1,
 			revision: 2,
 			event: {
 				kind: "member",

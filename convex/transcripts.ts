@@ -6,6 +6,7 @@ import { internal } from "./_generated/api";
 import { auth_get_current_access } from "./auth";
 import {
 	chat_error,
+	chat_transcript_error_code,
 	chat_PAGE_MAX_BYTES,
 	chat_PAGE_SIZE,
 	chat_validate_request_id,
@@ -16,6 +17,8 @@ import { transcripts_encrypt } from "./transcripts_secrets";
 import { press_get_lease, press_lease_facts } from "./press";
 import { transcripts_index_request } from "./transcripts_index";
 import { transcripts_deletions_get_access } from "./transcripts_deletions";
+import { transcripts_wake } from "./transcripts_wake";
+import { transcripts_db_resume_readers } from "./transcripts_db";
 
 export const list_deletions = query({
 	args: { paginationOpts: paginationOptsValidator },
@@ -68,6 +71,12 @@ export const status = query({
 				v.literal("ready"),
 			),
 			error: v.union(v.string(), v.null()),
+			// The code of the shown error. Null when it is not known.
+			errorCode: v.union(chat_transcript_error_code, v.null()),
+			channelName: v.string(),
+			// When temporary failures in a row started, and when the next try runs.
+			retryingSince: v.union(v.number(), v.null()),
+			nextAttemptAt: v.union(v.number(), v.null()),
 			desiredSequence: v.number(),
 			appliedSequence: v.number(),
 			folderPath: v.union(v.string(), v.null()),
@@ -78,6 +87,7 @@ export const status = query({
 			deletionPhase: v.union(v.literal("copy"), v.literal("archive"), v.null()),
 			indexStatus: v.union(v.literal("pending"), v.literal("running"), v.literal("blocked"), v.literal("ready")),
 			indexError: v.union(v.string(), v.null()),
+			indexErrorCode: v.union(chat_transcript_error_code, v.null()),
 		}),
 	),
 	handler: async (ctx, args) => {
@@ -105,25 +115,55 @@ export const status = query({
 				q.eq("installationId", access._yay.installation._id).eq("generation", access._yay.installation.generation),
 			)
 			.unique();
+		const readerRun = destination?.readerRunId ? await ctx.db.get("transcript_runs", destination.readerRunId) : null;
+		const readerJob = readerRun
+			? await ctx.db
+					.query("transcript_jobs")
+					.withIndex("by_channel_sequence", (q) => q.eq("channelId", args.channelId).eq("sequence", readerRun.barrier))
+					.unique()
+			: null;
+		// Show the first error in the order the work runs. A temporary error is a wait, not a block.
+		const shown = destination?.readerError
+			? { error: destination.readerError, errorCode: destination.readerErrorCode }
+			: grant?.error
+				? { error: grant.error, errorCode: grant.errorCode }
+				: deletion?.error
+					? { error: deletion.error, errorCode: deletion.errorCode }
+					: state?.error
+						? { error: state.error, errorCode: state.errorCode }
+						: null;
+		const final = (doc: { error: string | null; errorCode?: string } | null | undefined) =>
+			!!doc?.error && doc.errorCode !== "temporary";
+		const wakes = await Promise.all(
+			[grant?.wakeJobId, state?.wakeJobId].map(async (id) =>
+				id ? await ctx.db.system.get("_scheduled_functions", id) : null,
+			),
+		);
+		const pendingTimes = wakes.flatMap((job) => (job?.state.kind === "pending" ? [job.scheduledTime] : []));
 		return {
 			status: !grant
 				? ("not_connected" as const)
 				: destination?.readerRunId
-					? destination.readerError
+					? destination.readerError && destination.readerErrorCode !== "temporary"
 						? ("blocked" as const)
 						: ("running" as const)
-					: grant.error
+					: final(grant)
 						? ("blocked" as const)
 						: grant.phase !== "ready"
 							? ("pending" as const)
-							: deletion?.error
+							: final(deletion)
 								? ("blocked" as const)
 								: deletion && state?.status !== "blocked"
 									? deletion.archiveStartedAt === null
 										? ("pending" as const)
 										: ("running" as const)
 									: (state?.status ?? ("pending" as const)),
-			error: destination?.readerError ?? grant?.error ?? deletion?.error ?? state?.error ?? null,
+			error: shown?.error ?? null,
+			errorCode: shown?.errorCode ?? null,
+			channelName: access._yay.channel.name,
+			retryingSince:
+				readerJob?.retry?.since ?? grant?.retry?.since ?? deletion?.retry?.since ?? state?.retry?.since ?? null,
+			nextAttemptAt: pendingTimes.length ? Math.min(...pendingTimes) : null,
 			desiredSequence: state?.desiredSequence ?? 0,
 			appliedSequence: state?.appliedSequence ?? 0,
 			folderPath: destination?.folderPath ?? grant?.rootPath ?? null,
@@ -138,6 +178,7 @@ export const status = query({
 			deletionPhase: deletion ? (deletion.archiveStartedAt === null ? ("copy" as const) : ("archive" as const)) : null,
 			indexStatus: index?.status ?? ("pending" as const),
 			indexError: index?.error ?? null,
+			indexErrorCode: index?.errorCode ?? null,
 		};
 	},
 });
@@ -200,7 +241,7 @@ export const begin_connect = internalMutation({
 				existing.sponsorLifetime !== access._yay.member.membershipLifetime
 			)
 				return { _nay: { message: "This Files request belongs to another connection." } };
-			await ctx.scheduler.runAfter(0, internal.transcripts_grants.connect, { grantId: existing._id });
+			await transcripts_wake(ctx, { grantId: existing._id }, Date.now());
 			return { _yay: null };
 		}
 		const installation = access._yay.installation;
@@ -227,7 +268,8 @@ export const begin_connect = internalMutation({
 			updatedAt: Date.now(),
 		};
 		const grantId = existing?._id ?? (await ctx.db.insert("host_grants", values));
-		if (existing) await ctx.db.replace("host_grants", existing._id, values);
+		// Keep the saved wake-up so the old pending one is replaced, not left running beside a new one.
+		if (existing) await ctx.db.replace("host_grants", existing._id, { ...values, wakeJobId: existing.wakeJobId });
 		await ctx.db.insert("transcript_requests", {
 			installationId: installation._id,
 			actorUserId: access._yay.member.hostUserId,
@@ -238,7 +280,7 @@ export const begin_connect = internalMutation({
 			grantId,
 			runId: null,
 		});
-		await ctx.scheduler.runAfter(0, internal.transcripts_grants.connect, { grantId });
+		await transcripts_wake(ctx, { grantId }, Date.now());
 		return { _yay: null };
 	},
 });
@@ -282,7 +324,14 @@ export const retry = mutation({
 			.query("transcript_deletions")
 			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
 			.unique();
-		if (deletion) await ctx.db.patch("transcript_deletions", deletion._id, { nextAttemptAt: Date.now(), error: null });
+		// A person asked, so start every loop again now with a fresh retry count.
+		if (deletion)
+			await ctx.db.patch("transcript_deletions", deletion._id, {
+				nextAttemptAt: Date.now(),
+				error: null,
+				errorCode: undefined,
+				retry: undefined,
+			});
 		const state = await ctx.db
 			.query("transcript_channels")
 			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
@@ -291,8 +340,19 @@ export const retry = mutation({
 			await ctx.db.patch("transcript_channels", state._id, {
 				status: "pending",
 				error: null,
+				errorCode: undefined,
+				retry: undefined,
 				nextAttemptAt: Date.now(),
 			});
+		const grant = await ctx.db
+			.query("host_grants")
+			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
+			.unique();
+		// A final grant error needs Reconnect. A temporary one can try again now.
+		if (grant?.errorCode === "temporary") {
+			await ctx.db.patch("host_grants", grant._id, { retry: undefined });
+			await transcripts_wake(ctx, { grantId: grant._id }, Date.now());
+		}
 		const destination = await ctx.db
 			.query("transcript_destinations")
 			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
@@ -300,13 +360,7 @@ export const retry = mutation({
 		const run = destination?.runId ? await ctx.db.get("transcript_runs", destination.runId) : null;
 		if (destination?.readerRunId) {
 			const reader = await ctx.db.get("transcript_runs", destination.readerRunId);
-			if (reader) {
-				const job = await ctx.db
-					.query("transcript_jobs")
-					.withIndex("by_channel_sequence", (q) => q.eq("channelId", args.channelId).eq("sequence", reader.barrier))
-					.unique();
-				if (job) await ctx.db.patch("transcript_jobs", job._id, { nextAttemptAt: Date.now() });
-			}
+			if (reader) await transcripts_db_resume_readers(ctx, reader);
 		}
 		if (
 			run?.kind === "incremental" &&
@@ -323,7 +377,7 @@ export const retry = mutation({
 			)
 			.unique();
 		if (index) await transcripts_index_request(ctx, { indexId: index._id, reconcile: false });
-		await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, args);
+		if (state) await transcripts_wake(ctx, { channelStateId: state._id }, Date.now());
 		return { _yay: null };
 	},
 });
@@ -366,7 +420,13 @@ export const reconcile = mutation({
 			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
 			.unique();
 		if (!destination || !state) return { _nay: { message: "Connect Files first." } };
-		if (deletion) await ctx.db.patch("transcript_deletions", deletion._id, { nextAttemptAt: Date.now(), error: null });
+		if (deletion)
+			await ctx.db.patch("transcript_deletions", deletion._id, {
+				nextAttemptAt: Date.now(),
+				error: null,
+				errorCode: undefined,
+				retry: undefined,
+			});
 		const active = destination.runId ? await ctx.db.get("transcript_runs", destination.runId) : null;
 		const index = await ctx.db
 			.query("transcript_indexes")
@@ -393,9 +453,11 @@ export const reconcile = mutation({
 			await ctx.db.patch("transcript_channels", state._id, {
 				status: "pending",
 				error: null,
+				errorCode: undefined,
+				retry: undefined,
 				nextAttemptAt: Date.now(),
 			});
-			await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, { channelId: args.channelId });
+			await transcripts_wake(ctx, { channelStateId: state._id }, Date.now());
 			return { _yay: null };
 		}
 		const runId = await ctx.db.insert("transcript_runs", {
@@ -441,10 +503,12 @@ export const reconcile = mutation({
 		await ctx.db.patch("transcript_channels", state._id, {
 			status: "pending",
 			error: null,
+			errorCode: undefined,
+			retry: undefined,
 			nextAttemptAt: Date.now(),
 			workerGeneration: state.workerGeneration + 1,
 		});
-		await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, { channelId: args.channelId });
+		await transcripts_wake(ctx, { channelStateId: state._id }, Date.now());
 		return { _yay: null };
 	},
 });

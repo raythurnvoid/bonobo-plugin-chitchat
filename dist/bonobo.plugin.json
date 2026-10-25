@@ -2,12 +2,12 @@
 	"schemaVersion": 1,
 	"name": "chitchat",
 	"displayName": "Chitchat",
-	"version": "0.8.11",
+	"version": "0.8.12",
 	"description": "Team chat inside Bonobo Senate. Use your Bonobo Senate account and workspace with channels, threads, reactions, file attachments, unread and mention badges, and activity views. Chitchat has its own Convex database and live connections. A connected service keeps Markdown transcript copies in Bonobo Senate Files with current sharing and write permissions.",
 	"compatibility": {
 		"bonoboPluginRuntime": "1"
 	},
-	"events": [],
+	"events": [{ "type": "workspace.access.changed" }],
 	"pages": [
 		{
 			"id": "chat",
@@ -33,6 +33,7 @@
 		"https://exuberant-hippopotamus-790.convex.site",
 		"wss://exuberant-hippopotamus-790.convex.cloud"
 	],
+	"serviceEventsUrl": "https://exuberant-hippopotamus-790.convex.site/bonobo/access-events",
 	"files": [
 		{
 			"path": "dist/frontend/index.html",
@@ -42,8 +43,8 @@
 		},
 		{
 			"path": "dist/frontend/assets/index.js",
-			"sha256": "sha256:4f5d0f5a92f8b84e042440059ebda9a278ca6498443112e5728b650fd14d75e1",
-			"bytes": 889542,
+			"sha256": "sha256:a63dc3314c1fcb90965c98b09e05130ce3fd63f52d932ac0fcd5d0adaf85bb2a",
+			"bytes": 895008,
 			"contentType": "application/javascript"
 		},
 		{

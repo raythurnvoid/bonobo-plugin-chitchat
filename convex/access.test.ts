@@ -10,6 +10,7 @@ describe("members.resolve", () => {
 		const { t, user, member, installationId } = await setup();
 		await t.mutation(internal.access.apply_event, {
 			installationId,
+			afterRevision: 0,
 			revision: 1,
 			event: {
 				kind: "member",
@@ -130,10 +131,11 @@ describe("sessions.current", () => {
 		expect(
 			await t.mutation(internal.access.apply_event, {
 				installationId,
+				afterRevision: 0,
 				revision: 1,
 				event: { kind: "member", member: { ...member, canWrite: false } },
 			}),
-		).toBe(true);
+		).toBe("applied");
 		expect(await user.query(api.sessions.current, {})).toMatchObject({ canWrite: false });
 		expect(
 			await user.mutation(api.channels.create, {
@@ -149,52 +151,19 @@ describe("sessions.current", () => {
 
 	test("does not disconnect a different session or a no-op event", async () => {
 		const { t, user, installationId } = await setup();
-		await t.mutation(internal.access.apply_event, { installationId, revision: 1, event: { kind: "noop" } });
 		await t.mutation(internal.access.apply_event, {
 			installationId,
+			afterRevision: 0,
+			revision: 1,
+			event: { kind: "noop" },
+		});
+		await t.mutation(internal.access.apply_event, {
+			installationId,
+			afterRevision: 1,
 			revision: 2,
 			event: { kind: "session_revoked", hostSessionId: "other-session" },
 		});
 		expect(await user.query(api.sessions.current, {})).not.toBeNull();
-	});
-});
-
-describe("wake_installations", () => {
-	test("repeated outage polls leave no extra retry chain", async () => {
-		const { t } = await setup();
-		const fetchMock = vi.fn(async () => { throw new TypeError("Bonobo Senate is unavailable"); });
-		vi.stubGlobal("fetch", fetchMock);
-		for (let poll = 0; poll < 4; poll++) {
-			await t.mutation(internal.access.wake_installations, { paginationOpts: { numItems: 50, cursor: null } });
-			vi.advanceTimersByTime(0);
-			await t.finishInProgressScheduledFunctions();
-			const jobs = await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect());
-			expect(jobs.filter((job) => job.name === "access:sync" && job.state.kind === "pending")).toEqual([]);
-			expect(fetchMock).toHaveBeenCalledTimes(poll + 1);
-			vi.advanceTimersByTime(30_000);
-			await t.finishInProgressScheduledFunctions();
-		}
-	});
-
-	test("pages through installations and schedules each active one without waiting for another service call", async () => {
-		const { t, installationId } = await setup();
-		await t.run(async (ctx) => {
-			const { _id, _creationTime, ...installation } = (await ctx.db.get("installations", installationId))!;
-			for (let index = 0; index < 52; index++)
-				await ctx.db.insert("installations", {
-					...installation,
-					hostInstallationId: `other-${index}`,
-					status: index === 51 ? "revoked" : "ready",
-				});
-		});
-		await t.mutation(internal.access.wake_installations, { paginationOpts: { numItems: 50, cursor: null } });
-		const firstPage = await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect());
-		expect(firstPage.filter((job) => job.name === "access:sync")).toHaveLength(50);
-		const continuation = firstPage.find((job) => job.name === "access:wake_installations");
-		if (!continuation) throw new Error("The next installation page was not scheduled");
-		await t.mutation(internal.access.wake_installations, continuation.args[0]);
-		const allPages = await t.run((ctx) => ctx.db.system.query("_scheduled_functions").collect());
-		expect(allPages.filter((job) => job.name === "access:sync")).toHaveLength(52);
 	});
 });
 
@@ -205,16 +174,67 @@ describe("sync", () => {
 			expect(String(input)).toBe("https://press.test/api/v1/plugins/access/changes");
 			expect(JSON.parse(String(init?.body))).toEqual({ installationId: "installation", afterRevision: 0, limit: 100 });
 			return Response.json({
-				events: [{ revision: 1, event: { kind: "member", member: { ...member, active: false, canRead: false, canWrite: false } } }],
+				events: [
+					{
+						revision: 1,
+						event: { kind: "member", member: { ...member, active: false, canRead: false, canWrite: false } },
+					},
+				],
 				currentRevision: 1,
 				continueRevision: 1,
 				isDone: true,
 			});
 		});
 		vi.stubGlobal("fetch", fetchMock);
-		expect(await t.action(internal.access.sync, { installationId, requiredRevision: 0 })).toBe(true);
+		expect(
+			await t.action(internal.access.sync, { installationId, requiredRevision: 0, budgetMs: 12_000 }),
+		).toMatchObject({ ready: true });
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(await user.query(api.sessions.current, {})).toBeNull();
+	});
+
+	test("crosses gaps in the feed up to the continue revision", async () => {
+		const { t, user, member, installationId } = await setup();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				Response.json({
+					events: [
+						{ revision: 5, event: { kind: "member", member: { ...member, canWrite: false } } },
+						{ revision: 9, event: { kind: "noop" } },
+					],
+					currentRevision: 20,
+					continueRevision: 20,
+					isDone: true,
+				}),
+			),
+		);
+		expect(
+			await t.action(internal.access.sync, { installationId, requiredRevision: 20, budgetMs: 12_000 }),
+		).toMatchObject({ ready: true });
+		expect(await t.query(internal.access.get_installation, { installationId })).toMatchObject({
+			status: "ready",
+			appliedAccessRevision: 20,
+		});
+		expect(await user.query(api.sessions.current, {})).toMatchObject({ canWrite: false });
+		// A replay of an applied event is fine. A late copy of an older read must not apply over the newer state.
+		expect(
+			await t.mutation(internal.access.apply_event, {
+				installationId,
+				afterRevision: 5,
+				revision: 9,
+				event: { kind: "noop" },
+			}),
+		).toBe("applied");
+		expect(
+			await t.mutation(internal.access.apply_event, {
+				installationId,
+				afterRevision: 9,
+				revision: 21,
+				event: { kind: "member", member },
+			}),
+		).toBe("refused");
+		expect((await t.query(internal.access.get_installation, { installationId }))?.appliedAccessRevision).toBe(20);
 	});
 
 	test("a failed installation does not stop another installation from pulling changes", async () => {
@@ -225,19 +245,22 @@ describe("sync", () => {
 		});
 		if (!secondId) throw new Error("Setup has no second installation");
 		const seen: string[] = [];
-		vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-			const body = JSON.parse(String(init?.body));
-			seen.push(body.installationId);
-			if (body.installationId === "installation") throw new TypeError("Connection unavailable");
-			if (String(input).endsWith("/members/list"))
-				return Response.json({ startRevision: 0, currentRevision: 0, members: [], continueCursor: null });
-			return Response.json({ events: [], currentRevision: 0, continueRevision: 0, isDone: true });
-		}));
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+				const body = JSON.parse(String(init?.body));
+				seen.push(body.installationId);
+				if (body.installationId === "installation") throw new TypeError("Connection unavailable");
+				if (String(input).endsWith("/members/list"))
+					return Response.json({ startRevision: 0, currentRevision: 0, members: [], continueCursor: null });
+				return Response.json({ events: [], currentRevision: 0, continueRevision: 0, isDone: true });
+			}),
+		);
 		const results = await Promise.all([
-			t.action(internal.access.sync, { installationId, requiredRevision: 0 }),
-			t.action(internal.access.sync, { installationId: secondId, requiredRevision: 0 }),
+			t.action(internal.access.sync, { installationId, requiredRevision: 0, budgetMs: 12_000 }),
+			t.action(internal.access.sync, { installationId: secondId, requiredRevision: 0, budgetMs: 12_000 }),
 		]);
-		expect(results).toEqual([false, true]);
+		expect(results.map((result) => result.ready)).toEqual([false, true]);
 		expect(seen).toContain("second-installation");
 		expect((await t.query(internal.access.get_installation, { installationId: secondId }))?.status).toBe("ready");
 	});
@@ -248,6 +271,7 @@ describe("admit_lease", () => {
 		const { t, facts, installationId } = await setup();
 		await t.mutation(internal.access.apply_event, {
 			installationId,
+			afterRevision: 0,
 			revision: 1,
 			event: { kind: "session_revoked", hostSessionId: "not-yet-admitted" },
 		});
@@ -348,6 +372,7 @@ describe("admit_lease", () => {
 		const { t, user, facts, installationId } = await setup();
 		await t.mutation(internal.access.apply_event, {
 			installationId,
+			afterRevision: 0,
 			revision: 1,
 			event: { kind: "session_revoked", hostSessionId: facts.hostSessionId },
 		});
@@ -365,8 +390,13 @@ describe("apply_event", () => {
 	test("refuses a gap and refuses admission beyond the applied revision", async () => {
 		const { t, facts, member, installationId } = await setup();
 		expect(
-			await t.mutation(internal.access.apply_event, { installationId, revision: 2, event: { kind: "member", member } }),
-		).toBe(false);
+			await t.mutation(internal.access.apply_event, {
+				installationId,
+				afterRevision: 1,
+				revision: 2,
+				event: { kind: "member", member },
+			}),
+		).toBe("refused");
 		expect((await t.query(internal.access.get_installation, { installationId }))?.appliedAccessRevision).toBe(0);
 		expect(
 			await t.mutation(internal.access.admit_lease, {
@@ -397,18 +427,20 @@ describe("apply_event", () => {
 		expect(
 			await t.mutation(internal.access.apply_event, {
 				installationId,
+				afterRevision: 0,
 				revision: 1,
 				event: { kind: "member", member: removed },
 			}),
-		).toBe(true);
+		).toBe("applied");
 		expect(await user.query(api.sessions.current, {})).toBeNull();
 		expect(
 			await t.mutation(internal.access.apply_event, {
 				installationId,
+				afterRevision: 1,
 				revision: 2,
 				event: { kind: "member", member: { ...member, membershipLifetime: 2 } },
 			}),
-		).toBe(true);
+		).toBe("applied");
 		vi.advanceTimersByTime(100);
 		const next = {
 			...facts,
@@ -439,6 +471,7 @@ describe("apply_event", () => {
 		const { t, user, member, installationId } = await setup();
 		await t.mutation(internal.access.apply_event, {
 			installationId,
+			afterRevision: 0,
 			revision: 1,
 			event: { kind: "refresh", reason: "permissions" },
 		});
@@ -453,10 +486,11 @@ describe("apply_event", () => {
 		expect(
 			await t.mutation(internal.access.apply_event, {
 				installationId,
+				afterRevision: 1,
 				revision: 2,
 				event: { kind: "refresh", reason: "permissions" },
 			}),
-		).toBe(false);
+		).toBe("partial");
 		expect(await t.mutation(internal.access.finish_catchup, { installationId, observedRevision: 2 })).toBe(false);
 		expect(await t.query(internal.access.get_installation, { installationId })).toMatchObject({
 			status: "bootstrapping",

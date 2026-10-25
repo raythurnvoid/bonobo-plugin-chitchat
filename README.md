@@ -45,7 +45,18 @@ Bonobo Senate is the only identity authority for this release. `src/session.tsx`
 
 The target lease is 30 seconds. Membership and permission changes can reach Chitchat sooner through durable access events. If catch-up or renewal fails, access closes when the current lease expires. This is an explicit brief revocation window. Scheduled expiry writes also invalidate idle subscriptions. The browser checks a conservative monotonic deadline before submitting.
 
-Removal and reinvitation start a new membership lifetime. Old private grants do not become valid again. Uninstall, account changes, and version changes retire their old authority. Member pages use `/api/v1/plugins/members/list`; ordered events use `/api/v1/plugins/access/changes`. The 30-second cron schedules at most 50 installations per transaction and continues later pages. It owns background retries; failed requests never start another retry chain. Saved progress resumes on the next tick. Lease expiry remains independent of polling.
+Removal and reinvitation start a new membership lifetime. Old private grants do not become valid again. Uninstall, account changes, and version changes retire their old authority. Member pages use `/api/v1/plugins/members/list`; this installation's ordered events use `/api/v1/plugins/access/changes`. That feed skips revisions of other installations, so gaps between revisions are normal.
+
+Chitchat does not poll. When access changes, Bonobo Senate sends a signed `workspace.access.changed` notice to `/bonobo/access-events`, the manifest's `serviceEventsUrl`. The notice only says "pull now". Chitchat checks the Standard Webhooks signature and a 5-minute time window. Then it pulls the feed in the same request for up to 8 seconds.
+
+- 200: caught up, or the installation is unknown or revoked, or Bonobo Senate answers 409 unavailable (the installation is disabled, or was just upgraded and waits for its next lease, which syncs it).
+- 503: not caught up yet. Saved progress stays. It has `Retry-After: 5` only when this request saved progress. Otherwise Bonobo Senate uses its normal backoff.
+- 401: bad signature or old timestamp. Nothing is pulled or scheduled.
+- 413: the body is over 4096 bytes. It is refused before the signature check.
+
+Bonobo Senate retries a notice until it gets 200, so Chitchat starts no retry chain of its own. Chitchat caches the signing key from `/api/v1/plugins/service-events/key`, encrypted. On a signature mismatch, or when the saved key cannot be decrypted, it fetches the key again, at most once a minute. A lease request also catches up, so lease expiry does not depend on notices.
+
+While access is still syncing, `/auth/lease` answers 503 `{ code: "syncing", phase: "members" | "events", retryAfterMs }`. The frame shows "Getting the member list ready… Chitchat will open by itself." as a status and asks again by itself. It doubles its wait after each syncing answer, up to 30 seconds. It shows Reconnect only on 401/403 or after about 2 minutes. The shell's `data-chitchat-connection` attribute is `syncing`, `reconnecting`, `denied`, or `ready`.
 
 ## Markdown transcripts
 
@@ -73,6 +84,8 @@ limit remains local even though the public API supports other editable text and 
 A workspace admin must make the first connection. Both the connecting person and the exact Chitchat service account need **Can manage** on the workspace to create the initial locked root. Creating later locked folders needs **Can manage** on their parent folder or workspace. **Can write** alone cannot set their locks.
 
 After the root and `private` container exist, reduce the account's broad access where possible. Keep the workspace **Can write** permission needed for ordinary file writes, and **Can manage** on the exact generated root and `private` container. Normal folder grants do not pass to other folders or files. When creating a private channel folder, the public API grants **Can manage** on that new folder to the exact bound service account. The connecting person must be allowed to manage that account and grant access on the parent. This lets Chitchat update the transcript and its readers. Later setup calls keep existing grants unchanged and never restore a removed grant. The connecting person must also keep the Files permissions needed for each operation.
+
+Transcript work has no cron. Each channel, the README index, and each Files connection keep at most one scheduled wake-up. The wake-up is a mutation: it claims the work and arms a watchdog before it starts the action, so work resumes after an action crash. Temporary failures retry after 30 s, 1, 2, 5, and 10 minutes, then every 15 minutes, with some jitter. A `Retry-After` from Bonobo Senate wins. After 5 minutes of temporary failures, the status says when the next try runs and offers **Retry now**. An expired connection, missing permission, a sponsor who left, a conflict, or a file that is too large does not retry by itself. The status says which one it is.
 
 Transcript jobs are ordered per channel. Work claims, immutable source input, staged output, target IDs, write revisions, operation IDs, and checkpoints survive retries. A host transaction rechecks current access, labels, parent identity, file revision, and writer generation when publishing. A lost response can be checked without publishing twice.
 
@@ -107,9 +120,9 @@ Set these secrets on the Chitchat deployment:
 
 - `PRESS_HTTP_URL`: configured Bonobo Senate HTTP origin.
 - `PRESS_CHITCHAT_SERVICE_SECRET`: Bonobo Senate-issued Chitchat service proof.
-- `CHITCHAT_GRANT_ENCRYPTION_KEY`: base64 of 32 random bytes for AES-GCM.
+- `CHITCHAT_GRANT_ENCRYPTION_KEY`: base64 of 32 random bytes for AES-GCM. It encrypts Files grants and the cached signing key.
 
-Bonobo Senate needs no Chitchat URL, callback secret, or product-specific environment value. The publisher
+Bonobo Senate reads the notice URL from the manifest. It needs no callback secret or product-specific environment value. The publisher
 registers Chitchat through the normal service controls. Never put server secrets in Vite variables,
 source, logs, or built assets.
 
@@ -138,9 +151,9 @@ Published versions cannot change. Before publishing changed source or assets, us
 
 After native chat has accepted messages, keep its database and transcript queue. Fix and release the current app. Do not restore the old generic-store plugin or import old Markdown copies as chat; that would hide messages saved since the rebuild.
 
-Use **Retry sync** after a temporary Files failure. Use **Reconnect Files** when its connection needs renewal, including after a plugin update. Both still check current permissions and locks. They never restore removed account grants or overwrite manual sharing. **Rebuild copies** requires explicit confirmation before replacing manual text.
+Temporary Files failures retry by themselves. Use **Retry sync** after you fix the cause of a stop, such as missing folder access. Use **Reconnect Files** when the connection expired or the person who connected left, including after a plugin update. Both still check current permissions and locks. They never restore removed account grants or overwrite manual sharing. **Rebuild copies** requires explicit confirmation before replacing manual text.
 
-Unfinished private deletion appears in **Files sync** for the current owner or the original delete actor with the same active membership lifetime. This view shows copy progress and recovery controls. It does not reopen deleted messages. Rebuild remains available while copies are pending and stops being available when file archiving starts. A scheduled sweep also resumes interrupted archive work.
+Unfinished private deletion appears in **Files sync** for the current owner or the original delete actor with the same active membership lifetime. This view shows copy progress and recovery controls. It does not reopen deleted messages. Rebuild remains available while copies are pending and stops being available when file archiving starts. Interrupted archive work resumes from its saved step when its next wake-up runs.
 
 When the last channel member leaves the workspace, cleanup saves owner recovery before trying to update Files readers. This lets a current owner reconnect if the old sponsor can no longer write. A channel that never started Files setup needs no recovery entry.
 

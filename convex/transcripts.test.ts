@@ -5,11 +5,12 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { z } from "zod";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { api, internal } from "./_generated/api";
+import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
 import { transcripts_encrypt } from "./transcripts_secrets";
 import { channel_members_remove_host_member } from "./channel_members";
 import { chatbe_channel_header, chatbe_readme_markdown } from "../shared/transcript-markdown";
-import { transcripts_get_error_message } from "./transcripts_worker";
+import { transcripts_get_error_code, transcripts_get_error_message, transcripts_HostError } from "./transcripts_grants";
 
 const modules = import.meta.glob("./**/*.ts");
 const ROOT = "/chitchat-test-generation";
@@ -24,6 +25,40 @@ afterEach(() => {
 	vi.useRealTimers();
 	vi.unstubAllGlobals();
 });
+
+type TestConvex = ReturnType<typeof convexTest>;
+
+// Take the newest pending job with this name and cancel it, so a later timer does not run it a second time.
+async function take_scheduled(t: TestConvex, name: string) {
+	return await t.run(async (ctx) => {
+		const pending = (await ctx.db.system.query("_scheduled_functions").collect()).filter(
+			(job) => job.name === name && job.state.kind === "pending",
+		);
+		const job = pending.at(-1) ?? null;
+		if (job) await ctx.scheduler.cancel(job._id);
+		return job;
+	});
+}
+
+// Run one channel wake-up by hand: the dispatcher claims, then the action it started does one step.
+async function dispatch_channel(t: TestConvex, channelId: Id<"channels">) {
+	await t.mutation(internal.transcripts_worker.dispatch, { channelId });
+	const job = await take_scheduled(t, "transcripts_worker:run");
+	if (job) await t.action(internal.transcripts_worker.run, job.args[0]);
+}
+
+async function dispatch_index(t: TestConvex, indexId: Id<"transcript_indexes">) {
+	await t.mutation(internal.transcripts_index.dispatch, { indexId });
+	const job = await take_scheduled(t, "transcripts_index:run");
+	if (job) await t.action(internal.transcripts_index.run, job.args[0]);
+}
+
+// Run the current step of a Files connection, like its dispatcher does.
+async function run_grant(t: TestConvex, grantId: Id<"host_grants">) {
+	const grant = await t.run(async (ctx) => await ctx.db.get("host_grants", grantId));
+	if (grant)
+		await t.action(internal.transcripts_grants.connect, { grantId, lifecycleRequestId: grant.lifecycleRequestId });
+}
 
 function host(isPrivate = false) {
 	const files = new Map<string, { nodeId: string; content: string; revision: string }>();
@@ -501,7 +536,7 @@ async function fixture(isPrivate = false) {
 	};
 	const drain = async (expectBlocked = false) => {
 		for (let step = 0; step < 3000; step++) {
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			const status = await alice.query(api.transcripts.status, { channelId });
 			if (status?.status === "blocked") {
 				if (expectBlocked) return status;
@@ -602,12 +637,12 @@ async function fixture(isPrivate = false) {
 					.withIndex("by_channel", (q) => q.eq("channelId", targetChannelId))
 					.unique(),
 		))!;
-		for (let step = 0; step < 3; step++) await t.action(internal.transcripts_grants.connect, { grantId: grant._id });
+		for (let step = 0; step < 3; step++) await run_grant(t, grant._id);
 		return (await t.run(async (ctx) => await ctx.db.get("host_grants", grant._id)))!;
 	};
 	const drainDeletion = async () => {
 		for (let step = 0; step < 3000; step++) {
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			const deletion = await t.run(async (ctx) => await ctx.db.query("transcript_deletions").first());
 			if (deletion?.completedAt !== null && deletion?.completedAt !== undefined) return deletion;
 		}
@@ -636,6 +671,15 @@ describe("transcripts_get_error_message", () => {
 	});
 });
 
+describe("transcripts_get_error_code", () => {
+	test("retries an error without an HTTP status and stops on a final host refusal", () => {
+		const local = new Error("Bonobo Senate has not restored the previous Files readers.");
+		expect(transcripts_get_error_code(local, local.message)).toBe("temporary");
+		const missing = new transcripts_HostError("Not found (404)", 404);
+		expect(transcripts_get_error_code(missing, missing.message)).toBe("conflict");
+	});
+});
+
 describe("transcript publication", () => {
 	test.each(["committed", "uncommitted"])(
 		"rebuild settles an uncertain %s initial write before fencing",
@@ -644,7 +688,7 @@ describe("transcript publication", () => {
 			await send("Latest chat text");
 			remote.loseWrite(outcome === "uncommitted");
 			for (let step = 0; step < 40; step++) {
-				await t.action(internal.transcripts_worker.run_channel, { channelId });
+				await dispatch_channel(t, channelId);
 				if ((await alice.query(api.transcripts.status, { channelId }))?.error) break;
 			}
 			const main = `${ROOT}/${channel.transcriptSlug}.md`;
@@ -667,7 +711,7 @@ describe("transcript publication", () => {
 		await drain();
 		await alice.mutation(api.transcripts.reconcile, { channelId, clientRequestId: "first-confirmation" });
 		for (let step = 0; step < 40; step++) {
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			const run = await t.run(async (ctx) => {
 				const destination = await ctx.db.query("transcript_destinations").first();
 				return destination?.runId ? await ctx.db.get("transcript_runs", destination.runId) : null;
@@ -701,7 +745,7 @@ describe("transcript publication", () => {
 		await send(`rollover: ${"y".repeat(15_000)}`);
 		remote.loseWrite();
 		for (let step = 0; step < 40; step++) {
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			if ((await alice.query(api.transcripts.status, { channelId }))?.error) break;
 		}
 		const numbered = [...remote.files.entries()].find(([path]) => path !== main)!;
@@ -724,8 +768,7 @@ describe("transcript publication", () => {
 		const originalId = remote.files.get(main)!.nodeId;
 		await send("Hello from chat", "send-once");
 		remote.loseWrite();
-		for (let step = 0; step < 30 && remote.writes() < 2; step++)
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+		for (let step = 0; step < 30 && remote.writes() < 2; step++) await dispatch_channel(t, channelId);
 		expect(remote.writes()).toBe(2);
 		await alice.mutation(api.transcripts.retry, { channelId });
 		await drain();
@@ -839,7 +882,7 @@ describe("transcript publication", () => {
 			mentions: [],
 		});
 		for (let step = 0; step < 50; step++) {
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			if ((await alice.query(api.transcripts.status, { channelId }))!.appliedSequence >= barrier) break;
 		}
 		const main = `${ROOT}/${channel.transcriptSlug}.md`;
@@ -867,7 +910,7 @@ describe("transcript publication", () => {
 		await alice.mutation(api.transcripts.reconcile, { channelId, clientRequestId: "compact-history" });
 		remote.loseArchive();
 		for (let step = 0; step < 80; step++) {
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			if ((await alice.query(api.transcripts.status, { channelId }))?.error) break;
 		}
 		expect((await alice.query(api.transcripts.status, { channelId }))?.error).toContain("Archive response lost");
@@ -932,7 +975,7 @@ describe("transcript readers", () => {
 		await drain();
 		await alice.mutation(api.transcripts.reconcile, { channelId, clientRequestId: "fence-before-refresh" });
 		await t.mutation(internal.access.restart_snapshot, { installationId, revoked: false });
-		await t.action(internal.transcripts_worker.run_channel, { channelId });
+		await dispatch_channel(t, channelId);
 		expect(remote.generations.get("writer")).toBe(1);
 		const members = await t.run(async (ctx) =>
 			(await ctx.db.query("workspace_members").collect()).map((member) => ({
@@ -966,7 +1009,7 @@ describe("transcript readers", () => {
 				})
 			)._nay,
 		).toBeUndefined();
-		for (let step = 0; step < 30; step++) await t.action(internal.transcripts_worker.run_channel, { channelId });
+		for (let step = 0; step < 30; step++) await dispatch_channel(t, channelId);
 		expect((await t.run(async (ctx) => await ctx.db.query("channel_access_changes").first()))?.status).toBe("complete");
 		expect(remote.readers()).toEqual([{ userId: "bob", membershipLifetime: 1 }]);
 	});
@@ -987,7 +1030,7 @@ describe("transcript readers", () => {
 					})
 				)._nay,
 			).toBeUndefined();
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			if (outcome === "committed" || outcome === "source-changed" || outcome === "upgraded") {
 				remote.afterReaders(async () => {
 					if (outcome === "source-changed") {
@@ -1009,7 +1052,7 @@ describe("transcript readers", () => {
 					}
 					throw new TypeError("Reader reply lost");
 				});
-				await t.action(internal.transcripts_worker.run_channel, { channelId });
+				await dispatch_channel(t, channelId);
 			}
 			remote.expireToken(outcome === "forgotten");
 			if (outcome === "upgraded") remote.upgrade();
@@ -1033,12 +1076,12 @@ describe("transcript readers", () => {
 			await drain();
 			remote.failFence(failure === "refused" ? "refused" : "lost");
 			await alice.mutation(api.transcripts.reconcile, { channelId, clientRequestId: `fence-${failure}` });
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			expect((await alice.query(api.transcripts.status, { channelId }))?.error).toBeTruthy();
 			if (failure.startsWith("lost-then-refused")) {
 				remote.denyWrites();
 				await alice.mutation(api.transcripts.retry, { channelId });
-				await t.action(internal.transcripts_worker.run_channel, { channelId });
+				await dispatch_channel(t, channelId);
 				expect((await alice.query(api.transcripts.status, { channelId }))?.status).toBe("blocked");
 				remote.denyWrites(false);
 				if (failure === "lost-then-refused")
@@ -1058,7 +1101,7 @@ describe("transcript readers", () => {
 				)._nay,
 			).toBeUndefined();
 			if (failure === "lost") vi.setSystemTime(Date.now() + 30_000);
-			for (let step = 0; step < 30; step++) await t.action(internal.transcripts_worker.run_channel, { channelId });
+			for (let step = 0; step < 30; step++) await dispatch_channel(t, channelId);
 			const change = await t.run(async (ctx) => await ctx.db.query("channel_access_changes").first());
 			expect(change?.status).toBe("complete");
 			expect(remote.readers()).toEqual([{ userId: "bob", membershipLifetime: 1 }]);
@@ -1092,7 +1135,7 @@ describe("transcript readers", () => {
 				})
 			)._nay,
 		).toBeUndefined();
-		for (let step = 0; step < 15; step++) await t.action(internal.transcripts_worker.run_channel, { channelId });
+		for (let step = 0; step < 15; step++) await dispatch_channel(t, channelId);
 		expect(
 			(await alice.query(api.channel_members.status, { channelId, clientRequestId: "leave-after-block" }))?.status,
 		).toBe("complete");
@@ -1130,10 +1173,17 @@ describe("transcript readers", () => {
 			remote.removeReader("bob");
 			throw new TypeError("Lost the applied reader response");
 		});
-		await drain(true);
+		const reader_error = async () =>
+			(await t.run(async (ctx) => await ctx.db.query("transcript_destinations").first()))!.readerError;
+		for (let step = 0; step < 20 && !(await reader_error()); step++) await dispatch_channel(t, channelId);
+		// A lost response is temporary. The reader change waits for its next try instead of blocking.
+		expect(await alice.query(api.transcripts.status, { channelId })).toMatchObject({
+			status: "running",
+			errorCode: "temporary",
+		});
 		const before = remote.writes();
 		await send("Must wait for reader cancellation");
-		await t.action(internal.transcripts_worker.run_channel, { channelId });
+		await dispatch_channel(t, channelId);
 		expect(remote.writes()).toBe(before);
 		await alice.mutation(api.transcripts.retry, { channelId });
 		await drain();
@@ -1260,7 +1310,7 @@ describe("private transcript deletion", () => {
 			expectedMembershipRevision: 1,
 		});
 
-		for (let step = 0; step < 20; step++) await t.action(internal.transcripts_worker.run_channel, { channelId });
+		for (let step = 0; step < 20; step++) await dispatch_channel(t, channelId);
 		expect(remote.readers()).toEqual([]);
 		expect(remote.archived.size).toBe(0);
 		expect((await alice.query(api.transcripts.status, { channelId }))?.status).toBe("blocked");
@@ -1339,7 +1389,7 @@ describe("private transcript deletion", () => {
 		});
 		for (let step = 0; step < 12; step++) {
 			const before = remote.archived.size;
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			expect(remote.archived.size - before).toBeLessThanOrEqual(1);
 		}
 		await drainDeletion();
@@ -1361,7 +1411,7 @@ describe("private transcript deletion", () => {
 			expectedMembershipRevision: 1,
 		});
 		for (let step = 0; step < 30; step++) {
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			if ((await alice.query(api.transcripts.status, { channelId }))?.error) break;
 		}
 		const before = await t.run(async (ctx) => await ctx.db.query("transcript_deletions").first());
@@ -1383,7 +1433,7 @@ describe("private transcript deletion", () => {
 		expect(remote.receipts.has(before!.prepared!.operationId)).toBe(true);
 	});
 
-	test("the sweep resumes an expired archive claim and ignores its late completion", async () => {
+	test("an expired archive claim resumes and ignores its late completion", async () => {
 		const { t, alice, channelId, remote, send, drain, drainDeletion } = await fixture(true);
 		await send("Survive a stopped worker");
 		await drain();
@@ -1393,32 +1443,33 @@ describe("private transcript deletion", () => {
 			expectedMembershipRevision: 1,
 		});
 		for (let step = 0; step < 20; step++) {
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			const state = await t.run(async (ctx) => await ctx.db.query("transcript_channels").first());
 			if (state?.appliedSequence === state?.desiredSequence) break;
 		}
-		const original = (await t.mutation(internal.transcripts_deletions.claim, { channelId }))!;
-		expect(original.deletion.prepared).not.toBeNull();
+		const claim_deletion = async () => {
+			await t.mutation(internal.transcripts_worker.dispatch, { channelId });
+			const job = (await take_scheduled(t, "transcripts_worker:run"))!;
+			expect(job.args[0].work.kind).toBe("deletion");
+			return (await t.run(async (ctx) => await ctx.db.query("transcript_deletions").first()))!;
+		};
+		// The action of this claim never runs, like after a crash.
+		const original = await claim_deletion();
+		expect(original.prepared).not.toBeNull();
 		expect(remote.archived.size).toBe(0);
 		vi.setSystemTime(Date.now() + 60_001);
-		const beforeSweep = await t.run(
-			async (ctx) => (await ctx.db.system.query("_scheduled_functions").collect()).length,
-		);
-		await t.mutation(internal.transcripts_worker.sweep, {});
-		const scheduled = await t.run(async (ctx) => await ctx.db.system.query("_scheduled_functions").collect());
-		expect(scheduled.slice(beforeSweep).some((job) => job.name === "transcripts_worker:run_channel")).toBe(true);
-		const resumed = (await t.mutation(internal.transcripts_deletions.claim, { channelId }))!;
-		expect(resumed.deletion.prepared).toEqual(original.deletion.prepared);
-		expect(resumed.deletion.claim).not.toBe(original.deletion.claim);
+		const resumed = await claim_deletion();
+		expect(resumed.prepared).toEqual(original.prepared);
+		expect(resumed.claim).not.toBe(original.claim);
 		await t.mutation(internal.transcripts_deletions.release, {
-			deletionId: original.deletion._id,
-			claim: original.deletion.claim,
+			deletionId: original._id,
+			claim: original.claim,
 			error: null,
+			errorCode: null,
+			retryAfterMs: null,
 		});
-		const afterLateRelease = (await t.run(
-			async (ctx) => await ctx.db.get("transcript_deletions", original.deletion._id),
-		))!;
-		expect(afterLateRelease.prepared).toEqual(original.deletion.prepared);
+		const afterLateRelease = (await t.run(async (ctx) => await ctx.db.get("transcript_deletions", original._id)))!;
+		expect(afterLateRelease.prepared).toEqual(original.prepared);
 		expect(afterLateRelease.cursor).toBe(-1);
 		vi.setSystemTime(Date.now() + 60_001);
 		await drainDeletion();
@@ -1435,7 +1486,7 @@ describe("private transcript deletion", () => {
 			expectedMembershipRevision: 1,
 		});
 		for (let step = 0; step < 10; step++) {
-			await t.action(internal.transcripts_worker.run_channel, { channelId });
+			await dispatch_channel(t, channelId);
 			if (await t.run(async (ctx) => await ctx.db.query("transcript_deletions").first())) break;
 		}
 		remote.detach();
@@ -1482,7 +1533,7 @@ describe("private transcript deletion", () => {
 			clientRequestId: "delete-as-manager",
 			expectedMembershipRevision: 1,
 		});
-		for (let step = 0; step < 20; step++) await t.action(internal.transcripts_worker.run_channel, { channelId });
+		for (let step = 0; step < 20; step++) await dispatch_channel(t, channelId);
 		const paginationOpts = { cursor: null, numItems: 10 };
 		expect((await alice.query(api.transcripts.list_deletions, { paginationOpts })).page).toHaveLength(1);
 		expect((await alice.query(api.transcripts.status, { channelId }))?.canConnect).toBe(true);
@@ -1548,7 +1599,7 @@ describe("private transcript deletion", () => {
 			}));
 			expect(queued.deletion?.barrier).toBe(queued.progress?.desiredSequence);
 			expect(queued.deletion?.archiveStartedAt).toBeNull();
-			for (let step = 0; step < 30; step++) await t.action(internal.transcripts_worker.run_channel, { channelId });
+			for (let step = 0; step < 30; step++) await dispatch_channel(t, channelId);
 			const deletion = await t.run(async (ctx) => await ctx.db.query("transcript_deletions").first());
 			expect(deletion?.actorHostUserId).toBeNull();
 			expect(deletion?.completedAt).toBeNull();
@@ -1596,7 +1647,7 @@ describe("private transcript deletion", () => {
 			await channel_members_remove_host_member(ctx, { installationId, hostUserId: "bob", membershipLifetime: 2 });
 			await channel_members_remove_host_member(ctx, { installationId, hostUserId: "alice", membershipLifetime: 2 });
 		});
-		await t.action(internal.transcripts_worker.run_channel, { channelId });
+		await dispatch_channel(t, channelId);
 		const state = await t.run(async (ctx) => ({
 			channel: await ctx.db.get("channels", channelId),
 			deletion: await ctx.db
@@ -1668,7 +1719,7 @@ describe("transcript grants", () => {
 			expect((await reconnect(otherId)).error).toBeNull();
 		});
 		for (let step = 0; step < 15; step++) {
-			await t.action(internal.transcripts_index.run, { indexId: index._id });
+			await dispatch_index(t, index._id);
 			const current = (await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))!;
 			if (current.grantChannelId === otherId) break;
 		}
@@ -1676,7 +1727,7 @@ describe("transcript grants", () => {
 		expect(rebound.grantChannelId).toBe(otherId);
 		expect(rebound.status).toBe("pending");
 		expect(rebound.error).toBeNull();
-		for (let step = 0; step < 20; step++) await t.action(internal.transcripts_index.run, { indexId: index._id });
+		for (let step = 0; step < 20; step++) await dispatch_index(t, index._id);
 		expect((await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))?.status).toBe("ready");
 		expect(remote.writes()).toBe(1);
 	});
@@ -1720,13 +1771,12 @@ describe("transcript grants", () => {
 		const { t, alice, channelId, remote, reconnect } = await fixture();
 		const index = (await t.run(async (ctx) => await ctx.db.query("transcript_indexes").first()))!;
 		remote.loseWrite();
-		for (let step = 0; step < 15 && remote.writes() === 0; step++)
-			await t.action(internal.transcripts_index.run, { indexId: index._id });
+		for (let step = 0; step < 15 && remote.writes() === 0; step++) await dispatch_index(t, index._id);
 		const prepared = (await t.run(async (ctx) => await ctx.db.query("transcript_index_runs").first()))!;
 		expect(prepared.prepared).toBe(true);
 		remote.expireToken();
 		await alice.mutation(api.transcripts.retry, { channelId });
-		await t.action(internal.transcripts_index.run, { indexId: index._id });
+		await dispatch_index(t, index._id);
 		expect((await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))?.error).toContain("401");
 		const created = await alice.mutation(api.channels.create, {
 			clientRequestId: "new-index-sponsor",
@@ -1754,7 +1804,7 @@ describe("transcript grants", () => {
 			"prepared",
 		] as const)
 			expect(resumed[key]).toEqual(prepared[key]);
-		for (let step = 0; step < 20; step++) await t.action(internal.transcripts_index.run, { indexId: index._id });
+		for (let step = 0; step < 20; step++) await dispatch_index(t, index._id);
 		expect((await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))?.status).toBe("ready");
 		expect(remote.writes()).toBe(2);
 		expect(remote.files.get(`${ROOT}/README.md`)?.content).toContain("New sponsor");
@@ -1767,8 +1817,7 @@ describe("transcript grants", () => {
 					.unique(),
 		))!;
 		await t.mutation(internal.transcripts_grants.renew, { grantId: originalGrant._id });
-		for (let step = 0; step < 3; step++)
-			await t.action(internal.transcripts_grants.connect, { grantId: originalGrant._id });
+		for (let step = 0; step < 3; step++) await run_grant(t, originalGrant._id);
 		expect((await t.run(async (ctx) => await ctx.db.get("host_grants", originalGrant._id)))?.error).toBeNull();
 		expect((await t.run(async (ctx) => await ctx.db.get("transcript_indexes", index._id)))?.grantChannelId).toBe(
 			otherId,
@@ -1778,7 +1827,7 @@ describe("transcript grants", () => {
 	test("a failed new connection keeps the current index sponsor", async () => {
 		const { t, alice, channelId, remote, reconnect } = await fixture();
 		const index = (await t.run(async (ctx) => await ctx.db.query("transcript_indexes").first()))!;
-		for (let step = 0; step < 15; step++) await t.action(internal.transcripts_index.run, { indexId: index._id });
+		for (let step = 0; step < 15; step++) await dispatch_index(t, index._id);
 		const created = await alice.mutation(api.channels.create, {
 			clientRequestId: "refused-index-sponsor",
 			name: "Refused sponsor",
@@ -1895,7 +1944,7 @@ describe("transcript grants", () => {
 					.withIndex("by_channel", (q) => q.eq("channelId", channelId))
 					.unique(),
 		))!._id;
-		for (let step = 0; step < 5; step++) await t.action(internal.transcripts_grants.connect, { grantId });
+		for (let step = 0; step < 5; step++) await run_grant(t, grantId);
 		let grant = (await t.run(async (ctx) => await ctx.db.get("host_grants", grantId)))!;
 		expect(grant.phase).toBe("ready");
 		expect(grant.error).toBeNull();
@@ -1903,7 +1952,7 @@ describe("transcript grants", () => {
 		expect(JSON.stringify(grant)).not.toContain("plu_current_frame");
 		expect(JSON.stringify(grant)).not.toContain("psg_");
 		await t.mutation(internal.transcripts_grants.renew, { grantId });
-		for (let step = 0; step < 5; step++) await t.action(internal.transcripts_grants.connect, { grantId });
+		for (let step = 0; step < 5; step++) await run_grant(t, grantId);
 		grant = (await t.run(async (ctx) => await ctx.db.get("host_grants", grantId)))!;
 		expect(grant.phase).toBe("ready");
 		expect(calls).toEqual({ exchange: 1, seal: 2, renew: 1 });
@@ -1914,11 +1963,144 @@ describe("transcript grants", () => {
 	});
 });
 
+describe("transcript wake-ups", () => {
+	const pending_jobs = async (t: TestConvex) =>
+		(await t.run(async (ctx) => await ctx.db.system.query("_scheduled_functions").collect())).filter(
+			(job) => job.state.kind === "pending",
+		);
+	// Run every due scheduled function, and the work they schedule, without moving the clock.
+	// Moving it would expire the 60 s claim leases while the actions still run.
+	const settle = async (t: TestConvex) => await t.finishAllScheduledFunctions(() => vi.advanceTimersByTime(0), 1000);
+
+	test("a grant step refused with 401 stops at blocked and arms nothing", async () => {
+		const { t } = await fixture();
+		const grantId = await t.run(async (ctx) => {
+			const grant = (await ctx.db.query("host_grants").first())!;
+			// A renewal whose source bearer the host no longer accepts, like the dead grants on the dev deployment.
+			await ctx.db.patch("host_grants", grant._id, {
+				phase: "renew",
+				sourceSecret: await transcripts_encrypt("psg_dead"),
+				lifecycleRequestId: "renew-dead",
+			});
+			return grant._id;
+		});
+		const filesFetch = fetch;
+		let grantCalls = 0;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+				if (!new URL(String(input)).pathname.includes("service-grants")) return await filesFetch(input, init);
+				grantCalls++;
+				return Response.json({ message: "Unauthenticated" }, { status: 401 });
+			}),
+		);
+		await t.mutation(internal.transcripts_grants.dispatch, { grantId });
+		await settle(t);
+		const grant = (await t.run(async (ctx) => await ctx.db.get("host_grants", grantId)))!;
+		expect(grant.phase).toBe("blocked");
+		expect(grant.errorCode).toBe("auth_expired");
+		expect(grantCalls).toBe(1);
+		expect(await pending_jobs(t)).toEqual([]);
+	});
+
+	test("a temporary grant failure waits for its backoff, not for the step watchdog", async () => {
+		const { t } = await fixture();
+		const grantId = await t.run(async (ctx) => {
+			const grant = (await ctx.db.query("host_grants").first())!;
+			await ctx.db.patch("host_grants", grant._id, {
+				phase: "renew",
+				sourceSecret: await transcripts_encrypt("psg_busy"),
+				lifecycleRequestId: "renew-busy",
+			});
+			return grant._id;
+		});
+		const filesFetch = fetch;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+				if (!new URL(String(input)).pathname.includes("service-grants")) return await filesFetch(input, init);
+				return Response.json({ message: "Too many requests" }, { status: 429, headers: { "Retry-After": "600" } });
+			}),
+		);
+		await t.mutation(internal.transcripts_grants.dispatch, { grantId });
+		await settle(t);
+		const wakes = (await pending_jobs(t)).filter((job) => job.name === "transcripts_grants:dispatch");
+		expect(wakes.map((job) => job.scheduledTime - Date.now())).toEqual([600_000]);
+	});
+
+	test("a changed Files destination stops the grant instead of retrying it", async () => {
+		const { t } = await fixture();
+		const grantId = await t.run(async (ctx) => {
+			const destination = (await ctx.db.query("transcript_destinations").first())!;
+			await ctx.db.patch("transcript_destinations", destination._id, { writerId: "old-writer" });
+			return (await ctx.db.query("host_grants").first())!._id;
+		});
+		await t.mutation(internal.transcripts_grants.dispatch, { grantId });
+		await settle(t);
+		const grant = (await t.run(async (ctx) => await ctx.db.get("host_grants", grantId)))!;
+		expect(grant.errorCode).toBe("conflict");
+		expect((await pending_jobs(t)).filter((job) => job.name === "transcripts_grants:dispatch")).toEqual([]);
+	});
+
+	test("a reader change runs after a fence claim whose call was never sent", async () => {
+		const { t, alice, channelId, remote, drain } = await fixture(true);
+		await drain();
+		await alice.mutation(api.transcripts.reconcile, { channelId, clientRequestId: "fence-never-sent" });
+		// Claim the rebuild fence, then drop its action before it sends the fence call.
+		await t.mutation(internal.transcripts_worker.dispatch, { channelId });
+		expect(await take_scheduled(t, "transcripts_worker:run")).not.toBeNull();
+		const before = (await alice.query(api.channels.get, { channelId }))!;
+		expect(
+			(
+				await alice.mutation(api.channel_members.leave, {
+					channelId,
+					expectedMembershipRevision: before.membershipRevision,
+					clientRequestId: "leave-after-lost-fence",
+				})
+			)._nay,
+		).toBeUndefined();
+		vi.advanceTimersByTime(61_000);
+		for (let step = 0; step < 30; step++) await dispatch_channel(t, channelId);
+		expect((await t.run(async (ctx) => await ctx.db.query("channel_access_changes").first()))?.status).toBe("complete");
+		expect(remote.readers()).toEqual([{ userId: "bob", membershipLifetime: 1 }]);
+	});
+
+	test("the watchdog finishes channel work whose action never ran", async () => {
+		const { t, channel, remote, send } = await fixture();
+		await send("Saved after a crash");
+		// Run the dispatcher that the send armed. Then drop its action, like a deploy that stops it.
+		vi.advanceTimersByTime(0);
+		await t.finishInProgressScheduledFunctions();
+		const lost = await take_scheduled(t, "transcripts_worker:run");
+		expect(lost).not.toBeNull();
+		// The watchdog runs the dispatcher again one second after the 60 s lease.
+		vi.advanceTimersByTime(61_000);
+		await settle(t);
+		expect((await t.run(async (ctx) => await ctx.db.query("transcript_channels").first()))?.status).toBe("ready");
+		expect(remote.files.get(`${ROOT}/${channel.transcriptSlug}.md`)?.content).toContain("Saved after a crash");
+	});
+
+	test("idle channels keep no scheduled work", async () => {
+		const { t, alice, channelId, send } = await fixture();
+		await send("First");
+		await send("Second");
+		await expect(settle(t)).resolves.toBeUndefined();
+		expect(await alice.query(api.transcripts.status, { channelId })).toMatchObject({ status: "ready" });
+		expect(await pending_jobs(t)).toEqual([]);
+		const count = async () =>
+			(await t.run(async (ctx) => await ctx.db.system.query("_scheduled_functions").collect())).length;
+		const before = await count();
+		vi.advanceTimersByTime(60 * 60_000);
+		await t.finishInProgressScheduledFunctions();
+		expect(await count()).toBe(before);
+	});
+});
+
 describe("transcript index", () => {
 	test("uses its own source sequence and the existing public README format", async () => {
 		const { t, channel, remote } = await fixture();
 		const index = (await t.run(async (ctx) => await ctx.db.query("transcript_indexes").first()))!;
-		for (let step = 0; step < 15; step++) await t.action(internal.transcripts_index.run, { indexId: index._id });
+		for (let step = 0; step < 15; step++) await dispatch_index(t, index._id);
 		expect(remote.files.get(`${ROOT}/README.md`)?.content).toBe(
 			chatbe_readme_markdown([{ name: channel.name, slug: channel.transcriptSlug }]),
 		);

@@ -1,5 +1,4 @@
 import { v } from "convex/values";
-import { paginationOptsValidator } from "convex/server";
 import { doc } from "convex-helpers/validators";
 import { zodToConvex } from "convex-helpers/server/zod4";
 import { z } from "zod";
@@ -26,6 +25,16 @@ export const get_installation = internalQuery({
 	args: { installationId: v.id("installations") },
 	returns: v.union(doc(schema, "installations"), v.null()),
 	handler: async (ctx, args) => await ctx.db.get(args.installationId),
+});
+
+export const get_installation_by_host = internalQuery({
+	args: { hostInstallationId: v.string() },
+	returns: v.union(doc(schema, "installations"), v.null()),
+	handler: async (ctx, args) =>
+		await ctx.db
+			.query("installations")
+			.withIndex("by_hostInstallationId", (q) => q.eq("hostInstallationId", args.hostInstallationId))
+			.unique(),
 });
 
 export const ensure_installation = internalMutation({
@@ -140,6 +149,7 @@ export const accept_snapshot_page = internalMutation({
 	},
 });
 
+// Return true when this call saved a cleanup step or finished the snapshot.
 export const finish_snapshot = internalMutation({
 	args: { installationId: v.id("installations") },
 	returns: v.boolean(),
@@ -167,7 +177,7 @@ export const finish_snapshot = internalMutation({
 				cleanupPending: true,
 			});
 		}
-		if (missing.length > 0) return false;
+		if (missing.length > 0) return true;
 		const pending = await ctx.db
 			.query("workspace_members")
 			.withIndex("by_installation_cleanupPending", (q) =>
@@ -181,7 +191,7 @@ export const finish_snapshot = internalMutation({
 				membershipLifetime: pending.active ? pending.membershipLifetime : -1,
 			});
 			if (done) await ctx.db.patch(pending._id, { cleanupPending: false });
-			return false;
+			return true;
 		}
 		// Keep queries closed until all changes observed during the scan have been replayed.
 		await ctx.db.patch(installation._id, {
@@ -193,18 +203,29 @@ export const finish_snapshot = internalMutation({
 	},
 });
 
+// The feed returns only this installation's events, so revisions have gaps. `afterRevision` is the revision
+// the caller read after: the request's revision for the first event, then the previous event's revision.
+// An event applies only when nothing was applied in between.
+//
+// "applied": the event is applied, so go on with the page. "partial": some work was saved, but the page
+// stops here, because a refresh started or member cleanup has more steps. "refused": nothing was saved.
 export const apply_event = internalMutation({
-	args: { installationId: v.id("installations"), revision: v.number(), event: zodToConvex(press_access_event) },
-	returns: v.boolean(),
+	args: {
+		installationId: v.id("installations"),
+		afterRevision: v.number(),
+		revision: v.number(),
+		event: zodToConvex(press_access_event),
+	},
+	returns: v.union(v.literal("applied"), v.literal("partial"), v.literal("refused")),
 	handler: async (ctx, args) => {
 		const installation = await ctx.db.get(args.installationId);
-		if (!installation || installation.status === "revoked") return false;
-		if (args.revision <= installation.appliedAccessRevision) return true;
+		if (!installation || installation.status === "revoked") return "refused";
+		if (args.revision <= installation.appliedAccessRevision) return "applied";
 		if (
-			args.revision !== installation.appliedAccessRevision + 1 ||
+			installation.appliedAccessRevision !== args.afterRevision ||
 			(installation.status === "bootstrapping" && installation.bootstrapPhase !== "events")
 		)
-			return false;
+			return "refused";
 		const event = args.event;
 		if (event.kind === "refresh") {
 			await ctx.db.patch(installation._id, {
@@ -215,7 +236,7 @@ export const apply_event = internalMutation({
 				bootstrapPhase: "members",
 				bootstrapTargetRevision: args.revision,
 			});
-			return false;
+			return "partial";
 		}
 		if (event.kind === "revoked") {
 			await ctx.db.patch(installation._id, {
@@ -223,7 +244,7 @@ export const apply_event = internalMutation({
 				invalidatedAtRevision: args.revision,
 				appliedAccessRevision: args.revision,
 			});
-			return true;
+			return "applied";
 		}
 		if (event.kind === "session_revoked") {
 			const revoked = await ctx.db
@@ -277,11 +298,29 @@ export const apply_event = internalMutation({
 					hostUserId: member.hostUserId,
 					membershipLifetime: member.active ? member.membershipLifetime : -1,
 				});
-				if (!done) return false;
+				if (!done) return "partial";
 				await ctx.db.patch(member._id, { cleanupPending: false });
 			}
 		}
 		await ctx.db.patch(installation._id, { appliedAccessRevision: args.revision });
+		return "applied";
+	},
+});
+
+// The feed says that no event for this installation is in (fromRevision, toRevision], so move across the gap.
+export const advance_access_revision = internalMutation({
+	args: { installationId: v.id("installations"), fromRevision: v.number(), toRevision: v.number() },
+	returns: v.boolean(),
+	handler: async (ctx, args) => {
+		const installation = await ctx.db.get(args.installationId);
+		if (!installation || installation.status === "revoked") return false;
+		if (args.toRevision <= installation.appliedAccessRevision) return true;
+		if (
+			installation.appliedAccessRevision !== args.fromRevision ||
+			(installation.status === "bootstrapping" && installation.bootstrapPhase !== "events")
+		)
+			return false;
+		await ctx.db.patch(installation._id, { appliedAccessRevision: args.toRevision });
 		return true;
 	},
 });
@@ -322,24 +361,38 @@ export const restart_snapshot = internalMutation({
 });
 
 export const sync = internalAction({
-	args: { installationId: v.id("installations"), requiredRevision: v.number() },
-	returns: v.boolean(),
-	handler: async (ctx, args): Promise<boolean> => {
+	// `budgetMs` bounds one call, so a large roster cannot hold an HTTP request past its caller's limit.
+	// The lease route and the access notice route each pass their own budget.
+	// `progressed` says whether this call saved anything, so the notice route can ask for a quick retry.
+	// `needsLease` says the member list answered 409 unavailable: the installation is disabled, or its service
+	// connection still names the old version or account after an upgrade. Only a lease exchange binds it again.
+	args: { installationId: v.id("installations"), requiredRevision: v.number(), budgetMs: v.number() },
+	returns: v.object({ ready: v.boolean(), progressed: v.boolean(), needsLease: v.boolean() }),
+	handler: async (ctx, args): Promise<{ ready: boolean; progressed: boolean; needsLease: boolean }> => {
+		let progressed = false;
 		try {
-			// Bound one action. A continuation keeps a large roster from blocking an HTTP lease request.
-			const stopAt = Date.now() + 12_000;
+			const stopAt = Date.now() + args.budgetMs;
+			// One Bonobo Senate call may use at most the time that is left, and never more than 15 s.
+			const timeout = () => Math.min(15_000, stopAt - Date.now());
 			for (let step = 0; step < 10 && Date.now() < stopAt; step++) {
 				const installation = await ctx.runQuery(internal.access.get_installation, {
 					installationId: args.installationId,
 				});
-				if (!installation || installation.status === "revoked") return false;
+				if (!installation || installation.status === "revoked") return { ready: false, progressed, needsLease: false };
 				if (installation.status === "bootstrapping" && installation.bootstrapPhase === "members") {
-					const answer = await press_post("/api/v1/plugins/members/list", {
-						installationId: installation.hostInstallationId,
-						cursor: installation.bootstrapCursor,
-						startRevision: installation.bootstrapStartRevision,
-					});
+					const answer = await press_post(
+						"/api/v1/plugins/members/list",
+						{
+							installationId: installation.hostInstallationId,
+							cursor: installation.bootstrapCursor,
+							startRevision: installation.bootstrapStartRevision,
+						},
+						undefined,
+						timeout(),
+					);
 					const page = snapshot_response.safeParse(answer.body);
+					if (answer.status === 409 && z.object({ code: z.literal("unavailable") }).safeParse(answer.body).success)
+						return { ready: false, progressed, needsLease: true };
 					if (answer.status === 410) {
 						const failure = z.object({ code: z.string() }).safeParse(answer.body);
 						await ctx.runMutation(internal.access.restart_snapshot, {
@@ -349,23 +402,32 @@ export const sync = internalAction({
 						continue;
 					}
 					if (answer.status !== 200 || !page.success) throw new Error("Bonobo Senate snapshot is unavailable");
-					await ctx.runMutation(internal.access.accept_snapshot_page, {
-						installationId: installation._id,
-						expectedStartRevision: installation.bootstrapStartRevision,
-						expectedCursor: installation.bootstrapCursor,
-						page: page.data,
-					});
+					if (
+						await ctx.runMutation(internal.access.accept_snapshot_page, {
+							installationId: installation._id,
+							expectedStartRevision: installation.bootstrapStartRevision,
+							expectedCursor: installation.bootstrapCursor,
+							page: page.data,
+						})
+					)
+						progressed = true;
 					continue;
 				}
 				if (installation.status === "bootstrapping" && installation.bootstrapPhase === "cleanup") {
-					await ctx.runMutation(internal.access.finish_snapshot, { installationId: installation._id });
+					if (await ctx.runMutation(internal.access.finish_snapshot, { installationId: installation._id }))
+						progressed = true;
 					continue;
 				}
-				const answer = await press_post("/api/v1/plugins/access/changes", {
-					installationId: installation.hostInstallationId,
-					afterRevision: installation.appliedAccessRevision,
-					limit: 100,
-				});
+				const answer = await press_post(
+					"/api/v1/plugins/access/changes",
+					{
+						installationId: installation.hostInstallationId,
+						afterRevision: installation.appliedAccessRevision,
+						limit: 100,
+					},
+					undefined,
+					timeout(),
+				);
 				if (answer.status === 410) {
 					const failure = z.object({ code: z.string() }).safeParse(answer.body);
 					await ctx.runMutation(internal.access.restart_snapshot, {
@@ -376,54 +438,46 @@ export const sync = internalAction({
 				}
 				const page = events_response.safeParse(answer.body);
 				if (answer.status !== 200 || !page.success) throw new Error("Bonobo Senate events are unavailable");
-				let expectedRevision = installation.appliedAccessRevision + 1;
+				// Gaps are normal: the feed skips other installations' revisions. Every event for this
+				// installation in (applied, continueRevision] is on the page, in order.
+				let afterRevision = installation.appliedAccessRevision;
 				let complete = true;
 				for (const entry of page.data.events) {
-					if (entry.revision !== expectedRevision++) throw new Error("Bonobo Senate access events contain a gap");
-					if (!(await ctx.runMutation(internal.access.apply_event, { installationId: installation._id, ...entry }))) {
+					if (entry.revision <= afterRevision || entry.revision > page.data.continueRevision)
+						throw new Error("Bonobo Senate access events are out of order");
+					const applied = await ctx.runMutation(internal.access.apply_event, {
+						installationId: installation._id,
+						afterRevision,
+						...entry,
+					});
+					if (applied !== "refused") progressed = true;
+					if (applied !== "applied") {
 						complete = false;
 						break;
 					}
+					afterRevision = entry.revision;
 				}
-				if (
-					complete &&
-					page.data.isDone &&
-					page.data.continueRevision === expectedRevision - 1 &&
-					page.data.currentRevision === page.data.continueRevision &&
-					page.data.currentRevision >= args.requiredRevision
-				) {
-					return await ctx.runMutation(internal.access.finish_catchup, {
+				if (!complete) continue;
+				const advanced = await ctx.runMutation(internal.access.advance_access_revision, {
+					installationId: installation._id,
+					fromRevision: afterRevision,
+					toRevision: page.data.continueRevision,
+				});
+				if (advanced && page.data.continueRevision > afterRevision) progressed = true;
+				if (advanced && page.data.isDone && page.data.continueRevision >= args.requiredRevision) {
+					const ready = await ctx.runMutation(internal.access.finish_catchup, {
 						installationId: installation._id,
-						observedRevision: page.data.currentRevision,
+						observedRevision: page.data.continueRevision,
 					});
+					return { ready, progressed, needsLease: false };
 				}
 			}
 		} catch {
 			console.warn("Bonobo Senate membership sync will retry", { installationId: args.installationId });
 		}
-		// The cron resumes saved progress. A failed call must not start another retry chain.
-		return false;
-	},
-});
-
-export const wake_installations = internalMutation({
-	args: { paginationOpts: paginationOptsValidator },
-	returns: v.null(),
-	handler: async (ctx, args) => {
-		const page = await ctx.db.query("installations").paginate({ ...args.paginationOpts, numItems: 50 });
-		for (const installation of page.page) {
-			if (installation.status !== "revoked") {
-				await ctx.scheduler.runAfter(0, internal.access.sync, {
-					installationId: installation._id,
-					requiredRevision: installation.appliedAccessRevision,
-				});
-			}
-		}
-		if (!page.isDone)
-			await ctx.scheduler.runAfter(0, internal.access.wake_installations, {
-				paginationOpts: { numItems: 50, cursor: page.continueCursor },
-			});
-		return null;
+		// The next lease request or access notice resumes saved progress. Bonobo Senate retries a notice
+		// until Chitchat answers 200, so this call must not start a retry chain of its own.
+		return { ready: false, progressed, needsLease: false };
 	},
 });
 

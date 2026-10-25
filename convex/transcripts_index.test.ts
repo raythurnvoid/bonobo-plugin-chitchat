@@ -3,6 +3,7 @@ import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { z } from "zod";
 import { api, internal } from "./_generated/api";
+import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
 import { transcripts_encrypt } from "./transcripts_secrets";
 import { transcripts_index_request } from "./transcripts_index";
@@ -290,10 +291,23 @@ async function fixture(isPrivate = false) {
 	const state = async () => (await t.run(async (ctx) => await ctx.db.get("transcript_indexes", indexId)))!;
 	const request = async (reconcile = false) =>
 		await t.run(async (ctx) => await transcripts_index_request(ctx, { indexId, reconcile }));
-	const tick = async () => await t.action(internal.transcripts_index.run, { indexId });
+	// Take the action that the dispatcher started and cancel its scheduled copy, so it runs only here.
+	const take_run = async () =>
+		await t.run(async (ctx) => {
+			const job = (await ctx.db.system.query("_scheduled_functions").collect())
+				.filter((job) => job.name === "transcripts_index:run" && job.state.kind === "pending")
+				.at(-1);
+			if (job) await ctx.scheduler.cancel(job._id);
+			return job ? (job.args[0] as { runId: Id<"transcript_index_runs">; claim: string }) : null;
+		});
+	const dispatch_index = async () => {
+		await t.mutation(internal.transcripts_index.dispatch, { indexId });
+		const claimed = await take_run();
+		if (claimed) await t.action(internal.transcripts_index.run, claimed);
+	};
 	const drain = async (blocked = false) => {
 		for (let attempt = 0; attempt < 300; attempt++) {
-			await tick();
+			await dispatch_index();
 			const current = await state();
 			if (current.status === "blocked") {
 				if (blocked) return current;
@@ -324,7 +338,7 @@ async function fixture(isPrivate = false) {
 			}
 			return entries;
 		});
-	return { t, alice, channelId, grantId, indexId, remote, state, request, tick, drain, seed };
+	return { t, alice, channelId, grantId, indexId, remote, state, request, take_run, dispatch_index, drain, seed };
 }
 
 describe("transcript index", () => {
@@ -359,10 +373,10 @@ describe("transcript index", () => {
 	});
 
 	test("keeps a frozen source barrier while later names wait", async () => {
-		const { remote, state, seed, tick, drain } = await fixture();
-		await tick();
+		const { remote, state, seed, dispatch_index, drain } = await fixture();
+		await dispatch_index();
 		await seed(["Later channel"]);
-		for (let i = 0; i < 5 && (await state()).appliedSequence < 1; i++) await tick();
+		for (let i = 0; i < 5 && (await state()).appliedSequence < 1; i++) await dispatch_index();
 		expect(remote.files.get(PATH)!.content).not.toContain("Later channel");
 		await drain();
 		expect(remote.files.get(PATH)!.content).toContain("Later channel");
@@ -419,11 +433,12 @@ describe("transcript index", () => {
 	});
 
 	test("replays an uncertain initial write unchanged before learning its file id", async () => {
-		const { t, indexId, remote, tick, request, drain, state } = await fixture();
+		const { t, indexId, remote, take_run, dispatch_index, request, drain, state } = await fixture();
 		remote.loseWrite();
-		for (let i = 0; i < 10 && remote.writes() === 0; i++) await tick();
+		for (let i = 0; i < 10 && remote.writes() === 0; i++) await dispatch_index();
 		expect((await state()).nodeId).toBeNull();
-		expect(await t.mutation(internal.transcripts_index.claim, { indexId })).toBeNull();
+		await t.mutation(internal.transcripts_index.dispatch, { indexId });
+		expect(await take_run()).toBeNull();
 		await request();
 		await drain();
 		expect(remote.writes()).toBe(1);
@@ -434,9 +449,9 @@ describe("transcript index", () => {
 	});
 
 	test("rebuild first recovers an unknown committed file and then fences it", async () => {
-		const { remote, tick, request, drain } = await fixture();
+		const { remote, dispatch_index, request, drain } = await fixture();
 		remote.loseWrite();
-		for (let i = 0; i < 10 && remote.writes() === 0; i++) await tick();
+		for (let i = 0; i < 10 && remote.writes() === 0; i++) await dispatch_index();
 		remote.files.get(PATH)!.content += "\nHuman text";
 		remote.files.get(PATH)!.revision = "human";
 		await request(true);
@@ -449,7 +464,7 @@ describe("transcript index", () => {
 	});
 
 	test("requires explicit rebuild for human edits and replays a lost fence receipt", async () => {
-		const { remote, seed, drain, tick, request } = await fixture();
+		const { remote, seed, drain, dispatch_index, request } = await fixture();
 		await drain();
 		const originalId = remote.files.get(PATH)!.nodeId;
 		remote.files.get(PATH)!.content += "\nHuman text";
@@ -461,7 +476,7 @@ describe("transcript index", () => {
 		expect(remote.files.get(PATH)!.content).toContain("Human text");
 		remote.loseFence();
 		await request(true);
-		await tick();
+		await dispatch_index();
 		expect(remote.generation()).toBe(2);
 		await request();
 		await drain();
@@ -474,40 +489,43 @@ describe("transcript index", () => {
 	});
 
 	test("fences a delayed old publish and ignores its stale native checkpoints", async () => {
-		const { t, indexId, remote, seed, tick, request, drain, state } = await fixture();
+		const { t, indexId, remote, seed, take_run, dispatch_index, request, drain, state } = await fixture();
 		await drain();
 		await seed(["New room"]);
 		for (let i = 0; i < 10; i++) {
-			await tick();
+			await dispatch_index();
 			const index = await state();
 			const run = index.activeRunId
 				? await t.run(async (ctx) => await ctx.db.get("transcript_index_runs", index.activeRunId!))
 				: null;
 			if (run?.prepared) break;
 		}
-		const old = (await t.mutation(internal.transcripts_index.claim, { indexId }))!;
+		await t.mutation(internal.transcripts_index.dispatch, { indexId });
+		const old = (await take_run())!;
 		await t.mutation(internal.transcripts_index.release, {
-			runId: old._id,
+			runId: old.runId,
 			claim: old.claim,
 			receipt: null,
-			retryable: false,
 			error: null,
+			errorCode: null,
+			retryAfterMs: null,
 		});
 		remote.beforeWrite(async () => {
 			await request(true);
-			await tick();
+			await dispatch_index();
 		});
-		await tick();
+		await dispatch_index();
 		expect(remote.generation()).toBe(2);
 		expect(remote.writes()).toBe(1);
 		await t.mutation(internal.transcripts_index.release, {
-			runId: old._id,
+			runId: old.runId,
 			claim: old.claim,
 			receipt: null,
-			retryable: false,
 			error: "Stale error",
+			errorCode: "conflict",
+			retryAfterMs: null,
 		});
-		await t.mutation(internal.transcripts_index.step, { runId: old._id, claim: old.claim });
+		await t.mutation(internal.transcripts_index.step, old);
 		expect((await state()).status).toBe("pending");
 		expect((await state()).error).toBeNull();
 		await drain();
@@ -516,10 +534,10 @@ describe("transcript index", () => {
 	});
 
 	test("removes completed jobs and retired runs only after the host write is confirmed", async () => {
-		const { t, indexId, remote, seed, tick, request, drain, state } = await fixture();
+		const { t, indexId, remote, seed, dispatch_index, request, drain, state } = await fixture();
 		await seed(Array.from({ length: 60 }, (_, i) => `Room ${i}`));
 		remote.loseWrite();
-		for (let i = 0; i < 20 && remote.writes() === 0; i++) await tick();
+		for (let i = 0; i < 20 && remote.writes() === 0; i++) await dispatch_index();
 		await t.mutation(internal.transcripts_index.cleanup, { indexId, throughCreatedAt: Date.now() + 1000 });
 		expect(await t.run(async (ctx) => (await ctx.db.query("transcript_index_jobs").collect()).length)).toBe(61);
 		expect((await state()).activeRunId).not.toBeNull();
@@ -545,20 +563,20 @@ describe("transcript index", () => {
 	});
 
 	test("a retry of an already saved index stays ready", async () => {
-		const { request, tick, drain, state, remote } = await fixture();
+		const { request, dispatch_index, drain, state, remote } = await fixture();
 		await drain();
 		await request();
-		await tick();
+		await dispatch_index();
 		expect((await state()).status).toBe("ready");
 		expect(remote.writes()).toBe(1);
 	});
 
 	test("a new rebuild can replace manual edits made after an earlier rebuild prepared its write", async () => {
-		const { t, request, tick, drain, state, remote } = await fixture();
+		const { t, request, dispatch_index, drain, state, remote } = await fixture();
 		await drain();
 		await request(true);
 		for (let i = 0; i < 10; i++) {
-			await tick();
+			await dispatch_index();
 			const index = await state();
 			const current = index.activeRunId
 				? await t.run(async (ctx) => await ctx.db.get("transcript_index_runs", index.activeRunId!))

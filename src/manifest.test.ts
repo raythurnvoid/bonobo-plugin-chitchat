@@ -23,6 +23,7 @@ const manifest = JSON.parse(readFileSync(new URL("../bonobo.plugin.json", import
 	capabilities: string[];
 	outboundOrigins: string[];
 	uiOutboundOrigins: string[];
+	serviceEventsUrl: string;
 	files: { path: string; sha256: string; bytes: number; contentType: string }[];
 };
 
@@ -61,10 +62,14 @@ describe("bonobo.plugin.json", () => {
 		]);
 	});
 
+	test("gets access notices at its own Convex HTTP route", () => {
+		expect(manifest.events).toEqual([{ type: "workspace.access.changed" }]);
+		expect(manifest.serviceEventsUrl).toBe("https://exuberant-hippopotamus-790.convex.site/bonobo/access-events");
+	});
+
 	test("uses its separate Convex backend without the generic store or runner", () => {
 		expect("backend" in manifest).toBe(false);
 		expect("userWritableCollections" in manifest).toBe(false);
-		expect(manifest.events).toEqual([]);
 		expect(manifest.outboundOrigins).toEqual([]);
 		expect("secrets" in manifest).toBe(false);
 		expect("fileViews" in manifest).toBe(false);

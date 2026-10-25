@@ -4,10 +4,12 @@ import { createContext, useContext, useEffect, useState, useSyncExternalStore, t
 import { z } from "zod";
 import { api } from "../convex/_generated/api";
 
+const SYNCING_MESSAGE = "Getting the member list ready… Chitchat will open by itself.";
+
 function create_chat_connection(host: BonoboClient) {
 	const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL, { authRefreshTokenLeewaySeconds: 15 });
 	let snapshot: {
-		phase: "connecting" | "ready" | "unavailable" | "denied";
+		phase: "connecting" | "ready" | "syncing" | "unavailable" | "denied";
 		message: string | null;
 		deadline: number;
 		refreshing: boolean;
@@ -26,6 +28,8 @@ function create_chat_connection(host: BonoboClient) {
 	let failures = 0;
 	let closed = false;
 	let confirmed = false;
+	// When the lease route first answered "syncing" in this run of answers. Null after any other answer.
+	let syncingSince: number | null = null;
 
 	function update(next: Partial<typeof snapshot>) {
 		if (closed) return;
@@ -36,7 +40,7 @@ function create_chat_connection(host: BonoboClient) {
 	function on_auth(authenticated: boolean) {
 		confirmed = authenticated;
 		if (authenticated && performance.now() < snapshot.deadline) update({ phase: "ready", message: null });
-		else if (!pending && snapshot.phase !== "denied")
+		else if (!pending && snapshot.phase !== "denied" && snapshot.phase !== "syncing")
 			update({ phase: "unavailable", message: "Chitchat is reconnecting. Your draft is kept." });
 	}
 
@@ -45,7 +49,8 @@ function create_chat_connection(host: BonoboClient) {
 		cached = null;
 		if (retryTimer) clearTimeout(retryTimer);
 		retryTimer = null;
-		update({ phase: "connecting", message: null });
+		// Keep the syncing pause on screen while it asks again, so it does not flicker.
+		if (snapshot.phase !== "syncing") update({ phase: "connecting", message: null });
 		convex.setAuth(fetch_token, on_auth);
 	}
 
@@ -57,6 +62,7 @@ function create_chat_connection(host: BonoboClient) {
 			const startedAt = performance.now();
 			request = new AbortController();
 			const timeout = setTimeout(() => request?.abort(), 25_000);
+			let syncingRetryMs: number | null = null;
 			try {
 				const pressToken = await host.getToken();
 				const url = `${import.meta.env.VITE_CONVEX_SITE_URL}/auth/lease`;
@@ -76,6 +82,17 @@ function create_chat_connection(host: BonoboClient) {
 				const lease = z
 					.object({ jwt: z.string(), expiresAt: z.number(), validForMs: z.number().min(0).max(30_000) })
 					.safeParse(raw);
+				const syncing = z
+					.object({ code: z.literal("syncing"), phase: z.enum(["members", "events"]), retryAfterMs: z.number() })
+					.safeParse(raw);
+				syncingSince = response.status === 503 && syncing.success ? (syncingSince ?? performance.now()) : null;
+				// Chitchat is still reading workspace access. Show a status and ask again by itself.
+				// After about 2 minutes, show a real error with Reconnect instead.
+				if (syncing.success && syncingSince !== null && performance.now() - syncingSince < 120_000) {
+					syncingRetryMs = Math.min(30_000, Math.max(1_000, syncing.data.retryAfterMs));
+					update({ phase: "syncing", message: SYNCING_MESSAGE });
+					throw new Error("Chitchat access is syncing");
+				}
 				if (!response.ok || !lease.success) {
 					const denied = response.status === 401 || response.status === 403;
 					update({
@@ -108,6 +125,13 @@ function create_chat_connection(host: BonoboClient) {
 				return cached;
 			} catch {
 				cached = null;
+				if (syncingRetryMs !== null) {
+					// Each lease request runs its own sync, and many frames may wait for the same one.
+					// So double the wait after each syncing answer, up to 30 s.
+					retryTimer = setTimeout(retry, Math.min(30_000, syncingRetryMs * 2 ** Math.min(failures, 4)));
+					failures += 1;
+					return null;
+				}
 				if (snapshot.phase !== "denied")
 					update({ phase: "unavailable", message: "Chitchat is reconnecting. Your draft is kept." });
 				if (!closed && snapshot.phase !== "denied") {
@@ -128,7 +152,11 @@ function create_chat_connection(host: BonoboClient) {
 	return {
 		convex,
 		start: () => convex.setAuth(fetch_token, on_auth),
-		retry,
+		// A person who chooses Reconnect starts a new 2-minute wait for a syncing answer.
+		retry: () => {
+			syncingSince = null;
+			retry();
+		},
 		getSnapshot: () => snapshot,
 		subscribe: (listener: () => void) => {
 			listeners.add(listener);
@@ -159,7 +187,9 @@ export function ChatSessionProvider(props: { client: BonoboClient; children: Rea
 	useEffect(() => {
 		connection.start();
 		const reconnect = () => {
-			if (connection.getSnapshot().phase !== "ready") connection.retry();
+			// A syncing pause already asks again by itself.
+			const phase = connection.getSnapshot().phase;
+			if (phase !== "ready" && phase !== "syncing") connection.retry();
 		};
 		window.addEventListener("online", reconnect);
 		window.addEventListener("focus", reconnect);
@@ -189,9 +219,19 @@ export function use_chat_session() {
 	if ((status === "denied" || snapshot.phase === "denied") && previous !== undefined) setPrevious(undefined);
 	const refreshing = enabled && status === "refresh_required";
 	const member = refreshing ? previous : current;
+	const ready = enabled && status === "ready" && current !== null && current !== undefined;
 	return {
 		member,
-		ready: enabled && status === "ready" && current !== null && current !== undefined,
+		ready,
+		// Lets Playwriter and the UI read the connection state from one value.
+		connection:
+			snapshot.phase === "denied" || status === "denied"
+				? "denied"
+				: snapshot.phase === "syncing"
+					? "syncing"
+					: ready
+						? "ready"
+						: "reconnecting",
 		connected: enabled && status === "ready" && socket.isWebSocketConnected,
 		refreshing,
 		canSend:

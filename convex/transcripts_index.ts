@@ -1,6 +1,6 @@
 import { ConvexError, v } from "convex/values";
 import { doc } from "convex-helpers/validators";
-import { internalAction, internalMutation, type MutationCtx } from "./_generated/server";
+import { internalAction, internalMutation, internalQuery, type MutationCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
 import { internal } from "./_generated/api";
 import schema from "./schema";
@@ -10,13 +10,17 @@ import {
 	chatbe_utf8_byte_size,
 	chatbe_ROLLOVER_MAX_BYTES,
 } from "../shared/transcript-markdown";
-import { transcripts_get_token, transcripts_host_post, transcripts_host_scope } from "./transcripts_grants";
 import {
+	transcripts_get_error_code,
 	transcripts_get_error_message,
-	transcripts_prepared,
-	transcripts_receipt,
-	transcripts_file_result,
-} from "./transcripts_worker";
+	transcripts_get_token,
+	transcripts_host_post,
+	transcripts_host_scope,
+	transcripts_HostError,
+} from "./transcripts_grants";
+import { transcripts_retry_delay, transcripts_wake } from "./transcripts_wake";
+import { chat_transcript_error_code } from "../shared/chat";
+import { transcripts_prepared, transcripts_receipt, transcripts_file_result } from "./transcripts_worker";
 
 async function create_run(ctx: MutationCtx, index: Doc<"transcript_indexes">, reconcile: boolean) {
 	const runId = await ctx.db.insert("transcript_index_runs", {
@@ -80,27 +84,52 @@ export async function transcripts_index_request(
 				: {}),
 		});
 	}
-	await ctx.db.patch("transcript_indexes", index._id, { status: "pending", error: null });
-	await ctx.scheduler.runAfter(0, internal.transcripts_index.run, { indexId: index._id });
+	await ctx.db.patch("transcript_indexes", index._id, { status: "pending", error: null, errorCode: undefined });
+	await transcripts_wake(ctx, { indexId: index._id }, Date.now());
 }
 
-export const claim = internalMutation({
+// Each wake-up claims one step in this transaction, arms a watchdog, then starts the action.
+export const dispatch = internalMutation({
 	args: { indexId: v.id("transcript_indexes") },
-	returns: v.union(doc(schema, "transcript_index_runs"), v.null()),
+	returns: v.null(),
 	handler: async (ctx, args) => {
 		const index = await ctx.db.get("transcript_indexes", args.indexId);
-		if (!index?.grantChannelId || index.status === "blocked") return null;
+		if (!index) return null;
+		// Without a Files connection, or after a final refusal, the index waits for a person.
+		if (!index.grantChannelId || index.status === "blocked") {
+			await transcripts_wake(ctx, { indexId: index._id }, null);
+			return null;
+		}
 		let run = index.activeRunId ? await ctx.db.get("transcript_index_runs", index.activeRunId) : null;
-		if (run && (run.leaseUntil > Date.now() || run.retryAt > Date.now())) return null;
+		if (run && (run.leaseUntil > Date.now() || run.retryAt > Date.now())) {
+			await transcripts_wake(ctx, { indexId: index._id }, Math.max(run.leaseUntil, run.retryAt));
+			return null;
+		}
 		if (!run) {
-			if (index.nodeId && index.appliedSequence >= index.desiredSequence) return null;
+			if (index.nodeId && index.appliedSequence >= index.desiredSequence) {
+				await transcripts_wake(ctx, { indexId: index._id }, null);
+				return null;
+			}
 			run = await create_run(ctx, index, false);
 		}
 		const claim = crypto.randomUUID();
 		const leaseUntil = Date.now() + 60_000;
 		await ctx.db.patch("transcript_index_runs", run._id, { claim, leaseUntil });
-		await ctx.db.patch("transcript_indexes", index._id, { status: "running", error: null });
-		return { ...run, claim, leaseUntil };
+		await ctx.db.patch("transcript_indexes", index._id, { status: "running", error: null, errorCode: undefined });
+		// If the action never ends, this wake-up claims the same step again after the lease.
+		await transcripts_wake(ctx, { indexId: index._id }, leaseUntil + 1_000);
+		await ctx.scheduler.runAfter(0, internal.transcripts_index.run, { runId: run._id, claim });
+		return null;
+	},
+});
+
+// Load the run for a claim that the dispatcher made. A stale or expired claim loads nothing.
+export const claimed = internalQuery({
+	args: { runId: v.id("transcript_index_runs"), claim: v.string() },
+	returns: v.union(doc(schema, "transcript_index_runs"), v.null()),
+	handler: async (ctx, args) => {
+		const run = await ctx.db.get("transcript_index_runs", args.runId);
+		return run && run.claim === args.claim && run.leaseUntil > Date.now() ? run : null;
 	},
 });
 
@@ -183,7 +212,7 @@ export const fenced = internalMutation({
 			args.operationId !== `${run._id}:fence` ||
 			args.writerGeneration !== run.writerGeneration + 1
 		)
-			throw new Error("Bonobo Senate returned a different README fence receipt.");
+			throw new ConvexError("Bonobo Senate returned a different README fence receipt.");
 		await ctx.db.patch("transcript_indexes", index._id, { writerGeneration: args.writerGeneration });
 		await ctx.db.patch("transcript_index_runs", run._id, { writerGeneration: args.writerGeneration, phase: "fold" });
 	},
@@ -233,7 +262,8 @@ export const release = internalMutation({
 		runId: v.id("transcript_index_runs"),
 		claim: v.string(),
 		error: v.union(v.string(), v.null()),
-		retryable: v.boolean(),
+		errorCode: v.union(chat_transcript_error_code, v.null()),
+		retryAfterMs: v.union(v.number(), v.null()),
 		receipt: v.union(
 			v.null(),
 			v.object({
@@ -260,7 +290,7 @@ export const release = internalMutation({
 				!receipt.contentRevision ||
 				(run.expectedNodeId !== null && receipt.nodeId !== run.expectedNodeId)
 			)
-				throw new Error("Bonobo Senate returned a different README write receipt.");
+				throw new ConvexError("Bonobo Senate returned a different README write receipt.");
 			await ctx.db.patch("transcript_index_runs", run._id, {
 				phase: "complete",
 				leaseUntil: 0,
@@ -274,28 +304,30 @@ export const release = internalMutation({
 				appliedSequence: run.barrier,
 				status: run.barrier >= index.desiredSequence ? "ready" : "pending",
 				error: null,
+				errorCode: undefined,
 			});
 			await ctx.scheduler.runAfter(0, internal.transcripts_index.cleanup, {
 				indexId: index._id,
 				throughCreatedAt: run._creationTime,
 			});
 			if (run.reconcileAfterPublish) await transcripts_index_request(ctx, { indexId: index._id, reconcile: true });
-			else if (run.barrier < index.desiredSequence)
-				await ctx.scheduler.runAfter(0, internal.transcripts_index.run, { indexId: index._id });
+			else await transcripts_wake(ctx, { indexId: index._id }, run.barrier < index.desiredSequence ? Date.now() : null);
 			return;
 		}
-		const delay = args.error && args.retryable ? Math.min(60_000, 1000 * 2 ** Math.min(run.failures, 6)) : 0;
+		const temporary = args.errorCode === "temporary";
+		const retryAt = Date.now() + (temporary ? transcripts_retry_delay(run.failures + 1, args.retryAfterMs) : 0);
 		await ctx.db.patch("transcript_index_runs", run._id, {
 			leaseUntil: 0,
-			retryAt: Date.now() + delay,
-			failures: args.error ? run.failures + 1 : 0,
+			retryAt,
+			failures: temporary ? run.failures + 1 : 0,
 		});
 		await ctx.db.patch("transcript_indexes", index._id, {
-			status: args.error && !args.retryable ? "blocked" : "pending",
+			status: args.error && !temporary ? "blocked" : "pending",
 			error: args.error,
+			errorCode: args.errorCode ?? undefined,
 		});
-		if (!args.error || args.retryable)
-			await ctx.scheduler.runAfter(delay, internal.transcripts_index.run, { indexId: index._id });
+		// A final refusal waits for Retry, which calls transcripts_index_request.
+		await transcripts_wake(ctx, { indexId: index._id }, args.error && !temporary ? null : retryAt);
 	},
 });
 
@@ -323,10 +355,10 @@ export const cleanup = internalMutation({
 });
 
 export const run = internalAction({
-	args: { indexId: v.id("transcript_indexes") },
+	args: { runId: v.id("transcript_index_runs"), claim: v.string() },
 	returns: v.null(),
 	handler: async (ctx, args): Promise<void> => {
-		const run = await ctx.runMutation(internal.transcripts_index.claim, args);
+		const run = await ctx.runQuery(internal.transcripts_index.claimed, args);
 		if (!run) return;
 		const checkpoint = { runId: run._id, claim: run.claim };
 		try {
@@ -421,15 +453,17 @@ export const run = internalAction({
 				...checkpoint,
 				receipt,
 				error: null,
-				retryable: false,
+				errorCode: null,
+				retryAfterMs: null,
 			});
 		} catch (error) {
 			const message = transcripts_get_error_message(error, "The channel index could not be saved.");
 			await ctx.runMutation(internal.transcripts_index.release, {
 				...checkpoint,
 				receipt: null,
-				retryable: error instanceof TypeError || /timeout|timed out|temporarily|\(5\d\d\)|\(429\)/i.test(message),
 				error: message,
+				errorCode: transcripts_get_error_code(error, message),
+				retryAfterMs: error instanceof transcripts_HostError ? error.retryAfterMs : null,
 			});
 		}
 	},

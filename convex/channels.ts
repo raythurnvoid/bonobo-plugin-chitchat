@@ -13,9 +13,9 @@ import {
 import { chatbe_collision_slug, chatbe_sha256_hex, chatbe_slug_channel_name } from "../shared/transcript-markdown";
 import { auth_get_current_access } from "./auth";
 import type { Doc, Id } from "./_generated/dataModel";
-import { internal } from "./_generated/api";
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import schema from "./schema";
+import { transcripts_wake } from "./transcripts_wake";
 
 export async function channels_get_access(
 	ctx: QueryCtx | MutationCtx,
@@ -117,13 +117,15 @@ export async function channels_queue_transcript(
 		.withIndex("by_channel", (q) => q.eq("channelId", channelId))
 		.first();
 	const sequence = (state?.desiredSequence ?? 0) + 1;
+	let stateId: Id<"transcript_channels">;
 	if (state) {
+		stateId = state._id;
 		await ctx.db.patch("transcript_channels", state._id, {
 			desiredSequence: sequence,
 			...(state.status === "ready" ? { status: "pending" as const } : {}),
 		});
 	} else {
-		await ctx.db.insert("transcript_channels", {
+		stateId = await ctx.db.insert("transcript_channels", {
 			channelId,
 			desiredSequence: sequence,
 			renderedSequence: 0,
@@ -146,7 +148,7 @@ export async function channels_queue_transcript(
 		createdAt: Date.now(),
 		error: null,
 	});
-	await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, { channelId });
+	await transcripts_wake(ctx, { channelStateId: stateId }, Date.now());
 	return sequence;
 }
 
@@ -192,7 +194,7 @@ export async function channels_queue_index(ctx: MutationCtx, channel: Doc<"chann
 		active: channel.archivedAt === null && channel.deletedAt === null,
 		status: "pending",
 	});
-	await ctx.scheduler.runAfter(0, internal.transcripts_index.run, { indexId: state._id });
+	await transcripts_wake(ctx, { indexId: state._id }, Date.now());
 }
 
 export const get = query({

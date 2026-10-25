@@ -1,9 +1,20 @@
 import { z } from "zod";
-import { ConvexError, v } from "convex/values";
-import { internalAction, internalMutation, type ActionCtx } from "./_generated/server";
+import { v, type Infer } from "convex/values";
+import { internalAction, internalMutation, type ActionCtx, type MutationCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
-import type { Doc } from "./_generated/dataModel";
-import { transcripts_get_token, transcripts_host_post, transcripts_HostError } from "./transcripts_grants";
+import type { Doc, Id } from "./_generated/dataModel";
+import {
+	transcripts_get_error_code,
+	transcripts_get_error_message,
+	transcripts_get_token,
+	transcripts_host_post,
+	transcripts_HostError,
+	transcripts_StepError,
+} from "./transcripts_grants";
+import { transcripts_db_claim, transcripts_db_claim_readers } from "./transcripts_db";
+import { transcripts_deletions_claim } from "./transcripts_deletions";
+import { transcripts_wake } from "./transcripts_wake";
+import { channel_members_complete_without_files } from "./channel_members";
 import { chatbe_rollover_path, chatbe_ROLLOVER_MAX_BYTES } from "../shared/transcript-markdown";
 import { transcripts_decrypt, transcripts_encrypt } from "./transcripts_secrets";
 
@@ -26,12 +37,6 @@ export const transcripts_receipt = z.object({
 	operationId: z.string(),
 });
 export const transcripts_file_result = z.object({ receipt: transcripts_receipt }).transform((result) => result.receipt);
-
-export function transcripts_get_error_message(error: unknown, fallback: string) {
-	// Convex keeps expected refusal data separate from its cross-function error message.
-	if (error instanceof ConvexError && typeof error.data === "string") return error.data;
-	return error instanceof Error ? error.message : fallback;
-}
 
 async function readers_step(
 	ctx: ActionCtx,
@@ -231,7 +236,8 @@ async function readers_step(
 				changeId: context.change._id,
 				hostReceiptId: run.readerReceiptId,
 			});
-			if (!cancelled) throw new Error("Channel access changed during Files sync. Try again.");
+			if (!cancelled)
+				throw new transcripts_StepError("Channel access changed during Files sync. Try again.", "temporary");
 		}
 	} else {
 		const snapshot = [...run.readerSnapshot.readers].sort((a, b) => a.userId.localeCompare(b.userId));
@@ -253,32 +259,121 @@ async function readers_step(
 	});
 }
 
-export const run_channel = internalAction({
+const channel_work = v.union(
+	v.object({ kind: v.literal("readers"), runId: v.id("transcript_runs"), claim: v.string() }),
+	v.object({ kind: v.literal("file"), runId: v.id("transcript_runs"), claim: v.string() }),
+	v.object({ kind: v.literal("deletion"), deletionId: v.id("transcript_deletions"), claim: v.string() }),
+);
+
+async function start_work(
+	ctx: MutationCtx,
+	stateId: Id<"transcript_channels">,
+	channelId: Id<"channels">,
+	work: Infer<typeof channel_work>,
+	leaseUntil: number,
+) {
+	// If the action never ends, this wake-up claims the same work again after the lease.
+	await transcripts_wake(ctx, { channelStateId: stateId }, leaseUntil + 1_000);
+	await ctx.scheduler.runAfter(0, internal.transcripts_worker.run, { channelId, work });
+	return null;
+}
+
+// Claim one piece of channel work, then start the action that does it.
+//
+// Convex runs a scheduled mutation exactly once, but a scheduled action at most once. So the claim,
+// the watchdog wake-up, and the action start happen in this one transaction. When nothing can run now,
+// arm the earliest gate time, or nothing when every piece of work waits for a person or another step.
+export const dispatch = internalMutation({
 	args: { channelId: v.id("channels") },
 	returns: v.null(),
+	handler: async (ctx, args) => {
+		const state = await ctx.db
+			.query("transcript_channels")
+			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
+			.unique();
+		if (!state) return null;
+		if (await channel_members_complete_without_files(ctx, args)) {
+			await transcripts_wake(ctx, { channelStateId: state._id }, null);
+			return null;
+		}
+
+		const gates: number[] = [];
+		// Reader changes go first. File runs and deletions wait for them.
+		const readers = await transcripts_db_claim_readers(ctx, args.channelId);
+		if (typeof readers === "number") gates.push(readers);
+		else if (readers)
+			return await start_work(
+				ctx,
+				state._id,
+				args.channelId,
+				{ kind: "readers", runId: readers.runId, claim: readers.claim },
+				readers.leaseUntil,
+			);
+		const deletion = await transcripts_deletions_claim(ctx, args.channelId);
+		if (typeof deletion === "number") gates.push(deletion);
+		else if (deletion)
+			return await start_work(
+				ctx,
+				state._id,
+				args.channelId,
+				{ kind: "deletion", deletionId: deletion.deletionId, claim: deletion.claim },
+				deletion.leaseUntil,
+			);
+		const file = await transcripts_db_claim(ctx, args.channelId);
+		if (typeof file === "number") gates.push(file);
+		else if (file)
+			return await start_work(
+				ctx,
+				state._id,
+				args.channelId,
+				{ kind: "file", runId: file.runId, claim: file.claim },
+				file.leaseUntil,
+			);
+		await transcripts_wake(ctx, { channelStateId: state._id }, gates.length ? Math.min(...gates) : null);
+		return null;
+	},
+});
+
+export const run = internalAction({
+	args: { channelId: v.id("channels"), work: channel_work },
+	returns: v.null(),
 	handler: async (ctx, args): Promise<void> => {
-		if (await ctx.runMutation(internal.channel_members.complete_without_files, args)) return;
-		const reader = await ctx.runMutation(internal.transcripts_db.claim_readers, args);
-		if (reader) {
-			const checkpoint = { runId: reader.run._id, claim: reader.run.claim };
+		const { work } = args;
+		if (work.kind === "readers") {
+			const reader = await ctx.runQuery(internal.transcripts_db.claimed, { runId: work.runId, claim: work.claim });
+			if (!reader?.job) return;
+			const checkpoint = { runId: work.runId, claim: work.claim };
 			try {
 				const source =
-					(await ctx.runQuery(internal.transcripts_grants.reader_source, args)) ?? reader.run.readerSourceSecret;
-				if (!source) throw new Error("Connect Files sync again to continue.");
-				await readers_step(ctx, reader, await transcripts_decrypt(source));
-				await ctx.runMutation(internal.transcripts_db.release_readers, { ...checkpoint, error: null });
-			} catch (error) {
+					(await ctx.runQuery(internal.transcripts_grants.reader_source, { channelId: args.channelId })) ??
+					reader.run.readerSourceSecret;
+				if (!source) throw new transcripts_StepError("Connect Files sync again to continue.", "auth_expired");
+				await readers_step(ctx, { ...reader, job: reader.job }, await transcripts_decrypt(source));
 				await ctx.runMutation(internal.transcripts_db.release_readers, {
 					...checkpoint,
-					error: transcripts_get_error_message(error, "Files readers could not be updated."),
+					error: null,
+					errorCode: null,
+					retryAfterMs: null,
+				});
+			} catch (error) {
+				const message = transcripts_get_error_message(error, "Files readers could not be updated.");
+				await ctx.runMutation(internal.transcripts_db.release_readers, {
+					...checkpoint,
+					error: message,
+					errorCode: transcripts_get_error_code(error, message),
+					retryAfterMs: error instanceof transcripts_HostError ? error.retryAfterMs : null,
 				});
 			}
 			return;
 		}
-		const deletion = await ctx.runMutation(internal.transcripts_deletions.claim, args);
-		if (deletion) {
+		if (work.kind === "deletion") {
+			const deletion = await ctx.runQuery(internal.transcripts_deletions.claimed, {
+				deletionId: work.deletionId,
+				claim: work.claim,
+			});
+			if (!deletion) return;
 			const prepared = deletion.deletion.prepared!;
-			const checkpoint = { deletionId: deletion.deletion._id, claim: deletion.deletion.claim };
+			const checkpoint = { deletionId: work.deletionId, claim: work.claim };
 			try {
 				const { token } = await transcripts_get_token(ctx, args.channelId);
 				// Archive after the copy boundary, preserving this exact file's current text and manual edits.
@@ -299,16 +394,24 @@ export const run_channel = internalAction({
 				);
 				if (receipt.nodeId !== prepared.nodeId || receipt.operationId !== prepared.operationId)
 					throw new Error("Bonobo Senate did not confirm this transcript archive.");
-				await ctx.runMutation(internal.transcripts_deletions.release, { ...checkpoint, error: null });
-			} catch (error) {
 				await ctx.runMutation(internal.transcripts_deletions.release, {
 					...checkpoint,
-					error: transcripts_get_error_message(error, "The transcript could not be archived."),
+					error: null,
+					errorCode: null,
+					retryAfterMs: null,
+				});
+			} catch (error) {
+				const message = transcripts_get_error_message(error, "The transcript could not be archived.");
+				await ctx.runMutation(internal.transcripts_deletions.release, {
+					...checkpoint,
+					error: message,
+					errorCode: transcripts_get_error_code(error, message),
+					retryAfterMs: error instanceof transcripts_HostError ? error.retryAfterMs : null,
 				});
 			}
 			return;
 		}
-		const current = await ctx.runMutation(internal.transcripts_db.claim, args);
+		const current = await ctx.runQuery(internal.transcripts_db.claimed, { runId: work.runId, claim: work.claim });
 		if (!current) return;
 		const { run, destination, channel, job } = current;
 		const checkpoint = { runId: run._id, claim: run.claim };
@@ -468,7 +571,10 @@ export const run_channel = internalAction({
 							transcripts_prepared,
 						);
 						if (prepared.nodeId !== input.file.nodeId || prepared.content === null || prepared.contentRevision === null)
-							throw new Error("A transcript file moved or was replaced. Restore it before retrying.");
+							throw new transcripts_StepError(
+								"A transcript file moved or was replaced. Restore it before retrying.",
+								"conflict",
+							);
 						await ctx.runMutation(internal.transcripts_db.save_input, {
 							...checkpoint,
 							fileId: input.file._id,
@@ -499,11 +605,20 @@ export const run_channel = internalAction({
 					);
 					const target = await ctx.runQuery(internal.transcripts_db.target, { runId: run._id, path });
 					if (!target.file && prepared.nodeId !== null)
-						throw new Error("Another file already uses this transcript path. Move it before retrying.");
+						throw new transcripts_StepError(
+							"Another file already uses this transcript path. Move it before retrying.",
+							"conflict",
+						);
 					if (target.file && prepared.nodeId !== target.file.nodeId)
-						throw new Error("A transcript file moved or was replaced. Restore it before retrying.");
+						throw new transcripts_StepError(
+							"A transcript file moved or was replaced. Restore it before retrying.",
+							"conflict",
+						);
 					if (run.kind === "incremental" && target.input && prepared.contentRevision !== target.input.contentRevision)
-						throw new Error("The transcript changed while its new parts were prepared. Rebuild the Files copy.");
+						throw new transcripts_StepError(
+							"The transcript changed while its new parts were prepared. Rebuild the Files copy.",
+							"conflict",
+						);
 					await ctx.runMutation(internal.transcripts_db.prepare_write, {
 						...checkpoint,
 						writeId: write._id,
@@ -535,7 +650,10 @@ export const run_channel = internalAction({
 						prepared.contentRevision === null ||
 						(run.kind === "incremental" && prepared.contentRevision !== input.contentRevision)
 					)
-						throw new Error("The transcript changed while its new parts were prepared. Rebuild the Files copy.");
+						throw new transcripts_StepError(
+							"The transcript changed while its new parts were prepared. Rebuild the Files copy.",
+							"conflict",
+						);
 					await ctx.runMutation(internal.transcripts_db.validate_input, {
 						...checkpoint,
 						fileId: input.fileId,
@@ -614,7 +732,8 @@ export const run_channel = internalAction({
 			await ctx.runMutation(internal.transcripts_db.release, {
 				...checkpoint,
 				error: null,
-				retryable: false,
+				errorCode: null,
+				retryAfterMs: null,
 				definiteRefusal: false,
 			});
 		} catch (error) {
@@ -622,61 +741,13 @@ export const run_channel = internalAction({
 			await ctx.runMutation(internal.transcripts_db.release, {
 				...checkpoint,
 				error: message,
-				retryable: error instanceof TypeError || /timeout|timed out|temporarily|\(5\d\d\)|\(429\)/i.test(message),
+				errorCode: transcripts_get_error_code(error, message),
+				retryAfterMs: error instanceof transcripts_HostError ? error.retryAfterMs : null,
 				definiteRefusal:
 					!run.fenceUncertain &&
 					error instanceof transcripts_HostError &&
 					[400, 401, 403, 404, 409].includes(error.status),
 			});
-		}
-	},
-});
-
-export const sweep = internalMutation({
-	args: {},
-	returns: v.null(),
-	handler: async (ctx) => {
-		for (const status of ["pending", "running"] as const) {
-			const states = await ctx.db
-				.query("transcript_channels")
-				.withIndex("by_status_nextAttemptAt", (q) => q.eq("status", status).lte("nextAttemptAt", Date.now()))
-				.take(20);
-			for (const state of states)
-				await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, { channelId: state.channelId });
-		}
-		const deletions = await ctx.db
-			.query("transcript_deletions")
-			.withIndex("by_completedAt_nextAttemptAt", (q) => q.eq("completedAt", null).lte("nextAttemptAt", Date.now()))
-			.take(20);
-		for (const deletion of deletions)
-			await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, { channelId: deletion.channelId });
-		for (const phase of ["exchange", "renew", "seal"] as const) {
-			const grants = await ctx.db
-				.query("host_grants")
-				.withIndex("by_phase_updatedAt", (q) => q.eq("phase", phase).lt("updatedAt", Date.now() - 60_000))
-				.take(20);
-			for (const grant of grants) {
-				await ctx.db.patch("host_grants", grant._id, { updatedAt: Date.now() });
-				await ctx.scheduler.runAfter(0, internal.transcripts_grants.connect, { grantId: grant._id });
-			}
-		}
-		for (const status of ["pending", "running", "blocked"] as const) {
-			const jobs = await ctx.db
-				.query("transcript_jobs")
-				.withIndex("by_kind_status_nextAttemptAt", (q) =>
-					q.eq("operation.kind", "readers").eq("status", status).lte("nextAttemptAt", Date.now()),
-				)
-				.take(20);
-			for (const job of jobs)
-				await ctx.scheduler.runAfter(0, internal.transcripts_worker.run_channel, { channelId: job.channelId });
-		}
-		for (const status of ["pending", "running"] as const) {
-			const indexes = await ctx.db
-				.query("transcript_indexes")
-				.withIndex("by_status", (q) => q.eq("status", status))
-				.take(20);
-			for (const index of indexes)
-				await ctx.scheduler.runAfter(0, internal.transcripts_index.run, { indexId: index._id });
 		}
 	},
 });

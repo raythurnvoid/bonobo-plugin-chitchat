@@ -44,7 +44,7 @@ export const press_member = z.object({
 export const press_access_event = z.discriminatedUnion("kind", [
 	z.object({ kind: z.literal("noop") }),
 	z.object({ kind: z.literal("member"), member: press_member }),
-	z.object({ kind: z.literal("refresh"), reason: z.enum(["permissions", "installation", "account", "members"]) }),
+	z.object({ kind: z.literal("refresh"), reason: z.enum(["permissions", "installation", "account"]) }),
 	z.object({ kind: z.literal("session_revoked"), hostSessionId: z.string() }),
 	z.object({
 		kind: z.literal("revoked"),
@@ -57,6 +57,8 @@ export async function press_post<Path extends BonoboHttpApiPath>(
 	path: Path,
 	body: BonoboHttpApi[Path]["POST"]["body"],
 	token?: string,
+	// Access sync lowers this so its whole answer fits in the time limit of its caller.
+	timeoutMs = 15_000,
 ) {
 	const response = await fetch(`${press_HTTP_URL}${path}`, {
 		method: "POST",
@@ -67,10 +69,31 @@ export async function press_post<Path extends BonoboHttpApiPath>(
 			...(token ? { Authorization: `Bearer ${token}` } : {}),
 		},
 		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(15_000),
+		signal: AbortSignal.timeout(timeoutMs),
 	});
-	const answer: unknown = await response.json();
-	return { status: response.status, body: answer };
+	// A proxy error page is not JSON. Keep its status so the caller can sort the failure.
+	const answer: unknown = await response.json().catch(() => null);
+	return { status: response.status, body: answer, retryAfter: response.headers.get("Retry-After") };
+}
+
+// Reads the signing key of access notices. The pinned SDK does not type this route yet, so this call
+// does not use press_post. It returns null when Bonobo Senate gives no valid key.
+export async function press_get_signing_key(timeoutMs: number) {
+	const response = await fetch(`${press_HTTP_URL}/api/v1/plugins/service-events/key`, {
+		method: "POST",
+		redirect: "error",
+		headers: {
+			"Content-Type": "application/json",
+			"X-Bonobo-Service-Authorization": `Bearer ${PRESS_SERVICE_SECRET}`,
+		},
+		body: JSON.stringify({ pluginName: "chitchat" }),
+		signal: AbortSignal.timeout(timeoutMs),
+	});
+	if (response.status !== 200) return null;
+	const answer = z
+		.object({ key: z.string().startsWith("whsec_"), createdAt: z.number() })
+		.safeParse(await response.json().catch(() => null));
+	return answer.success ? answer.data.key : null;
 }
 
 // Verifies the exact bearer without admitting or replacing a native session.

@@ -792,6 +792,7 @@ export function App(props: { client: BonoboClient }) {
 		<div
 			ref={appRef}
 			className="chitchat"
+			data-chitchat-connection={session.connection}
 			onFocusCapture={(event) => {
 				const target = event.target as HTMLElement;
 				focusOwner.current =
@@ -923,7 +924,9 @@ export function App(props: { client: BonoboClient }) {
 						</>
 					) : (
 						<p className="channel-status" role="status">
-							{session.message ? "Channel access is unavailable." : "Loading channels…"}
+							{session.message && session.connection !== "syncing"
+								? "Channel access is unavailable."
+								: "Loading channels…"}
 						</p>
 					)}
 				</div>
@@ -933,7 +936,12 @@ export function App(props: { client: BonoboClient }) {
 					{selectedId ? (
 						<TranscriptStatus key={`transcript:${selectedId}`} client={props.client} channelId={selectedId} />
 					) : null}
-					{session.message ? (
+					{/* A syncing pause is not an error. It asks again by itself, so it has no Reconnect button. */}
+					{session.connection === "syncing" ? (
+						<div className="connection-status" role="status">
+							{session.message}
+						</div>
+					) : session.message ? (
 						<div className="connection-status" role="alert">
 							{session.message}
 							<button type="button" className="button" onClick={session.retry}>
