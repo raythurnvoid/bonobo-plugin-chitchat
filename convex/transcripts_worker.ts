@@ -380,6 +380,7 @@ export const run = internalAction({
 				const receipt = await transcripts_host_post(
 					"/api/v1/files/plugin-archive",
 					{
+						force: true,
 						path: prepared.path,
 						writer: {
 							writerId: deletion.destination.writerId,
@@ -453,6 +454,7 @@ export const run = internalAction({
 								await transcripts_host_post(
 									"/api/v1/files/plugin-archive",
 									{
+										force: true,
 										path: input.path,
 										writer: {
 											writerId: destination.writerId,
@@ -492,6 +494,7 @@ export const run = internalAction({
 						const receipt = await transcripts_host_post(
 							"/api/v1/files/write",
 							{
+								force: true,
 								path: write.path,
 								expectedParentNodeId: write.expectedParentNodeId,
 								content: write.content,
@@ -670,6 +673,7 @@ export const run = internalAction({
 						await transcripts_host_post(
 							"/api/v1/files/plugin-archive",
 							{
+								force: true,
 								path: input.path,
 								writer: {
 									writerId: destination.writerId,
@@ -698,6 +702,7 @@ export const run = internalAction({
 					const receipt = await transcripts_host_post(
 						"/api/v1/files/write",
 						{
+							force: true,
 							path: write.path,
 							expectedParentNodeId: write.expectedParentNodeId,
 							content: write.content,

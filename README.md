@@ -78,10 +78,10 @@ Files writes use the public plugin folder, access, and archive APIs plus `/api/v
 Writer inspection, generation advance, and reader undo are general public Files capabilities.
 `JSON.stringify([generation, channelPublicId])` is the opaque writer resource key; `__root` identifies
 the README writer inside Chitchat only. Bonobo Senate never parses this value. Chitchat sends the original
-saved operation ID, sequence, target and revision checks on every retry. Its 100,000-byte Markdown
+saved operation ID, sequence, target and revision checks on every retry. Transcript writes and archives explicitly send `force: true`; this is part of the host receipt fingerprint. Drain old prepared requests before the host cutover. Never add force to an already accepted old request. Its 100,000-byte Markdown
 limit remains local even though the public API supports other editable text and larger bounds.
 
-A workspace admin must make the first connection. Both the connecting person and the exact Chitchat service account need **Can manage** on the workspace to create the initial locked root. Creating later locked folders needs **Can manage** on their parent folder or workspace. **Can write** alone cannot set their locks.
+A workspace admin must make the first connection. Read-only creation and forced transcript writes need the new `workspace.files.manage-read-only` consent and current Can edit access. Private reader bindings still need Can manage. Force preserves every Read-only flag.
 
 After the root and `private` container exist, reduce the account's broad access where possible. Keep the workspace **Can write** permission needed for ordinary file writes, and **Can manage** on the exact generated root and `private` container. Normal folder grants do not pass to other folders or files. When creating a private channel folder, the public API grants **Can manage** on that new folder to the exact bound service account. The connecting person must be allowed to manage that account and grant access on the parent. This lets Chitchat update the transcript and its readers. Later setup calls keep existing grants unchanged and never restore a removed grant. The connecting person must also keep the Files permissions needed for each operation.
 

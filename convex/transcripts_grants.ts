@@ -515,6 +515,7 @@ export const connect = internalAction({
 			const root = await transcripts_host_post(
 				"/api/v1/files/plugin-folders/ensure",
 				{
+					force: true,
 					path: grant.rootPath,
 					writer: {
 						resourceKey: JSON.stringify([current.installation.generation, "__root"]),
@@ -532,6 +533,7 @@ export const connect = internalAction({
 			const destination = await transcripts_host_post(
 				"/api/v1/files/plugin-folders/ensure",
 				{
+					force: true,
 					path: folderPath,
 					writer: {
 						resourceKey: JSON.stringify([current.installation.generation, current.channel.publicId]),

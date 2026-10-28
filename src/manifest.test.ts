@@ -54,6 +54,7 @@ describe("bonobo.plugin.json", () => {
 		expect([...manifest.capabilities].sort()).toEqual([
 			"plugin.service.connect",
 			"ui.outbound.fetch",
+			"workspace.files.manage-read-only",
 			"workspace.files.own-access",
 			"workspace.files.own-write",
 			"workspace.files.read",

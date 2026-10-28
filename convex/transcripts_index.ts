@@ -389,6 +389,7 @@ export const run = internalAction({
 					const root = await transcripts_host_post(
 						"/api/v1/files/plugin-folders/ensure",
 						{
+							force: true,
 							path: grant.rootPath,
 							writer: {
 								resourceKey: JSON.stringify([installation.generation, "__root"]),
@@ -422,6 +423,7 @@ export const run = internalAction({
 					const saved = await transcripts_host_post(
 						"/api/v1/files/write",
 						{
+							force: true,
 							path,
 							expectedParentNodeId: run.parentNodeId,
 							content: run.content,

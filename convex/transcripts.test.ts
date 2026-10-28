@@ -775,6 +775,9 @@ describe("transcript publication", () => {
 		expect(remote.files.get(main)!.nodeId).toBe(originalId);
 		expect(remote.files.get(main)!.content.match(/Hello from chat/g)).toHaveLength(1);
 		expect(remote.writes()).toBe(2);
+		const writes = vi.mocked(fetch).mock.calls.filter(([input]) => String(input).endsWith("/files/write"));
+		expect(writes.length).toBeGreaterThan(2);
+		for (const [, init] of writes) expect(JSON.parse(String(init?.body))).toMatchObject({ force: true });
 	});
 
 	test("finds an old reply beyond eight files and repacks a complete suffix", async () => {
@@ -1399,6 +1402,7 @@ describe("private transcript deletion", () => {
 
 	test("replays a lost file archive response and keeps manual text", async () => {
 		const { t, alice, channelId, channel, remote, send, drain, drainDeletion, reconnect } = await fixture(true);
+		const hostFetch = vi.mocked(fetch);
 		await send("Copied text");
 		await drain();
 		const path = `${ROOT}/private/${channel.transcriptSlug}/${channel.transcriptSlug}.md`;
@@ -1431,6 +1435,14 @@ describe("private transcript deletion", () => {
 		expect(remote.archived.size).toBe(1);
 		expect(remote.archived.get(path)?.content).toContain("Manual note to preserve");
 		expect(remote.receipts.has(before!.prepared!.operationId)).toBe(true);
+		const archives = hostFetch.mock.calls.filter(([input]) => String(input).endsWith("/files/plugin-archive"));
+		expect(archives).toHaveLength(2);
+		for (const [, init] of archives) {
+			expect(JSON.parse(String(init?.body))).toMatchObject({
+				force: true,
+				writer: { operationId: before!.prepared!.operationId },
+			});
+		}
 	});
 
 	test("an expired archive claim resumes and ignores its late completion", async () => {
