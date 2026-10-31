@@ -107,11 +107,11 @@ export function TranscriptStatus(props: { client: BonoboClient; channelId: Id<"c
 		: status.deletionPhase
 			? status.status === "blocked"
 				? status.errorCode === "auth_expired"
-					? `${name} was deleted. Archiving its Files copies is paused because the connection expired. ${status.canConnect ? "Reconnect Files to finish." : "Ask a channel manager to reconnect Files to finish."}`
+					? `${name} was deleted. Moving its Files copies to Trash is paused because the connection expired. ${status.canConnect ? "Reconnect Files to finish." : "Ask a channel manager to reconnect Files to finish."}`
 					: "Channel deleted. Its Files copies need attention."
 				: status.deletionPhase === "copy"
 					? "Channel deleted. Saving its last messages in Files…"
-					: "Channel deleted. Archiving its Files copies…"
+					: "Channel deleted. Moving its Files copies to Trash…"
 			: status.status === "ready"
 				? status.indexStatus === "blocked"
 					? status.indexErrorCode === "auth_expired"

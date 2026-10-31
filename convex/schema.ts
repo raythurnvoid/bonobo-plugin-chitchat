@@ -275,7 +275,7 @@ export default defineSchema({
 		// File runs, reader jobs, and deletions of this channel share this wake-up.
 		wakeJobId: wake_job_id,
 	}).index("by_channel", ["channelId"]),
-	// Deletion waits for its accepted copies, then archives exact transcript files in bounded steps.
+	// Deletion waits for its accepted copies, then moves exact transcript files to Trash in bounded steps.
 	transcript_deletions: defineTable({
 		channelId: v.id("channels"),
 		installationId: v.id("installations"),

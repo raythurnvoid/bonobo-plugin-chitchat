@@ -74,11 +74,11 @@ Inside the dataset root, the layout and format remain:
 
 Connect Files from the channel's transcript status. The server uses `/api/v1/plugins/service-grants/*` to exchange and seal a Files-only grant for the exact root. Grants are encrypted before storage.
 
-Files writes use the public plugin folder, access, and archive APIs plus `/api/v1/files/write`.
+Files writes use the public plugin folder, access, and Trash APIs plus `/api/v1/files/write`.
 Writer inspection, generation advance, and reader undo are general public Files capabilities.
 `JSON.stringify([generation, channelPublicId])` is the opaque writer resource key; `__root` identifies
 the README writer inside Chitchat only. Bonobo Senate never parses this value. Chitchat sends the original
-saved operation ID, sequence, target and revision checks on every retry. Transcript writes and archives explicitly send `force: true`; this is part of the host receipt fingerprint. Drain old prepared requests before the host cutover. Never add force to an already accepted old request. Its 100,000-byte Markdown
+saved operation ID, sequence, target and revision checks on every retry. Transcript writes and moves to Trash explicitly send `force: true`; this is part of the host receipt fingerprint. Drain old prepared requests before the host cutover. Never add force to an already accepted old request. Its 100,000-byte Markdown
 limit remains local even though the public API supports other editable text and larger bounds.
 
 A workspace admin must make the first connection. Read-only creation and forced transcript writes need the new `workspace.files.manage-read-only` consent and current Can edit access. Private reader bindings still need Can manage. Force preserves every Read-only flag.
@@ -103,7 +103,7 @@ Once Files setup has started, private reader changes wait for its acknowledgemen
 
 After a plugin upgrade or account rebind, Reconnect can settle the saved reader operation with a new sealed grant for the same installation and exact root. The current person and account must have Files write and sharing-management access. Old credentials cannot authorize new changes. Recovery still checks locks, labels, exact writer and reader revisions, and membership lifetimes.
 
-Private deletion removes chat access first. It then finishes all transcript copies through the saved deletion sequence. Only after those copies finish does it archive each saved transcript file, one file per worker step. Each archive request is saved before sending, so a lost reply can be retried exactly. The folder and unrelated files remain in Files. Archiving keeps the current text, including manual edits; it does not replace content. A current lock or missing permission blocks the next step. Manual sharing stops automatic archive.
+Private deletion removes chat access first. It then finishes all transcript copies through the saved deletion sequence. Only after those copies finish does it move each saved transcript file to Trash, one file per worker step. Each request is saved before sending, so a lost reply can be retried exactly. The folder and unrelated files remain in Files. Moving to Trash keeps the current text, including manual edits; it does not replace content. A current lock or missing permission blocks the next step. Manual sharing stops automatic moves to Trash.
 
 ## Configuration
 
@@ -153,7 +153,7 @@ After native chat has accepted messages, keep its database and transcript queue.
 
 Temporary Files failures retry by themselves. Use **Retry sync** after you fix the cause of a stop, such as missing folder access. Use **Reconnect Files** when the connection expired or the person who connected left, including after a plugin update. Both still check current permissions and locks. They never restore removed account grants or overwrite manual sharing. **Rebuild copies** requires explicit confirmation before replacing manual text.
 
-Unfinished private deletion appears in **Files sync** for the current owner or the original delete actor with the same active membership lifetime. This view shows copy progress and recovery controls. It does not reopen deleted messages. Rebuild remains available while copies are pending and stops being available when file archiving starts. Interrupted archive work resumes from its saved step when its next wake-up runs.
+Unfinished private deletion appears in **Files sync** for the current owner or the original delete actor with the same active membership lifetime. This view shows copy progress and recovery controls. It does not reopen deleted messages. Rebuild remains available while copies are pending and stops being available when files start moving to Trash. Interrupted moves to Trash resume from their saved step when the next wake-up runs.
 
 When the last channel member leaves the workspace, cleanup saves owner recovery before trying to update Files readers. This lets a current owner reconnect if the old sponsor can no longer write. A channel that never started Files setup needs no recovery entry.
 

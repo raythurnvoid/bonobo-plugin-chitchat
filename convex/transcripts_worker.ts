@@ -376,7 +376,7 @@ export const run = internalAction({
 			const checkpoint = { deletionId: work.deletionId, claim: work.claim };
 			try {
 				const { token } = await transcripts_get_token(ctx, args.channelId);
-				// Archive after the copy boundary, preserving this exact file's current text and manual edits.
+				// Move to Trash after the copy boundary, preserving this exact file's current text and manual edits.
 				const receipt = await transcripts_host_post(
 					"/api/v1/files/plugin-archive",
 					{
@@ -394,7 +394,7 @@ export const run = internalAction({
 					transcripts_file_result,
 				);
 				if (receipt.nodeId !== prepared.nodeId || receipt.operationId !== prepared.operationId)
-					throw new Error("Bonobo Senate did not confirm this transcript archive.");
+					throw new Error("Bonobo Senate did not confirm moving this transcript to Trash.");
 				await ctx.runMutation(internal.transcripts_deletions.release, {
 					...checkpoint,
 					error: null,
@@ -402,7 +402,7 @@ export const run = internalAction({
 					retryAfterMs: null,
 				});
 			} catch (error) {
-				const message = transcripts_get_error_message(error, "The transcript could not be archived.");
+				const message = transcripts_get_error_message(error, "The transcript could not be moved to Trash.");
 				await ctx.runMutation(internal.transcripts_deletions.release, {
 					...checkpoint,
 					error: message,

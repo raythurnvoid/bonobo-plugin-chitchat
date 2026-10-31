@@ -311,12 +311,12 @@ function host(isPrivate = false) {
 				if ((fileSequences.get(sequenceKey) ?? -1) >= request.sequence)
 					return Response.json({ message: "A newer transcript write already exists" }, { status: 409 });
 				if (files.get(request.path)?.nodeId !== request.nodeId)
-					return Response.json({ message: "Wrong archive target" }, { status: 409 });
+					return Response.json({ message: "Wrong Trash target" }, { status: 409 });
 				if (
 					request.expectedContentRevision !== undefined &&
 					request.expectedContentRevision !== files.get(request.path)?.revision
 				)
-					return Response.json({ message: "Archive content changed" }, { status: 409 });
+					return Response.json({ message: "Content changed before moving to Trash" }, { status: 409 });
 				archived.set(request.path, files.get(request.path)!);
 				files.delete(request.path);
 				fileSequences.set(sequenceKey, request.sequence);
@@ -331,7 +331,7 @@ function host(isPrivate = false) {
 				receipts.set(request.operationId, receipt);
 				if (loseNextArchive) {
 					loseNextArchive = false;
-					throw new TypeError("Archive response lost");
+					throw new TypeError("Move to Trash response lost");
 				}
 				return Response.json({ receipt });
 			}
@@ -916,7 +916,7 @@ describe("transcript publication", () => {
 			await dispatch_channel(t, channelId);
 			if ((await alice.query(api.transcripts.status, { channelId }))?.error) break;
 		}
-		expect((await alice.query(api.transcripts.status, { channelId }))?.error).toContain("Archive response lost");
+		expect((await alice.query(api.transcripts.status, { channelId }))?.error).toContain("Move to Trash response lost");
 		remote.denyWrites();
 		await alice.mutation(api.transcripts.retry, { channelId });
 		expect((await drain(true))?.error).toContain("Permission denied");
@@ -1419,7 +1419,7 @@ describe("private transcript deletion", () => {
 			if ((await alice.query(api.transcripts.status, { channelId }))?.error) break;
 		}
 		const before = await t.run(async (ctx) => await ctx.db.query("transcript_deletions").first());
-		expect(before?.error).toContain("Archive response lost");
+		expect(before?.error).toContain("Move to Trash response lost");
 		expect(before?.prepared).not.toBeNull();
 		expect(
 			(
@@ -1428,7 +1428,7 @@ describe("private transcript deletion", () => {
 					clientRequestId: "cannot-rebuild-archive",
 				})
 			)._nay?.message,
-		).toContain("being archived");
+		).toContain("moving to Trash");
 		expect((await reconnect()).error).toBeNull();
 		expect((await alice.mutation(api.transcripts.retry, { channelId }))._nay).toBeUndefined();
 		await drainDeletion();

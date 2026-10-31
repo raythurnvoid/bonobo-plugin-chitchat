@@ -325,7 +325,7 @@ function TranscriptDeletionsView(props: {
 			<header className="view-head">
 				<h2 className="view-title">Deleted channel copies</h2>
 			</header>
-			<p className="view-note">Finish saving and archiving the Files copies for deleted channels.</p>
+			<p className="view-note">Finish saving and moving the Files copies for deleted channels to Trash.</p>
 			{!rows ? (
 				<p className="channel-status" role="status">
 					Checking Files sync…

@@ -394,7 +394,7 @@ export const reconcile = mutation({
 			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
 			.unique();
 		if (deletion && deletion.archiveStartedAt !== null)
-			return { _nay: { message: "The saved transcripts are being archived. Retry or reconnect Files to finish." } };
+			return { _nay: { message: "The saved transcripts are moving to Trash. Retry or reconnect Files to finish." } };
 		if (!chat_validate_request_id(args.clientRequestId)) return { _nay: { message: "Invalid request ID" } };
 		const request = await ctx.db
 			.query("transcript_requests")

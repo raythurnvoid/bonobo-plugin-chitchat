@@ -30410,11 +30410,11 @@ function dC(e) {
 			? i.deletionPhase
 				? i.status === "blocked"
 					? i.errorCode === "auth_expired"
-						? `${L} was deleted. Archiving its Files copies is paused because the connection expired. ${i.canConnect ? "Reconnect Files to finish." : "Ask a channel manager to reconnect Files to finish."}`
+						? `${L} was deleted. Moving its Files copies to Trash is paused because the connection expired. ${i.canConnect ? "Reconnect Files to finish." : "Ask a channel manager to reconnect Files to finish."}`
 						: "Channel deleted. Its Files copies need attention."
 					: i.deletionPhase === "copy"
 						? "Channel deleted. Saving its last messages in Files…"
-						: "Channel deleted. Archiving its Files copies…"
+						: "Channel deleted. Moving its Files copies to Trash…"
 				: i.status === "ready"
 					? i.indexStatus === "blocked"
 						? i.indexErrorCode === "auth_expired"
@@ -30899,7 +30899,7 @@ function aL(e) {
 			}),
 			(0, S.jsx)("p", {
 				className: "view-note",
-				children: "Finish saving and archiving the Files copies for deleted channels.",
+				children: "Finish saving and moving the Files copies for deleted channels to Trash.",
 			}),
 			i
 				? i.page.length === 0
