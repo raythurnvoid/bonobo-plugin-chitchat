@@ -133,18 +133,6 @@ describe("channels.create", () => {
 		expect(
 			(await h.owner.query(api.channels.list_mine, { archived: false, paginationOpts: pageOptions })).page,
 		).toEqual([]);
-		const readers = await h.t.run((ctx) =>
-			ctx.db
-				.query("transcript_jobs")
-				.withIndex("by_channel_sequence", (q) => q.eq("channelId", channelId))
-				.collect(),
-		);
-		expect(readers.find((job) => job.operation.kind === "readers")?.operation).toMatchObject({
-			readers: [
-				{ userId: "alice", membershipLifetime: 1 },
-				{ userId: "bob", membershipLifetime: 1 },
-			],
-		});
 	});
 
 	test("rejects an ineligible invite without channel or transcript writes", async () => {
@@ -572,20 +560,6 @@ describe("channel_members", () => {
 			clientRequestId: "manager-leave",
 			expectedMembershipRevision: 1,
 		});
-		const change = await h.t.run((ctx) =>
-			ctx.db
-				.query("channel_access_changes")
-				.withIndex("by_channel_status", (q) => q.eq("channelId", channelId).eq("status", "pending"))
-				.unique(),
-		);
-		expect(change?.principals.find((entry) => entry.hostUserId === "bob")?.level).toBe("manage");
-		expect(
-			await h.t.mutation(internal.channel_members.complete_change, {
-				changeId: change!._id,
-				readerRevision: change!.readerRevision,
-				hostReceiptId: "confirmed-readers",
-			}),
-		).toBe(true);
 		expect(await h.bob.query(api.channels.permissions, { channelId })).toMatchObject({ canManage: true });
 	});
 
@@ -630,155 +604,13 @@ describe("channel_members", () => {
 		expect(await h.alice.query(api.channels.permissions, { channelId })).toMatchObject({ canManage: true });
 	});
 
-	test("finishes private changes when Files has never been connected", async () => {
-		const h = await fixture();
-		const channelId = await create_channel(h, "private", ["bob"]);
-		await h.alice.mutation(api.channel_members.leave, {
-			channelId,
-			clientRequestId: "leave-without-files",
-			expectedMembershipRevision: 1,
-		});
-		expect(await h.t.mutation(internal.channel_members.complete_without_files, { channelId })).toBe(true);
-		expect(await h.alice.query(api.channels.get, { channelId })).toBeNull();
-		expect(await h.bob.query(api.channels.permissions, { channelId })).toMatchObject({ canManage: true });
-		expect(await h.t.run((ctx) => ctx.db.query("host_grants").collect())).toEqual([]);
-	});
-	test("another principal's read downgrade does not prevent leaving", async () => {
-		const h = await fixture();
-		const channelId = await create_channel(h, "private", ["bob"]);
-		await h.t.run(async (ctx) => {
-			const alice = await ctx.db
-				.query("workspace_members")
-				.withIndex("by_installation_hostUserId", (q) =>
-					q.eq("installationId", h.installationId).eq("hostUserId", "alice"),
-				)
-				.first();
-			await ctx.db.patch("workspace_members", alice!._id, { canRead: false });
-		});
-		expect(
-			(
-				await h.bob.mutation(api.channel_members.leave, {
-					channelId,
-					clientRequestId: "leave-read-downgrade",
-					expectedMembershipRevision: 1,
-				})
-			)._yay,
-		).toMatchObject({ pending: true });
-		const change = await h.t.run((ctx) => ctx.db.query("channel_access_changes").first());
-		expect(
-			await h.t.mutation(internal.channel_members.complete_change, {
-				changeId: change!._id,
-				readerRevision: 2,
-				hostReceiptId: "reader-receipt",
-			}),
-		).toBe(true);
-		expect(
-			await h.bob.query(api.channel_members.status, { channelId, clientRequestId: "leave-read-downgrade" }),
-		).toMatchObject({ status: "complete", left: true });
-	});
-	test("cancels a compensated deletion without claiming deletion or changing current members", async () => {
-		const h = await fixture();
-		const channelId = await create_channel(h, "private", ["bob"]);
-		const request = { channelId, clientRequestId: "cancel-delete", expectedMembershipRevision: 1 };
-		await h.alice.mutation(api.channel_members.delete_channel, request);
-		const change = await h.t.run((ctx) => ctx.db.query("channel_access_changes").first());
-		expect(
-			await h.t.mutation(internal.channel_members.cancel_change, {
-				changeId: change!._id,
-				hostReceiptId: "restored-readers",
-			}),
-		).toBe(true);
-		expect(
-			await h.t.mutation(internal.channel_members.cancel_change, { changeId: change!._id, hostReceiptId: "duplicate" }),
-		).toBe(true);
-		expect(
-			await h.alice.query(api.channel_members.status, { channelId, clientRequestId: request.clientRequestId }),
-		).toEqual({
-			status: "cancelled",
-			membershipRevision: 1,
-			left: false,
-			deleted: false,
-		});
-		expect((await h.alice.mutation(api.channel_members.delete_channel, request))._nay?.name).toBe("conflict");
-		expect(await h.alice.query(api.channels.get, { channelId })).toMatchObject({
-			memberCount: 2,
-			membershipRevision: 1,
-			deletedAt: null,
-		});
-	});
-	test("reserves a pending request ID across different channels", async () => {
-		const h = await fixture();
-		const first = await create_channel(h, "private", ["bob"]);
-		const second = await create_channel(h, "private", ["bob"]);
-		const request = {
-			channelId: first,
-			clientRequestId: "pending-once",
-			expectedMembershipRevision: 1,
-			expectedPrincipalCount: 2,
-		};
-		expect((await h.bob.mutation(api.channel_members.leave, request))._yay).toMatchObject({ pending: true });
-		expect((await h.bob.mutation(api.channel_members.leave, { ...request, channelId: second }))._nay?.name).toBe(
-			"conflict",
-		);
-		expect(
-			await h.bob.query(api.channel_members.status, { channelId: first, clientRequestId: "pending-once" }),
-		).toMatchObject({ status: "pending" });
-	});
-	test("cannot complete a queued manager change after the manager loses write access", async () => {
-		const h = await fixture();
-		const channelId = await create_channel(h, "private", ["bob"]);
-		await h.alice.mutation(api.channel_members.change, {
-			channelId,
-			clientRequestId: "remove-bob",
-			expectedMembershipRevision: 1,
-			hostUserId: "bob",
-			level: null,
-		});
-		await h.t.run(async (ctx) => {
-			const actor = await ctx.db
-				.query("workspace_members")
-				.withIndex("by_installation_hostUserId", (q) =>
-					q.eq("installationId", h.installationId).eq("hostUserId", "alice"),
-				)
-				.first();
-			await ctx.db.patch("workspace_members", actor!._id, { canWrite: false });
-		});
-		const change = await h.t.run((ctx) => ctx.db.query("channel_access_changes").first());
-		expect(
-			await h.t.mutation(internal.channel_members.complete_change, {
-				changeId: change!._id,
-				readerRevision: 2,
-				hostReceiptId: "late",
-			}),
-		).toBe(false);
-		expect(await h.t.run(async (ctx) => (await ctx.db.get("channels", channelId))!.memberCount)).toBe(2);
-	});
-	test("closes content during reader change and confirms leave after lost access", async () => {
+	test("confirms a retried leave after the person lost access", async () => {
 		const h = await fixture();
 		const channelId = await create_channel(h, "private", ["bob"]);
 		const request = { channelId, clientRequestId: "leave", expectedMembershipRevision: 1, expectedPrincipalCount: 2 };
-		expect((await h.bob.mutation(api.channel_members.leave, request))._yay).toMatchObject({
-			pending: true,
-			left: true,
-		});
-		expect(await h.alice.query(api.messages.latest_roots, { channelId })).toBeNull();
-		const change = await h.t.run((ctx) => ctx.db.query("channel_access_changes").first());
-		expect(
-			await h.t.mutation(internal.channel_members.complete_change, {
-				changeId: change!._id,
-				readerRevision: 2,
-				hostReceiptId: "confirmed-reader-write",
-			}),
-		).toBe(true);
+		expect((await h.bob.mutation(api.channel_members.leave, request))._yay).toMatchObject({ left: true });
 		expect(await h.bob.query(api.channels.get, { channelId })).toBeNull();
-		expect((await h.bob.mutation(api.channel_members.leave, request))._yay).toMatchObject({
-			pending: false,
-			left: true,
-		});
-		expect(await h.bob.query(api.channel_members.status, { channelId, clientRequestId: "leave" })).toMatchObject({
-			status: "complete",
-			left: true,
-		});
+		expect((await h.bob.mutation(api.channel_members.leave, request))._yay).toMatchObject({ left: true });
 	});
 
 	test("remove and reinvite never restores old private grants or cursors", async () => {

@@ -104,37 +104,29 @@ export function TranscriptStatus(props: { client: BonoboClient; channelId: Id<"c
 	const name = status ? `#${status.channelName}` : "";
 	const copy = !status
 		? "Checking transcript access…"
-		: status.deletionPhase
-			? status.status === "blocked"
-				? status.errorCode === "auth_expired"
-					? `${name} was deleted. Moving its Files copies to Trash is paused because the connection expired. ${status.canConnect ? "Reconnect Files to finish." : "Ask a channel manager to reconnect Files to finish."}`
-					: "Channel deleted. Its Files copies need attention."
-				: status.deletionPhase === "copy"
-					? "Channel deleted. Saving its last messages in Files…"
-					: "Channel deleted. Moving its Files copies to Trash…"
-			: status.status === "ready"
-				? status.indexStatus === "blocked"
-					? status.indexErrorCode === "auth_expired"
-						? "Chat is saved. The channel list file (README.md) is paused because its Files connection expired. Reconnect Files from any channel."
-						: "Chat is saved. The channel index needs attention."
-					: status.indexStatus === "ready"
-						? "Saved in Files"
-						: "Channel saved. Updating the channel index…"
-				: status.status === "not_connected"
-					? "Chat is saved. Connect Files to keep Markdown copies."
-					: status.status === "blocked"
-						? status.errorCode === "auth_expired"
-							? `Chat is saved. Saving ${name} to Files is paused because the Files connection expired.${status.canConnect ? " Reconnect Files to continue. New messages will be copied after you reconnect." : " Ask a channel manager to reconnect Files."}`
-							: status.errorCode === "permission"
-								? `Chat is saved. Saving ${name} to Files is paused. Chitchat can no longer write to ${status.folderPath ?? "its folder"}.${status.canConnect ? " Give the Chitchat service account Can manage on that folder, then choose Retry sync." : " Ask a channel manager to fix the folder access."}`
-								: status.errorCode === "sponsor_gone"
-									? `Chat is saved. The person who connected Files no longer has access.${status.canConnect ? " Reconnect Files to use your own connection." : " Ask a channel manager to reconnect Files."}`
-									: `Chat is saved. Transcript sync needs attention.${status.canConnect ? "" : " Ask a channel manager to check it."}`
-						: delayed
-							? status.nextAttemptAt === null
-								? "Chat is saved. Saving to Files is delayed. Chitchat keeps trying."
-								: `Chat is saved. Saving to Files is delayed. Next try at ${new Date(status.nextAttemptAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`
-							: "Chat is saved. Updating Files…";
+		: status.status === "ready"
+			? status.indexStatus === "blocked"
+				? status.indexErrorCode === "auth_expired"
+					? "Chat is saved. The channel list file (README.md) is paused because its Files connection expired. Reconnect Files from any channel."
+					: "Chat is saved. The channel index needs attention."
+				: status.indexStatus === "ready"
+					? "Saved in Files"
+					: "Channel saved. Updating the channel index…"
+			: status.status === "not_connected"
+				? "Chat is saved. Connect Files to keep Markdown copies."
+				: status.status === "blocked"
+					? status.errorCode === "auth_expired"
+						? `Chat is saved. Saving ${name} to Files is paused because the Files connection expired.${status.canConnect ? " Reconnect Files to continue. New messages will be copied after you reconnect." : " Ask a channel manager to reconnect Files."}`
+						: status.errorCode === "permission"
+							? `Chat is saved. Saving ${name} to Files is paused. Chitchat can no longer write to ${status.folderPath ?? "its folder"}.${status.canConnect ? " Give the Chitchat service account Can manage on that folder, then choose Retry sync." : " Ask a channel manager to fix the folder access."}`
+							: status.errorCode === "sponsor_gone"
+								? `Chat is saved. The person who connected Files no longer has access.${status.canConnect ? " Reconnect Files to use your own connection." : " Ask a channel manager to reconnect Files."}`
+								: `Chat is saved. Transcript sync needs attention.${status.canConnect ? "" : " Ask a channel manager to check it."}`
+					: delayed
+						? status.nextAttemptAt === null
+							? "Chat is saved. Saving to Files is delayed. Chitchat keeps trying."
+							: `Chat is saved. Saving to Files is delayed. Next try at ${new Date(status.nextAttemptAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`
+						: "Chat is saved. Updating Files…";
 	return (
 		<>
 			<div className="transcript-status">
@@ -170,7 +162,6 @@ export function TranscriptStatus(props: { client: BonoboClient; channelId: Id<"c
 								<code>{status.folderPath}</code>
 							</p>
 						) : null}
-						{status.readerMode === "manual" ? <p>Files sharing is managed in Bonobo Senate.</p> : null}
 						{status.error ? <p role="alert">{status.error}</p> : null}
 						<p>
 							Channel index:{" "}

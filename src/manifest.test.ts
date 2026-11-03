@@ -55,7 +55,6 @@ describe("bonobo.plugin.json", () => {
 			"plugin.service.connect",
 			"ui.outbound.fetch",
 			"workspace.files.manage-read-only",
-			"workspace.files.own-access",
 			"workspace.files.own-write",
 			"workspace.files.read",
 			"workspace.files.write",

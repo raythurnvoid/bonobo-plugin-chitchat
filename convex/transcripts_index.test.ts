@@ -49,7 +49,6 @@ function host() {
 				sequence: z.number().int().positive(),
 				expectedNodeId: z.string().nullable(),
 				expectedContentRevision: z.string().nullable(),
-				expectedReaderRevision: z.null(),
 				contentHash: z.string(),
 			}),
 		})
@@ -69,8 +68,6 @@ function host() {
 						rootNodeId: "root",
 						folderNodeId: "root",
 						writerGeneration: generation,
-						readerRevision: null,
-						detached: false,
 					},
 				});
 			if (path.endsWith("/inspect")) {
@@ -83,8 +80,6 @@ function host() {
 					contentRevision: file?.revision ?? null,
 					expectedParentNodeId: "root",
 					writerGeneration: generation,
-					readerRevision: null,
-					detached: false,
 				});
 			}
 			if (path.endsWith("/advance")) {
@@ -110,7 +105,6 @@ function host() {
 					writerGeneration: generation,
 					nodeId: "root",
 					contentRevision: null,
-					readerRevision: null,
 				};
 				receipts.set(request.operationId, { fingerprint: JSON.stringify(body), value });
 				if (loseFence) {
@@ -153,7 +147,6 @@ function host() {
 					writerGeneration: generation,
 					nodeId: next.nodeId,
 					contentRevision: next.revision,
-					readerRevision: null,
 				};
 				receipts.set(request.operationId, { fingerprint: JSON.stringify(body), value });
 				if (loseWrite) {
@@ -186,7 +179,7 @@ function host() {
 	};
 }
 
-async function fixture(isPrivate = false) {
+async function fixture() {
 	const remote = host();
 	const t = convexTest(schema, modules);
 	const installationId = await t.run(async (ctx) => {
@@ -249,7 +242,7 @@ async function fixture(isPrivate = false) {
 		clientRequestId: "create",
 		name: "General",
 		topic: "",
-		visibility: isPrivate ? "private" : "public",
+		visibility: "public",
 		invitedUserIds: [],
 	});
 	if (created._yay?.kind !== "channel") throw new Error("Channel creation failed");
@@ -284,8 +277,6 @@ async function fixture(isPrivate = false) {
 		folderNodeId: "root",
 		folderPath: ROOT,
 		writerGeneration: 1,
-		readerRevision: null,
-		detached: false,
 	});
 	const indexId = (await t.run(async (ctx) => await ctx.db.query("transcript_indexes").first()))!._id;
 	const state = async () => (await t.run(async (ctx) => await ctx.db.get("transcript_indexes", indexId)))!;
@@ -358,18 +349,6 @@ describe("transcript index", () => {
 		);
 		expect((await state()).entryCount).toBe(125);
 		expect(remote.writes()).toBe(1);
-	});
-
-	test("creates the empty README when the first connected channel is private", async () => {
-		const { remote, drain } = await fixture(true);
-		const index = await drain();
-		expect(index.appliedSequence).toBe(0);
-		expect(index.nodeId).not.toBeNull();
-		expect(remote.files.get(PATH)!.content).toBe(chatbe_readme_markdown([]));
-		expect(
-			z.object({ writer: z.object({ sequence: z.number() }) })
-				.parse(remote.calls.find((call) => call.path.endsWith("/write"))!.body).writer.sequence,
-		).toBe(1);
 	});
 
 	test("keeps a frozen source barrier while later names wait", async () => {

@@ -2,7 +2,7 @@ import { z } from "zod";
 import { v, type Infer } from "convex/values";
 import { internalAction, internalMutation, type ActionCtx, type MutationCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
-import type { Doc, Id } from "./_generated/dataModel";
+import type { Id } from "./_generated/dataModel";
 import {
 	transcripts_get_error_code,
 	transcripts_get_error_message,
@@ -11,12 +11,9 @@ import {
 	transcripts_HostError,
 	transcripts_StepError,
 } from "./transcripts_grants";
-import { transcripts_db_claim, transcripts_db_claim_readers } from "./transcripts_db";
-import { transcripts_deletions_claim } from "./transcripts_deletions";
+import { transcripts_db_claim } from "./transcripts_db";
 import { transcripts_wake } from "./transcripts_wake";
-import { channel_members_complete_without_files } from "./channel_members";
 import { chatbe_rollover_path, chatbe_ROLLOVER_MAX_BYTES } from "../shared/transcript-markdown";
-import { transcripts_decrypt, transcripts_encrypt } from "./transcripts_secrets";
 
 export const transcripts_prepared = z.object({
 	nodeId: z.string().nullable(),
@@ -25,245 +22,17 @@ export const transcripts_prepared = z.object({
 	contentRevision: z.string().nullable(),
 	expectedParentNodeId: z.string(),
 	writerGeneration: z.number(),
-	readerRevision: z.number().nullable(),
-	detached: z.boolean(),
 });
 export const transcripts_receipt = z.object({
 	_id: z.string(),
 	nodeId: z.string().nullable(),
 	contentRevision: z.string().nullable(),
 	writerGeneration: z.number(),
-	readerRevision: z.number().nullable(),
 	operationId: z.string(),
 });
 export const transcripts_file_result = z.object({ receipt: transcripts_receipt }).transform((result) => result.receipt);
 
-async function readers_step(
-	ctx: ActionCtx,
-	current: {
-		run: Doc<"transcript_runs">;
-		destination: Doc<"transcript_destinations">;
-		job: Doc<"transcript_jobs">;
-	},
-	token: string,
-) {
-	const { run, destination, job } = current;
-	if (job.operation.kind !== "readers") return;
-	const operation = job.operation;
-	const checkpoint = { runId: run._id, claim: run.claim };
-	const context = await ctx.runQuery(internal.transcripts_db.reader_context, {
-		channelId: run.channelId,
-		readerRevision: operation.readerRevision,
-	});
-	const invalidPending =
-		context.change !== null &&
-		!(await ctx.runQuery(internal.channel_members.is_change_current, { changeId: context.change._id }));
-	if (
-		run.readerStep === 0 &&
-		!run.readerReceiptId &&
-		(invalidPending || (run.readerSnapshot !== null && context.channel.membershipRevision > operation.readerRevision))
-	) {
-		await ctx.runMutation(internal.transcripts_db.stage_readers, {
-			...checkpoint,
-			revision: context.channel.membershipRevision,
-			readers: context.readers,
-			compensation: true,
-			...(run.readerSourceSecret === null ? { sourceSecret: await transcripts_encrypt(token) } : {}),
-		});
-		return;
-	}
-	if (!run.readerSnapshot) {
-		const stale = context.channel.membershipRevision > operation.readerRevision;
-		if (stale) {
-			await ctx.runMutation(internal.transcripts_db.complete_control, {
-				...checkpoint,
-				readerRevision: context.channel.membershipRevision,
-				...(run.kind === "reconcile" ? { foldedSequence: job.sequence } : {}),
-			});
-			return;
-		}
-		await ctx.runMutation(internal.transcripts_db.stage_readers, {
-			...checkpoint,
-			revision: operation.readerRevision,
-			readers: operation.readers,
-			compensation: false,
-			sourceSecret: await transcripts_encrypt(token),
-		});
-		return;
-	}
-	const readerToken = await transcripts_decrypt(run.readerSourceSecret!);
-	if (!run.readerReceiptId) {
-		if (run.readerStep === 0 && readerToken !== token) {
-			// Settle the old operation first. Its lost reply may still own the host journal.
-			await ctx.runMutation(internal.transcripts_db.stage_readers, {
-				...checkpoint,
-				revision: context.channel.membershipRevision,
-				readers: context.readers,
-				compensation: true,
-				refresh: true,
-			});
-			return;
-		}
-		if (run.readerStep > 0 && run.readerOriginalReceiptId?.startsWith("manual:")) {
-			await ctx.runMutation(internal.transcripts_db.reader_receipt, {
-				...checkpoint,
-				receiptId: run.readerOriginalReceiptId,
-				readerRevision: destination.readerRevision,
-				detached: true,
-			});
-			return;
-		}
-		if (run.readerStep > 0 && !run.readerOriginalReceiptId?.startsWith("manual:")) {
-			const rollbackToken = run.readerRollbackSecret
-				? await transcripts_decrypt(run.readerRollbackSecret)
-				: readerToken;
-			let rollback;
-			try {
-				rollback = await transcripts_host_post(
-					"/api/v1/files/plugin-access/undo",
-					{
-						writerId: destination.writerId,
-						operationId: `${run._id}:${job.sequence}:rollback:${run.readerAttempt}`,
-						writerGeneration: run.writerGeneration,
-						...(run.readerOriginalReceiptId
-							? { receiptId: run.readerOriginalReceiptId }
-							: { originalReaderOperationId: `${run._id}:${job.sequence}:readers:${run.readerAttempt}` }),
-					},
-					rollbackToken,
-					z.object({
-						_id: z.string().nullable(),
-						readerRevision: z.number(),
-						detached: z.boolean(),
-						restored: z.boolean(),
-					}),
-				);
-			} catch (error) {
-				if (
-					!(error instanceof transcripts_HostError) ||
-					error.code !== "reader_proof_mismatch" ||
-					rollbackToken === token
-				)
-					throw error;
-				// An upgrade can retire the saved bearer. Save current authority before retrying its exact operation.
-				await ctx.runMutation(internal.transcripts_db.set_reader_rollback_source, {
-					...checkpoint,
-					sourceSecret: await transcripts_encrypt(token),
-				});
-				return;
-			}
-			if (!rollback.restored && !rollback.detached)
-				throw new Error("Bonobo Senate has not restored the previous Files readers.");
-			await ctx.runMutation(internal.transcripts_db.reader_receipt, {
-				...checkpoint,
-				receiptId: rollback._id ?? `manual:${run._id}:${job.sequence}`,
-				readerRevision: rollback.readerRevision,
-				detached: rollback.detached,
-			});
-			return;
-		}
-		// An explicit Files takeover leaves its readers independent of later chat membership.
-		const prepared = await transcripts_host_post(
-			"/api/v1/files/plugin-writers/inspect",
-			{
-				writerId: destination.writerId,
-				path: chatbe_rollover_path(destination.folderPath, context.channel.transcriptSlug, 0),
-				maxBytes: chatbe_ROLLOVER_MAX_BYTES,
-			},
-			readerToken,
-			transcripts_prepared,
-		);
-		if (prepared.detached) {
-			await ctx.runMutation(internal.transcripts_db.reader_receipt, {
-				...checkpoint,
-				receiptId: `manual:${run._id}:${run.readerStep}`,
-				readerRevision: prepared.readerRevision,
-				detached: true,
-			});
-			return;
-		}
-		const receipt = await transcripts_host_post(
-			"/api/v1/files/plugin-access/set",
-			{
-				path: destination.folderPath,
-				access: { readers: run.readerSnapshot.readers },
-				writer: {
-					writerId: destination.writerId,
-					operationId: `${run._id}:${job.sequence}:readers:${run.readerAttempt}`,
-					writerGeneration: run.writerGeneration,
-					expectedReaderRevision: destination.readerRevision!,
-				},
-			},
-			readerToken,
-			transcripts_file_result,
-		);
-		await ctx.runMutation(internal.transcripts_db.reader_receipt, {
-			...checkpoint,
-			receiptId: receipt._id,
-			readerRevision: receipt.readerRevision,
-			detached: false,
-		});
-		return;
-	}
-	if (
-		run.readerRefresh &&
-		!invalidPending &&
-		(context.change !== null || context.channel.membershipRevision === operation.readerRevision)
-	) {
-		await ctx.runMutation(internal.transcripts_db.restart_readers, {
-			...checkpoint,
-			sourceSecret: await transcripts_encrypt(token),
-		});
-		return;
-	}
-	if (run.readerStep === 0 && context.change) {
-		const complete: boolean = await ctx.runMutation(internal.channel_members.complete_change, {
-			changeId: context.change._id,
-			readerRevision: operation.readerRevision,
-			hostReceiptId: run.readerReceiptId,
-		});
-		if (!complete) {
-			await ctx.runMutation(internal.transcripts_db.stage_readers, {
-				...checkpoint,
-				revision: context.channel.membershipRevision,
-				readers: context.readers,
-				compensation: true,
-			});
-			return;
-		}
-	} else if (run.readerStep > 0) {
-		if (context.change) {
-			const cancelled: boolean = await ctx.runMutation(internal.channel_members.cancel_change, {
-				changeId: context.change._id,
-				hostReceiptId: run.readerReceiptId,
-			});
-			if (!cancelled)
-				throw new transcripts_StepError("Channel access changed during Files sync. Try again.", "temporary");
-		}
-	} else {
-		const snapshot = [...run.readerSnapshot.readers].sort((a, b) => a.userId.localeCompare(b.userId));
-		const readers = [...context.readers].sort((a, b) => a.userId.localeCompare(b.userId));
-		if (JSON.stringify(snapshot) !== JSON.stringify(readers)) {
-			await ctx.runMutation(internal.transcripts_db.stage_readers, {
-				...checkpoint,
-				revision: context.channel.membershipRevision,
-				readers: context.readers,
-				compensation: true,
-			});
-			return;
-		}
-	}
-	await ctx.runMutation(internal.transcripts_db.complete_control, {
-		...checkpoint,
-		readerRevision: Math.max(context.channel.membershipRevision, operation.readerRevision),
-		...(run.kind === "reconcile" ? { foldedSequence: job.sequence } : {}),
-	});
-}
-
-const channel_work = v.union(
-	v.object({ kind: v.literal("readers"), runId: v.id("transcript_runs"), claim: v.string() }),
-	v.object({ kind: v.literal("file"), runId: v.id("transcript_runs"), claim: v.string() }),
-	v.object({ kind: v.literal("deletion"), deletionId: v.id("transcript_deletions"), claim: v.string() }),
-);
+const channel_work = v.object({ runId: v.id("transcript_runs"), claim: v.string() });
 
 async function start_work(
 	ctx: MutationCtx,
@@ -292,44 +61,36 @@ export const dispatch = internalMutation({
 			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
 			.unique();
 		if (!state) return null;
-		if (await channel_members_complete_without_files(ctx, args)) {
+		const [grant, destination] = await Promise.all([
+			ctx.db
+				.query("host_grants")
+				.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
+				.unique(),
+			ctx.db
+				.query("transcript_destinations")
+				.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
+				.unique(),
+		]);
+		// A channel that never connected Files waits for Connect Files. Its connection wakes it again.
+		if (!grant && !destination) {
+			await ctx.db.patch("transcript_channels", state._id, {
+				status: "blocked",
+				error: "Connect Files to save Markdown copies.",
+			});
 			await transcripts_wake(ctx, { channelStateId: state._id }, null);
 			return null;
 		}
 
-		const gates: number[] = [];
-		// Reader changes go first. File runs and deletions wait for them.
-		const readers = await transcripts_db_claim_readers(ctx, args.channelId);
-		if (typeof readers === "number") gates.push(readers);
-		else if (readers)
-			return await start_work(
-				ctx,
-				state._id,
-				args.channelId,
-				{ kind: "readers", runId: readers.runId, claim: readers.claim },
-				readers.leaseUntil,
-			);
-		const deletion = await transcripts_deletions_claim(ctx, args.channelId);
-		if (typeof deletion === "number") gates.push(deletion);
-		else if (deletion)
-			return await start_work(
-				ctx,
-				state._id,
-				args.channelId,
-				{ kind: "deletion", deletionId: deletion.deletionId, claim: deletion.claim },
-				deletion.leaseUntil,
-			);
 		const file = await transcripts_db_claim(ctx, args.channelId);
-		if (typeof file === "number") gates.push(file);
-		else if (file)
+		if (file && typeof file !== "number")
 			return await start_work(
 				ctx,
 				state._id,
 				args.channelId,
-				{ kind: "file", runId: file.runId, claim: file.claim },
+				{ runId: file.runId, claim: file.claim },
 				file.leaseUntil,
 			);
-		await transcripts_wake(ctx, { channelStateId: state._id }, gates.length ? Math.min(...gates) : null);
+		await transcripts_wake(ctx, { channelStateId: state._id }, file);
 		return null;
 	},
 });
@@ -339,96 +100,13 @@ export const run = internalAction({
 	returns: v.null(),
 	handler: async (ctx, args): Promise<void> => {
 		const { work } = args;
-		if (work.kind === "readers") {
-			const reader = await ctx.runQuery(internal.transcripts_db.claimed, { runId: work.runId, claim: work.claim });
-			if (!reader?.job) return;
-			const checkpoint = { runId: work.runId, claim: work.claim };
-			try {
-				const source =
-					(await ctx.runQuery(internal.transcripts_grants.reader_source, { channelId: args.channelId })) ??
-					reader.run.readerSourceSecret;
-				if (!source) throw new transcripts_StepError("Connect Files sync again to continue.", "auth_expired");
-				await readers_step(ctx, { ...reader, job: reader.job }, await transcripts_decrypt(source));
-				await ctx.runMutation(internal.transcripts_db.release_readers, {
-					...checkpoint,
-					error: null,
-					errorCode: null,
-					retryAfterMs: null,
-				});
-			} catch (error) {
-				const message = transcripts_get_error_message(error, "Files readers could not be updated.");
-				await ctx.runMutation(internal.transcripts_db.release_readers, {
-					...checkpoint,
-					error: message,
-					errorCode: transcripts_get_error_code(error, message),
-					retryAfterMs: error instanceof transcripts_HostError ? error.retryAfterMs : null,
-				});
-			}
-			return;
-		}
-		if (work.kind === "deletion") {
-			const deletion = await ctx.runQuery(internal.transcripts_deletions.claimed, {
-				deletionId: work.deletionId,
-				claim: work.claim,
-			});
-			if (!deletion) return;
-			const prepared = deletion.deletion.prepared!;
-			const checkpoint = { deletionId: work.deletionId, claim: work.claim };
-			try {
-				const { token } = await transcripts_get_token(ctx, args.channelId);
-				// Move to Trash after the copy boundary, preserving this exact file's current text and manual edits.
-				const receipt = await transcripts_host_post(
-					"/api/v1/files/plugin-archive",
-					{
-						force: true,
-						path: prepared.path,
-						writer: {
-							writerId: deletion.destination.writerId,
-							operationId: prepared.operationId,
-							writerGeneration: prepared.writerGeneration,
-							nodeId: prepared.nodeId,
-							sequence: deletion.deletion.barrier + 1,
-						},
-					},
-					token,
-					transcripts_file_result,
-				);
-				if (receipt.nodeId !== prepared.nodeId || receipt.operationId !== prepared.operationId)
-					throw new Error("Bonobo Senate did not confirm moving this transcript to Trash.");
-				await ctx.runMutation(internal.transcripts_deletions.release, {
-					...checkpoint,
-					error: null,
-					errorCode: null,
-					retryAfterMs: null,
-				});
-			} catch (error) {
-				const message = transcripts_get_error_message(error, "The transcript could not be moved to Trash.");
-				await ctx.runMutation(internal.transcripts_deletions.release, {
-					...checkpoint,
-					error: message,
-					errorCode: transcripts_get_error_code(error, message),
-					retryAfterMs: error instanceof transcripts_HostError ? error.retryAfterMs : null,
-				});
-			}
-			return;
-		}
 		const current = await ctx.runQuery(internal.transcripts_db.claimed, { runId: work.runId, claim: work.claim });
 		if (!current) return;
 		const { run, destination, channel, job } = current;
 		const checkpoint = { runId: run._id, claim: run.claim };
 		try {
-			const next =
-				run.kind === "reconcile" && run.phase === "fold"
-					? await ctx.runQuery(internal.transcripts_db.next_job, { runId: run._id })
-					: null;
-			const readerJob = job?.operation.kind === "readers" ? job : next?.operation.kind === "readers" ? next : null;
 			const token = (await transcripts_get_token(ctx, channel._id)).token;
-			if (readerJob)
-				await ctx.runMutation(internal.transcripts_db.complete_control, {
-					...checkpoint,
-					...(run.kind === "reconcile" ? { foldedSequence: readerJob.sequence } : {}),
-				});
-			else if (job?.operation.kind === "archive")
+			if (job?.operation.kind === "archive")
 				await ctx.runMutation(internal.transcripts_db.complete_control, checkpoint);
 			else if (run.phase === "recover") {
 				const previous = (await ctx.runQuery(internal.transcripts_db.recovery_run, { runId: run._id }))!;
@@ -507,7 +185,6 @@ export const run = internalAction({
 									sequence: previous.barrier,
 									expectedNodeId: write.expectedNodeId,
 									expectedContentRevision: write.expectedContentRevision,
-									expectedReaderRevision: write.expectedReaderRevision,
 									contentHash: write.contentHash,
 								},
 							},
@@ -629,8 +306,6 @@ export const run = internalAction({
 						expectedParentNodeId: prepared.expectedParentNodeId,
 						expectedNodeId: prepared.nodeId,
 						expectedContentRevision: prepared.contentRevision,
-						expectedReaderRevision: prepared.readerRevision,
-						detached: prepared.detached,
 					});
 				}
 			} else if (run.phase === "validate" || run.phase === "archive") {
@@ -715,7 +390,6 @@ export const run = internalAction({
 								sequence: run.barrier,
 								expectedNodeId: write.expectedNodeId,
 								expectedContentRevision: write.expectedContentRevision,
-								expectedReaderRevision: write.expectedReaderRevision,
 								contentHash: write.contentHash,
 							},
 						},

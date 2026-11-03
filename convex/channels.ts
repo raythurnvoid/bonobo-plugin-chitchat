@@ -20,7 +20,6 @@ import { transcripts_wake } from "./transcripts_wake";
 export async function channels_get_access(
 	ctx: QueryCtx | MutationCtx,
 	channelId: Id<"channels">,
-	allowPending = false,
 ): Promise<
 	chat_Result<
 		NonNullable<Awaited<ReturnType<typeof auth_get_current_access>>["_yay"]> & {
@@ -52,13 +51,6 @@ export async function channels_get_access(
 		!(access._yay.session.isOwner && access._yay.member.isOwner)
 	) {
 		return { _nay: { message: "Not found" } } as const;
-	}
-	if (channel.visibility === "private" && !allowPending) {
-		const changing = await ctx.db
-			.query("channel_access_changes")
-			.withIndex("by_channel_status", (q) => q.eq("channelId", channelId).eq("status", "pending"))
-			.first();
-		if (changing) return { _nay: { message: "Channel access is updating. Try again shortly." } } as const;
 	}
 	return {
 		_yay: {
@@ -109,9 +101,17 @@ export async function channels_save_request(
 
 export async function channels_queue_transcript(
 	ctx: MutationCtx,
-	channelId: Id<"channels">,
+	channel: Doc<"channels">,
 	operation: Doc<"transcript_jobs">["operation"],
 ) {
+	// TODO: Private channels get no transcript, because a transcript is a regular workspace file that every
+	// member who can open the folder can read. Two future fixes: let each user pick a folder in another
+	// workspace they own (for example their personal workspace) for the transcripts of their private
+	// channels, or set sharing on the transcript through the host's normal sharing API (the same rules as
+	// the Files UI).
+	if (channel.visibility === "private") return;
+
+	const channelId = channel._id;
 	const state = await ctx.db
 		.query("transcript_channels")
 		.withIndex("by_channel", (q) => q.eq("channelId", channelId))
@@ -134,7 +134,6 @@ export async function channels_queue_transcript(
 			status: "pending",
 			error: null,
 			nextAttemptAt: Date.now(),
-			readerRevision: 0,
 		});
 	}
 	await ctx.db.insert("transcript_jobs", {
@@ -149,7 +148,6 @@ export async function channels_queue_transcript(
 		error: null,
 	});
 	await transcripts_wake(ctx, { channelStateId: stateId }, Date.now());
-	return sequence;
 }
 
 export async function channels_queue_index(ctx: MutationCtx, channel: Doc<"channels">) {
@@ -207,8 +205,7 @@ export const permissions = query({
 	args: { channelId: v.id("channels") },
 	returns: v.union(v.object({ canWrite: v.boolean(), canManage: v.boolean() }), v.null()),
 	handler: async (ctx, args) => {
-		// Keep access controls visible while a private reader change waits for Files.
-		const access = await channels_get_access(ctx, args.channelId, true);
+		const access = await channels_get_access(ctx, args.channelId);
 		return access._yay ? { canWrite: access._yay.canWrite, canManage: access._yay.canManage } : null;
 	},
 });
@@ -396,23 +393,9 @@ export const create = mutation({
 				),
 			);
 		}
-		await channels_queue_transcript(ctx, channelId, {
-			kind: "header",
-			name,
-			topic,
-			isPrivate: args.visibility === "private",
-		});
-		if (args.visibility === "private")
-			await channels_queue_transcript(ctx, channelId, {
-				kind: "readers",
-				readerRevision: 1,
-				readers: [member, ...members].map((entry) => ({
-					userId: entry!.hostUserId,
-					membershipLifetime: entry!.membershipLifetime,
-				})),
-				deleted: false,
-			});
-		await channels_queue_index(ctx, (await ctx.db.get("channels", channelId))!);
+		const channel = (await ctx.db.get("channels", channelId))!;
+		await channels_queue_transcript(ctx, channel, { kind: "header", name, topic });
+		await channels_queue_index(ctx, channel);
 		const result = { kind: "channel" as const, channelId, revision: 1 };
 		await channels_save_request(ctx, {
 			installationId: installation._id,
@@ -458,12 +441,7 @@ export const update = mutation({
 			return { _nay: { message: "Use a name of 1–64 characters and a topic of at most 250 characters." } };
 		const revision = channel.revision + 1;
 		await ctx.db.patch("channels", channel._id, { name, sortName: name.toLowerCase(), topic, revision });
-		await channels_queue_transcript(ctx, channel._id, {
-			kind: "header",
-			name,
-			topic,
-			isPrivate: channel.visibility === "private",
-		});
+		await channels_queue_transcript(ctx, channel, { kind: "header", name, topic });
 		await channels_queue_index(ctx, { ...channel, name, topic, revision });
 		const result = { kind: "channel" as const, channelId: channel._id, revision };
 		await channels_save_request(ctx, {
@@ -506,7 +484,7 @@ export const archive = mutation({
 		const revision = channel.revision + 1;
 		const archivedAt = args.archived ? (channel.archivedAt ?? Date.now()) : null;
 		await ctx.db.patch("channels", channel._id, { revision, archivedAt });
-		await channels_queue_transcript(ctx, channel._id, { kind: "archive", archived: args.archived });
+		await channels_queue_transcript(ctx, channel, { kind: "archive", archived: args.archived });
 		await channels_queue_index(ctx, { ...channel, revision, archivedAt });
 		const result = { kind: "channel" as const, channelId: channel._id, revision };
 		await channels_save_request(ctx, {

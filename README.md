@@ -13,7 +13,7 @@ The plugin stays in its own Git repository, mounted in Bonobo Senate at `plugins
 - A channel sidebar, message pane, and resizable thread pane. Small screens use a channel drawer and a separate thread view.
 - Keyboard controls, accessible names, focus return, and composition-aware Enter handling.
 
-The organization owner can read private channels. The plugin lists only private channels the person joined. Files copies have their own sharing settings. File managers can share them with other people, including later updates.
+The organization owner can read private channels. The plugin lists only private channels the person joined. Private channels get no Files copy (see [Private channels](#private-channels)). Public channel copies in Files have their own sharing settings. File managers can share them with other people, including later updates.
 
 Internet access is required. New sends are blocked without a valid lease and live socket. Drafts stay in the open frame. Already-submitted uncertain requests keep their original ID and payload. No offline send queue is created. A Chitchat outage does not stop the rest of Bonobo Senate.
 
@@ -68,22 +68,22 @@ Inside the dataset root, the layout and format remain:
 
 - `README.md` lists public channels.
 - Public transcripts use `<slug>.md` and numbered `<slug>.001.md` rollovers.
-- Private transcripts use `private/<slug>-<digest8>/<slug>-<digest8>.md`.
+- Private channels get no transcript. See [Private channels](#private-channels).
 - Each file stays within 100,000 UTF-8 bytes. The current rollover scheme is retained.
 - Message markers, UTC dates, saved author names, two-space reply indentation, edit/delete flags, attachment names, and reaction lines keep their existing format. Signed download URLs are never stored.
 
 Connect Files from the channel's transcript status. The server uses `/api/v1/plugins/service-grants/*` to exchange and seal a Files-only grant for the exact root. Grants are encrypted before storage.
 
-Files writes use the public plugin folder, access, and Trash APIs plus `/api/v1/files/write`.
-Writer inspection, generation advance, and reader undo are general public Files capabilities.
+Files writes use the public plugin folder and Trash APIs plus `/api/v1/files/write`.
+Writer inspection and generation advance are general public Files capabilities.
 `JSON.stringify([generation, channelPublicId])` is the opaque writer resource key; `__root` identifies
 the README writer inside Chitchat only. Bonobo Senate never parses this value. Chitchat sends the original
 saved operation ID, sequence, target and revision checks on every retry. Transcript writes and moves to Trash explicitly send `force: true`; this is part of the host receipt fingerprint. Drain old prepared requests before the host cutover. Never add force to an already accepted old request. Its 100,000-byte Markdown
 limit remains local even though the public API supports other editable text and larger bounds.
 
-A workspace admin must make the first connection. Read-only creation and forced transcript writes need the new `workspace.files.manage-read-only` consent and current Can edit access. Private reader bindings still need Can manage. Force preserves every Read-only flag.
+A workspace admin must make the first connection. Read-only creation and forced transcript writes need the new `workspace.files.manage-read-only` consent and current Can edit access. Force preserves every Read-only flag.
 
-After the root and `private` container exist, reduce the account's broad access where possible. Keep the workspace **Can write** permission needed for ordinary file writes, and **Can manage** on the exact generated root and `private` container. Normal folder grants do not pass to other folders or files. When creating a private channel folder, the public API grants **Can manage** on that new folder to the exact bound service account. The connecting person must be allowed to manage that account and grant access on the parent. This lets Chitchat update the transcript and its readers. Later setup calls keep existing grants unchanged and never restore a removed grant. The connecting person must also keep the Files permissions needed for each operation.
+After the root exists, reduce the account's broad access where possible. Keep the workspace **Can write** permission needed for ordinary file writes, and **Can manage** on the exact generated root. Normal folder grants do not pass to other folders or files. Later setup calls keep existing grants unchanged and never restore a removed grant. The connecting person must also keep the Files permissions needed for each operation.
 
 Transcript work has no cron. Each channel, the README index, and each Files connection keep at most one scheduled wake-up. The wake-up is a mutation: it claims the work and arms a watchdog before it starts the action, so work resumes after an action crash. Temporary failures retry after 30 s, 1, 2, 5, and 10 minutes, then every 15 minutes, with some jitter. A `Retry-After` from Bonobo Senate wins. After 5 minutes of temporary failures, the status says when the next try runs and offers **Retry now**. An expired connection, missing permission, a sponsor who left, a conflict, or a file that is too large does not retry by itself. The status says which one it is.
 
@@ -95,15 +95,22 @@ The README index runs independently from channel jobs. It stays within the same 
 
 A successful **Connect Files** also selects that connection for the shared README index. This repairs an expired index grant even when its first channel is no longer available. Failed setup keeps the previous choice. Background renewal does not choose another sponsor. A pending index write keeps its exact saved request while the new connection retries it.
 
-New output starts with Chitchat labels and a plugin lock. Removing its label, moving or replacing a pinned folder, removing account access, or applying a human lock can block sync. Repeated setup never repairs those choices. A manual sharing change detaches automatic reader updates. The Files UI then owns that sharing.
+New output starts with Chitchat labels and a plugin lock. Removing its label, moving or replacing a pinned folder, removing account access, or applying a human lock can block sync. Repeated setup never repairs those choices. Chitchat never changes sharing. The Files UI owns it.
 
 Removing workspace chat read permission does not revoke a separate Files grant while workspace and channel membership remain active. Removing the workspace membership invalidates attached transcript grants from that membership lifetime.
 
-Once Files setup has started, private reader changes wait for its acknowledgement before chat opens under the new access. Before any Files connection exists, they may complete locally. If authority changes during a Files step, the saved reader operation must be rolled back safely or cancelled under its original operation ID before a delayed apply can arrive. Current file locks still apply. A missing proof or newer file state keeps sync blocked. Manual sharing is acknowledged without changing it.
+### Private channels
 
-After a plugin upgrade or account rebind, Reconnect can settle the saved reader operation with a new sealed grant for the same installation and exact root. The current person and account must have Files write and sharing-management access. Old credentials cannot authorize new changes. Recovery still checks locks, labels, exact writer and reader revisions, and membership lifetimes.
+Private channels get no transcript. A transcript is a regular workspace file. Every member who can open its folder can read it, so a private channel copy would leak the chat. Chitchat skips private channels in one place: `channels_queue_transcript` in `convex/channels.ts`. The transcript status, Connect Files, Retry, and Rebuild also refuse private channels.
 
-Private deletion removes chat access first. It then finishes all transcript copies through the saved deletion sequence. Only after those copies finish does it move each saved transcript file to Trash, one file per worker step. Each request is saved before sending, so a lost reply can be retried exactly. The folder and unrelated files remain in Files. Moving to Trash keeps the current text, including manual edits; it does not replace content. A current lock or missing permission blocks the next step. Manual sharing stops automatic moves to Trash.
+A channel cannot change between public and private. Private channels that got copies before this rule get no more writes. Chitchat does not delete or move those files. They stay in Files with their current sharing, and file managers decide what to do with them.
+
+Membership changes in private channels apply at once. No Files step has to finish first.
+
+Two possible future fixes:
+
+- Let each user pick a folder in another workspace they own, for example their personal workspace, for the transcripts of their private channels.
+- Set sharing on the transcript through the host's normal sharing API, with the same rules as the Files UI.
 
 ## Configuration
 
@@ -152,9 +159,5 @@ Published versions cannot change. Before publishing changed source or assets, us
 After native chat has accepted messages, keep its database and transcript queue. Fix and release the current app. Do not restore the old generic-store plugin or import old Markdown copies as chat; that would hide messages saved since the rebuild.
 
 Temporary Files failures retry by themselves. Use **Retry sync** after you fix the cause of a stop, such as missing folder access. Use **Reconnect Files** when the connection expired or the person who connected left, including after a plugin update. Both still check current permissions and locks. They never restore removed account grants or overwrite manual sharing. **Rebuild copies** requires explicit confirmation before replacing manual text.
-
-Unfinished private deletion appears in **Files sync** for the current owner or the original delete actor with the same active membership lifetime. This view shows copy progress and recovery controls. It does not reopen deleted messages. Rebuild remains available while copies are pending and stops being available when files start moving to Trash. Interrupted moves to Trash resume from their saved step when the next wake-up runs.
-
-When the last channel member leaves the workspace, cleanup saves owner recovery before trying to update Files readers. This lets a current owner reconnect if the old sponsor can no longer write. A channel that never started Files setup needs no recovery entry.
 
 Verify access, pending jobs, and the served bundle after a repair. Uninstall is not a temporary pause: it retires the installation's authority. Never uninstall, reset the plugin registry, or wipe Bonobo Senate as a shortcut to recover this plugin.

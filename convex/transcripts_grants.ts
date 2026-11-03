@@ -9,7 +9,6 @@ import { press_post } from "./press";
 import { transcripts_decrypt, transcripts_encrypt } from "./transcripts_secrets";
 import { transcripts_index_request } from "./transcripts_index";
 import { transcripts_next_retry, transcripts_retry_delay, transcripts_wake } from "./transcripts_wake";
-import { transcripts_db_resume_readers } from "./transcripts_db";
 import { chatbe_channel_header } from "../shared/transcript-markdown";
 import { chat_transcript_error_code, type chat_TranscriptErrorCode } from "../shared/chat";
 import schema from "./schema";
@@ -28,8 +27,6 @@ export const transcripts_host_scope = z
 			rootNodeId: z.string(),
 			folderNodeId: z.string(),
 			writerGeneration: z.number(),
-			readerRevision: z.number().nullable(),
-			detached: z.boolean(),
 		}),
 	})
 	.transform((result) => result.writer);
@@ -116,7 +113,6 @@ export const get = internalQuery({
 			grant: doc(schema, "host_grants"),
 			installation: doc(schema, "installations"),
 			channel: doc(schema, "channels"),
-			readers: v.array(v.object({ userId: v.string(), membershipLifetime: v.number() })),
 		}),
 	),
 	handler: async (ctx, args) => {
@@ -137,25 +133,7 @@ export const get = internalQuery({
 		if (!installation || installation.status !== "ready" || !channel) return null;
 		if (!sponsor?.active || sponsor.cleanupPending || sponsor.membershipLifetime !== grant.sponsorLifetime)
 			return "sponsor_gone";
-		const members =
-			channel.visibility === "private"
-				? await ctx.db
-						.query("channel_members")
-						.withIndex("by_channel_hostUserId", (q) => q.eq("channelId", channel._id))
-						.take(50)
-				: [];
-		const readers = [];
-		for (const member of members) {
-			const current = await ctx.db
-				.query("workspace_members")
-				.withIndex("by_installation_hostUserId", (q) =>
-					q.eq("installationId", grant.installationId).eq("hostUserId", member.hostUserId),
-				)
-				.unique();
-			if (current?.active && !current.cleanupPending && current.membershipLifetime === member.membershipLifetime)
-				readers.push({ userId: member.hostUserId, membershipLifetime: member.membershipLifetime });
-		}
-		return { grant, installation, channel, readers };
+		return { grant, installation, channel };
 	},
 });
 
@@ -179,19 +157,6 @@ export const get_by_id = internalQuery({
 	args: { grantId: v.id("host_grants") },
 	returns: v.union(doc(schema, "host_grants"), v.null()),
 	handler: async (ctx, args) => await ctx.db.get("host_grants", args.grantId),
-});
-
-// Rollback keeps a proof even after the sponsor loses chat access. Bonobo Senate limits it to cancellation.
-export const reader_source = internalQuery({
-	args: { channelId: v.id("channels") },
-	returns: v.union(v.string(), v.null()),
-	handler: async (ctx, args) =>
-		(
-			await ctx.db
-				.query("host_grants")
-				.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
-				.unique()
-		)?.sealedSecret ?? null,
 });
 
 export const save_step = internalMutation({
@@ -290,8 +255,6 @@ export const save_destination = internalMutation({
 		folderNodeId: v.string(),
 		folderPath: v.string(),
 		writerGeneration: v.number(),
-		readerRevision: v.union(v.number(), v.null()),
-		detached: v.boolean(),
 	},
 	returns: v.null(),
 	handler: async (ctx, args) => {
@@ -320,19 +283,13 @@ export const save_destination = internalMutation({
 		if (current) {
 			if (current.writerId !== args.writerId || current.folderNodeId !== args.folderNodeId)
 				throw new ConvexError("The Files destination changed. Its saved path cannot be adopted.");
-			await ctx.db.patch("transcript_destinations", current._id, {
-				readerRevision: args.readerRevision,
-				detached: args.detached,
-			});
 		} else
 			await ctx.db.insert("transcript_destinations", {
 				...destination,
 				channelId: grant.channelId,
-				header: chatbe_channel_header(channel.name, channel.topic, channel.visibility === "private"),
+				header: chatbe_channel_header(channel.name, channel.topic),
 				tailOrder: 0,
 				runId: null,
-				readerRunId: null,
-				readerError: null,
 			});
 		await ctx.db.patch("host_grants", grant._id, {
 			selectIndexOnReady: false,
@@ -347,37 +304,18 @@ export const save_destination = internalMutation({
 			.query("transcript_channels")
 			.withIndex("by_channel", (q) => q.eq("channelId", channel._id))
 			.unique();
-		const [run, readerRun] = await Promise.all([
-			current?.runId ? ctx.db.get("transcript_runs", current.runId) : null,
-			current?.readerRunId ? ctx.db.get("transcript_runs", current.readerRunId) : null,
-		]);
+		const run = current?.runId ? await ctx.db.get("transcript_runs", current.runId) : null;
 		// A new grant adds no transcript work when the existing destination is already synced.
 		if (state)
 			await ctx.db.patch("transcript_channels", state._id, {
 				status:
-					current &&
-					(!run || run.phase === "complete") &&
-					(!readerRun || readerRun.phase === "complete") &&
-					state.appliedSequence === state.desiredSequence
+					current && (!run || run.phase === "complete") && state.appliedSequence === state.desiredSequence
 						? "ready"
 						: "pending",
 				error: null,
 				errorCode: undefined,
 				retry: undefined,
 				nextAttemptAt: Date.now(),
-			});
-		// The new connection also restarts a reader change that stopped on the old one.
-		if (readerRun && readerRun.phase !== "complete") await transcripts_db_resume_readers(ctx, readerRun);
-		const deletion = await ctx.db
-			.query("transcript_deletions")
-			.withIndex("by_channel", (q) => q.eq("channelId", channel._id))
-			.unique();
-		if (deletion && deletion.completedAt === null)
-			await ctx.db.patch("transcript_deletions", deletion._id, {
-				nextAttemptAt: Date.now(),
-				error: null,
-				errorCode: undefined,
-				retry: undefined,
 			});
 		if (state) await transcripts_wake(ctx, { channelStateId: state._id }, Date.now());
 		const index = await ctx.db
@@ -526,23 +464,16 @@ export const connect = internalAction({
 				token,
 				transcripts_host_scope,
 			);
-			const folderPath =
-				current.channel.visibility === "private"
-					? `${grant.rootPath}/private/${current.channel.transcriptSlug}`
-					: grant.rootPath;
 			const destination = await transcripts_host_post(
 				"/api/v1/files/plugin-folders/ensure",
 				{
 					force: true,
-					path: folderPath,
+					path: grant.rootPath,
 					writer: {
 						resourceKey: JSON.stringify([current.installation.generation, current.channel.publicId]),
 						rootNodeId: root.rootNodeId,
 					},
-					access: {
-						readOnly: true,
-						...(current.channel.visibility === "private" ? { readers: current.readers } : {}),
-					},
+					access: { readOnly: true },
 				},
 				token,
 				transcripts_host_scope,
@@ -554,10 +485,8 @@ export const connect = internalAction({
 				rootWriterId: root.writerId,
 				rootNodeId: root.rootNodeId,
 				folderNodeId: destination.folderNodeId,
-				folderPath,
+				folderPath: grant.rootPath,
 				writerGeneration: destination.writerGeneration,
-				readerRevision: destination.readerRevision,
-				detached: destination.detached,
 			});
 		} catch (error) {
 			const message = transcripts_get_error_message(error, "Files connection failed. Try again.");

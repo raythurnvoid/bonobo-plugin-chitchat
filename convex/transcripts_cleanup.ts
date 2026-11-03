@@ -35,7 +35,7 @@ export const channel = internalMutation({
 		if (
 			run &&
 			run._creationTime <= args.throughCreatedAt &&
-			((destination?.runId !== run._id && destination?.readerRunId !== run._id) || run.phase === "complete")
+			(destination?.runId !== run._id || run.phase === "complete")
 		) {
 			const blocks = await ctx.db
 				.query("transcript_staged_blocks")

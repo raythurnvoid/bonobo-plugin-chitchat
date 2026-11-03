@@ -1,6 +1,6 @@
 import { useConvex } from "convex/react";
 import type { FunctionArgs } from "convex/server";
-import { useEffect, useId, useState } from "react";
+import { useId, useState } from "react";
 import { api } from "../convex/_generated/api";
 import type { Doc, Id } from "../convex/_generated/dataModel";
 import { chat_PRIVATE_CHANNEL_DISCLOSURE, chat_member_label } from "../shared/chat-display";
@@ -252,25 +252,9 @@ export function ChannelPeopleDialog(props: { channelId: Id<"channels">; selfUser
 		api.members.resolve,
 		people ? { userIds: people.page.map((person) => person.hostUserId) } : "skip",
 	);
-	const result = use_chat_query(
-		session,
-		api.channel_members.status,
-		attempt ? { channelId: props.channelId, clientRequestId: attempt.clientRequestId } : "skip",
-	);
-	const waiting = result?.status === "pending";
-	useEffect(() => {
-		if (result?.status === "complete") {
-			setAttempt(null);
-			setError(null);
-		}
-		if (result?.status === "cancelled") {
-			setAttempt(null);
-			setError("Access changed before this request finished. Check the people list and try again.");
-		}
-	}, [result]);
 
 	const change = async (request: FunctionArgs<typeof api.channel_members.change>) => {
-		if (busy || waiting) return;
+		if (busy) return;
 		if (!session.can_request_now()) {
 			setError("Reconnect before changing channel access.");
 			return;
@@ -280,10 +264,8 @@ export function ChannelPeopleDialog(props: { channelId: Id<"channels">; selfUser
 		setError(null);
 		try {
 			const saved = await convex.mutation(api.channel_members.change, request);
-			if (saved._nay) {
-				setAttempt(null);
-				setError(saved._nay.message);
-			}
+			setAttempt(null);
+			if (saved._nay) setError(saved._nay.message);
 		} catch {
 			setError("This change may have reached Chitchat. Retry to check it.");
 		} finally {
@@ -314,9 +296,7 @@ export function ChannelPeopleDialog(props: { channelId: Id<"channels">; selfUser
 				{channel ? `People in #${channel.name}` : "Channel access"}
 			</h2>
 			<p className="field-note">{chat_PRIVATE_CHANNEL_DISCLOSURE}</p>
-			{waiting ? (
-				<p role="status">Updating channel and transcript access…</p>
-			) : !people ? (
+			{!people ? (
 				<p className="channel-status" role="status">
 					{people === null ? "The people list is not currently available." : "Loading people…"}
 				</p>
@@ -375,7 +355,7 @@ export function ChannelPeopleDialog(props: { channelId: Id<"channels">; selfUser
 				</p>
 			) : null}
 			<div className="dialog-actions">
-				{attempt && !waiting ? (
+				{attempt ? (
 					<button
 						type="button"
 						className="button"
@@ -410,19 +390,7 @@ export function ChannelActionDialog(props: {
 	const [busy, setBusy] = useState(false);
 	const [submitted, setSubmitted] = useState(false);
 	const [error, setError] = useState<string | null>(null);
-	const privateAction = props.action === "leave" || props.action === "delete";
 	const permissions = use_chat_query(session, api.channels.permissions, { channelId: props.channel._id });
-	const status = use_chat_query(
-		session,
-		api.channel_members.status,
-		submitted && privateAction ? { channelId: props.channel._id, clientRequestId: requestId } : "skip",
-	);
-	const waiting = status?.status === "pending";
-	useEffect(() => {
-		if (status?.status === "complete") props.onDone();
-		if (status?.status === "cancelled")
-			setError("Access changed before this request finished. Close this dialog and try again.");
-	}, [status, props.onDone]);
 	const label =
 		props.action === "archive"
 			? "Archive"
@@ -432,7 +400,7 @@ export function ChannelActionDialog(props: {
 					? "Leave"
 					: "Delete";
 	const confirm = async () => {
-		if (busy || waiting) return;
+		if (busy) return;
 		if (!session.can_request_now()) {
 			setError("Reconnect before changing this channel.");
 			return;
@@ -467,7 +435,7 @@ export function ChannelActionDialog(props: {
 				setError(result._nay.message);
 				return;
 			}
-			if (result._yay.kind !== "membership" || !result._yay.pending) props.onDone();
+			props.onDone();
 		} catch {
 			setError("This change may have reached Chitchat. Retry to check the same request.");
 		} finally {
@@ -494,10 +462,9 @@ export function ChannelActionDialog(props: {
 					: props.action === "unarchive"
 						? "The channel returns to the active list."
 						: deleting
-							? `This deletes the channel for all ${props.channel.memberCount} people in it. Nobody can open it again. Copies in Files follow their own sharing settings. This cannot be undone.`
-							: "You stop seeing this channel and its messages. Other people keep it. Somebody who can add people has to add you back. Copies in Files follow their own sharing settings."}
+							? `This deletes the channel for all ${props.channel.memberCount} people in it. Nobody can open it again. This cannot be undone.`
+							: "You stop seeing this channel and its messages. Other people keep it. Somebody who can add people has to add you back."}
 			</p>
-			{waiting ? <p role="status">Updating channel and transcript access…</p> : null}
 			{error ? (
 				<p className="form-error" role="alert">
 					{error}
@@ -505,12 +472,12 @@ export function ChannelActionDialog(props: {
 			) : null}
 			<div className="dialog-actions">
 				<button type="button" className="button" data-dialog-initial disabled={busy} onClick={props.onClose}>
-					{waiting ? "Close" : "Cancel"}
+					Cancel
 				</button>
 				<button
 					type="button"
 					className={`button ${deleting || props.action === "archive" ? "button-danger" : "button-primary"}`}
-					disabled={busy || waiting || !(props.action === "leave" || submitted ? session.connected : session.canSend)}
+					disabled={busy || !(props.action === "leave" || submitted ? session.connected : session.canSend)}
 					onClick={() => void confirm()}
 				>
 					{busy ? "Saving…" : submitted ? "Retry" : `${label} channel`}

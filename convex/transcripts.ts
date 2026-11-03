@@ -1,62 +1,23 @@
 import { v } from "convex/values";
-import { paginationOptsValidator, paginationResultValidator, type RegisteredMutation } from "convex/server";
+import type { RegisteredMutation } from "convex/server";
 import { zodToConvex } from "convex-helpers/server/zod4";
-import { action, internalMutation, mutation, query } from "./_generated/server";
+import { action, internalMutation, mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { auth_get_current_access } from "./auth";
-import {
-	chat_error,
-	chat_transcript_error_code,
-	chat_PAGE_MAX_BYTES,
-	chat_PAGE_SIZE,
-	chat_validate_request_id,
-	type chat_Result,
-} from "../shared/chat";
+import type { Id } from "./_generated/dataModel";
+import { chat_error, chat_transcript_error_code, chat_validate_request_id, type chat_Result } from "../shared/chat";
 import { chatbe_sha256_hex } from "../shared/transcript-markdown";
 import { transcripts_encrypt } from "./transcripts_secrets";
 import { press_get_lease, press_lease_facts } from "./press";
 import { transcripts_index_request } from "./transcripts_index";
-import { transcripts_deletions_get_access } from "./transcripts_deletions";
 import { transcripts_wake } from "./transcripts_wake";
-import { transcripts_db_resume_readers } from "./transcripts_db";
+import { channels_get_access } from "./channels";
 
-export const list_deletions = query({
-	args: { paginationOpts: paginationOptsValidator },
-	returns: paginationResultValidator(v.object({ channelId: v.id("channels"), name: v.string() })),
-	handler: async (ctx, args) => {
-		const access = await auth_get_current_access(ctx);
-		if (access._nay) return { page: [], isDone: true, continueCursor: "" };
-		const { installation, member, session } = access._yay;
-		const query = ctx.db.query("transcript_deletions");
-		const pending =
-			member.isOwner && session.isOwner
-				? query.withIndex("by_installation_completedAt", (q) =>
-						q.eq("installationId", installation._id).eq("completedAt", null),
-					)
-				: query.withIndex("by_installation_actor_lifetime_completedAt", (q) =>
-						q
-							.eq("installationId", installation._id)
-							.eq("actorHostUserId", member.hostUserId)
-							.eq("actorLifetime", member.membershipLifetime)
-							.eq("completedAt", null),
-					);
-		const page = await pending.paginate({
-			...args.paginationOpts,
-			numItems: Math.min(chat_PAGE_SIZE, Math.max(1, args.paginationOpts.numItems)),
-			maximumRowsRead: chat_PAGE_SIZE,
-			maximumBytesRead: chat_PAGE_MAX_BYTES,
-		});
-		return {
-			...page,
-			page: await Promise.all(
-				page.page.map(async (entry) => ({
-					channelId: entry.channelId,
-					name: (await ctx.db.get("channels", entry.channelId))!.name,
-				})),
-			),
-		};
-	},
-});
+// Private channels get no transcript. See the TODO in `channels_queue_transcript`.
+async function get_access(ctx: QueryCtx | MutationCtx, channelId: Id<"channels">) {
+	const access = await channels_get_access(ctx, channelId);
+	if (access._yay?.channel.visibility === "private") return { _nay: { message: "Not found" } } as const;
+	return access;
+}
 
 export const status = query({
 	args: { channelId: v.id("channels") },
@@ -81,22 +42,16 @@ export const status = query({
 			appliedSequence: v.number(),
 			folderPath: v.union(v.string(), v.null()),
 			folderNodeId: v.union(v.string(), v.null()),
-			readerMode: v.union(v.literal("unconfigured"), v.literal("attached"), v.literal("manual")),
 			canConnect: v.boolean(),
 			canReconcile: v.boolean(),
-			deletionPhase: v.union(v.literal("copy"), v.literal("archive"), v.null()),
 			indexStatus: v.union(v.literal("pending"), v.literal("running"), v.literal("blocked"), v.literal("ready")),
 			indexError: v.union(v.string(), v.null()),
 			indexErrorCode: v.union(chat_transcript_error_code, v.null()),
 		}),
 	),
 	handler: async (ctx, args) => {
-		const access = await transcripts_deletions_get_access(ctx, args.channelId);
+		const access = await get_access(ctx, args.channelId);
 		if (access._nay) return null;
-		const deletion = await ctx.db
-			.query("transcript_deletions")
-			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
-			.unique();
 		const state = await ctx.db
 			.query("transcript_channels")
 			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
@@ -115,23 +70,12 @@ export const status = query({
 				q.eq("installationId", access._yay.installation._id).eq("generation", access._yay.installation.generation),
 			)
 			.unique();
-		const readerRun = destination?.readerRunId ? await ctx.db.get("transcript_runs", destination.readerRunId) : null;
-		const readerJob = readerRun
-			? await ctx.db
-					.query("transcript_jobs")
-					.withIndex("by_channel_sequence", (q) => q.eq("channelId", args.channelId).eq("sequence", readerRun.barrier))
-					.unique()
-			: null;
 		// Show the first error in the order the work runs. A temporary error is a wait, not a block.
-		const shown = destination?.readerError
-			? { error: destination.readerError, errorCode: destination.readerErrorCode }
-			: grant?.error
-				? { error: grant.error, errorCode: grant.errorCode }
-				: deletion?.error
-					? { error: deletion.error, errorCode: deletion.errorCode }
-					: state?.error
-						? { error: state.error, errorCode: state.errorCode }
-						: null;
+		const shown = grant?.error
+			? { error: grant.error, errorCode: grant.errorCode }
+			: state?.error
+				? { error: state.error, errorCode: state.errorCode }
+				: null;
 		const final = (doc: { error: string | null; errorCode?: string } | null | undefined) =>
 			!!doc?.error && doc.errorCode !== "temporary";
 		const wakes = await Promise.all(
@@ -143,39 +87,22 @@ export const status = query({
 		return {
 			status: !grant
 				? ("not_connected" as const)
-				: destination?.readerRunId
-					? destination.readerError && destination.readerErrorCode !== "temporary"
-						? ("blocked" as const)
-						: ("running" as const)
-					: final(grant)
-						? ("blocked" as const)
-						: grant.phase !== "ready"
-							? ("pending" as const)
-							: final(deletion)
-								? ("blocked" as const)
-								: deletion && state?.status !== "blocked"
-									? deletion.archiveStartedAt === null
-										? ("pending" as const)
-										: ("running" as const)
-									: (state?.status ?? ("pending" as const)),
+				: final(grant)
+					? ("blocked" as const)
+					: grant.phase !== "ready"
+						? ("pending" as const)
+						: (state?.status ?? ("pending" as const)),
 			error: shown?.error ?? null,
 			errorCode: shown?.errorCode ?? null,
 			channelName: access._yay.channel.name,
-			retryingSince:
-				readerJob?.retry?.since ?? grant?.retry?.since ?? deletion?.retry?.since ?? state?.retry?.since ?? null,
+			retryingSince: grant?.retry?.since ?? state?.retry?.since ?? null,
 			nextAttemptAt: pendingTimes.length ? Math.min(...pendingTimes) : null,
 			desiredSequence: state?.desiredSequence ?? 0,
 			appliedSequence: state?.appliedSequence ?? 0,
 			folderPath: destination?.folderPath ?? grant?.rootPath ?? null,
 			folderNodeId: destination?.folderNodeId ?? null,
-			readerMode: !destination
-				? ("unconfigured" as const)
-				: destination.detached
-					? ("manual" as const)
-					: ("attached" as const),
 			canConnect: access._yay.canManage,
-			canReconcile: access._yay.canManage && !!destination && (!deletion || deletion.archiveStartedAt === null),
-			deletionPhase: deletion ? (deletion.archiveStartedAt === null ? ("copy" as const) : ("archive" as const)) : null,
+			canReconcile: access._yay.canManage && !!destination,
 			indexStatus: index?.status ?? ("pending" as const),
 			indexError: index?.error ?? null,
 			indexErrorCode: index?.errorCode ?? null,
@@ -192,7 +119,7 @@ export const begin_connect = internalMutation({
 	},
 	returns: v.union(v.object({ _yay: v.null() }), v.object({ _nay: chat_error })),
 	handler: async (ctx, args): Promise<chat_Result<null>> => {
-		const access = await transcripts_deletions_get_access(ctx, args.channelId);
+		const access = await get_access(ctx, args.channelId);
 		if (access._nay) return access;
 		const { session, member, installation: currentInstallation } = access._yay;
 		const facts = args.facts;
@@ -317,25 +244,14 @@ export const retry = mutation({
 	args: { channelId: v.id("channels") },
 	returns: v.union(v.object({ _yay: v.null() }), v.object({ _nay: chat_error })),
 	handler: async (ctx, args): Promise<chat_Result<null>> => {
-		const access = await transcripts_deletions_get_access(ctx, args.channelId);
+		const access = await get_access(ctx, args.channelId);
 		if (access._nay) return access;
 		if (!access._yay.canManage) return { _nay: { message: "A channel manager must retry Files sync." } };
-		const deletion = await ctx.db
-			.query("transcript_deletions")
-			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
-			.unique();
-		// A person asked, so start every loop again now with a fresh retry count.
-		if (deletion)
-			await ctx.db.patch("transcript_deletions", deletion._id, {
-				nextAttemptAt: Date.now(),
-				error: null,
-				errorCode: undefined,
-				retry: undefined,
-			});
 		const state = await ctx.db
 			.query("transcript_channels")
 			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
 			.unique();
+		// A person asked, so start every loop again now with a fresh retry count.
 		if (state)
 			await ctx.db.patch("transcript_channels", state._id, {
 				status: "pending",
@@ -358,15 +274,7 @@ export const retry = mutation({
 			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
 			.unique();
 		const run = destination?.runId ? await ctx.db.get("transcript_runs", destination.runId) : null;
-		if (destination?.readerRunId) {
-			const reader = await ctx.db.get("transcript_runs", destination.readerRunId);
-			if (reader) await transcripts_db_resume_readers(ctx, reader);
-		}
-		if (
-			run?.kind === "incremental" &&
-			run.readerSnapshot === null &&
-			["copy", "fold", "stage", "prepare", "validate"].includes(run.phase)
-		) {
+		if (run?.kind === "incremental" && ["copy", "fold", "stage", "prepare", "validate"].includes(run.phase)) {
 			// No publication has started. Read current manual text again without changing generated content.
 			await ctx.db.patch("transcript_destinations", destination!._id, { runId: null });
 		}
@@ -386,15 +294,9 @@ export const reconcile = mutation({
 	args: { channelId: v.id("channels"), clientRequestId: v.string() },
 	returns: v.union(v.object({ _yay: v.null() }), v.object({ _nay: chat_error })),
 	handler: async (ctx, args): Promise<chat_Result<null>> => {
-		const access = await transcripts_deletions_get_access(ctx, args.channelId);
+		const access = await get_access(ctx, args.channelId);
 		if (access._nay) return access;
 		if (!access._yay.canManage) return { _nay: { message: "A channel manager must rebuild the Files copy." } };
-		const deletion = await ctx.db
-			.query("transcript_deletions")
-			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
-			.unique();
-		if (deletion && deletion.archiveStartedAt !== null)
-			return { _nay: { message: "The saved transcripts are moving to Trash. Retry or reconnect Files to finish." } };
 		if (!chat_validate_request_id(args.clientRequestId)) return { _nay: { message: "Invalid request ID" } };
 		const request = await ctx.db
 			.query("transcript_requests")
@@ -420,13 +322,6 @@ export const reconcile = mutation({
 			.withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
 			.unique();
 		if (!destination || !state) return { _nay: { message: "Connect Files first." } };
-		if (deletion)
-			await ctx.db.patch("transcript_deletions", deletion._id, {
-				nextAttemptAt: Date.now(),
-				error: null,
-				errorCode: undefined,
-				retry: undefined,
-			});
 		const active = destination.runId ? await ctx.db.get("transcript_runs", destination.runId) : null;
 		const index = await ctx.db
 			.query("transcript_indexes")
@@ -480,14 +375,6 @@ export const reconcile = mutation({
 			outputCount: 0,
 			error: null,
 			createdAt: Date.now(),
-			readerReceiptId: null,
-			readerOriginalReceiptId: null,
-			readerSourceSecret: null,
-			readerRollbackSecret: null,
-			readerAttempt: 0,
-			readerRefresh: false,
-			readerStep: 0,
-			readerSnapshot: null,
 		});
 		await ctx.db.patch("transcript_destinations", destination._id, { runId });
 		await ctx.db.insert("transcript_requests", {

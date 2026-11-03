@@ -24,7 +24,6 @@
 		"workspace.files.read",
 		"workspace.files.write",
 		"workspace.files.own-write",
-		"workspace.files.own-access",
 		"workspace.files.manage-read-only",
 		"workspace.members.read"
 	],

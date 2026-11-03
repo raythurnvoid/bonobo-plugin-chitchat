@@ -32,7 +32,6 @@ export const chat_write_receipt = v.union(
 		membershipRevision: v.number(),
 		left: v.boolean(),
 		deleted: v.boolean(),
-		pending: v.boolean(),
 	}),
 );
 export const chat_write_result = v.union(v.object({ _yay: chat_write_receipt }), v.object({ _nay: chat_error }));
@@ -47,14 +46,8 @@ export const chat_transcript_operation = v.union(
 		renderedBlock: v.string(),
 		sourceRevision: v.number(),
 	}),
-	v.object({ kind: v.literal("header"), name: v.string(), topic: v.string(), isPrivate: v.boolean() }),
+	v.object({ kind: v.literal("header"), name: v.string(), topic: v.string() }),
 	v.object({ kind: v.literal("archive"), archived: v.boolean() }),
-	v.object({
-		kind: v.literal("readers"),
-		readerRevision: v.number(),
-		readers: v.array(v.object({ userId: v.string(), membershipLifetime: v.number() })),
-		deleted: v.boolean(),
-	}),
 );
 
 // Why transcript work stopped or waits. Only "temporary" retries by itself; every other code waits for a person.

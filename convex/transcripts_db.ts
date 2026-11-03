@@ -10,32 +10,17 @@ import {
 	chatbe_ROLLOVER_MAX_BYTES,
 } from "../shared/transcript-markdown";
 import schema from "./schema";
-import { transcripts_deletions_queue } from "./transcripts_deletions";
 import { transcripts_next_retry, transcripts_retry_delay, transcripts_wake } from "./transcripts_wake";
 import { chat_transcript_error_code } from "../shared/chat";
 
-async function pending_readers(ctx: MutationCtx, channelId: Id<"channels">) {
-	for (const status of ["pending", "running", "blocked"] as const) {
-		const job = await ctx.db
-			.query("transcript_jobs")
-			.withIndex("by_channel_kind_status_sequence", (q) =>
-				q.eq("channelId", channelId).eq("operation.kind", "readers").eq("status", status),
-			)
-			.first();
-		if (job) return true;
-	}
-	return false;
-}
-
-async function current_run(ctx: MutationCtx, runId: Id<"transcript_runs">, claim: string, acknowledge = false) {
+async function current_run(ctx: MutationCtx, runId: Id<"transcript_runs">, claim: string) {
 	const run = await ctx.db.get("transcript_runs", runId);
 	if (!run || run.claim !== claim || run.leaseUntil <= Date.now()) return null;
 	const destination = await ctx.db
 		.query("transcript_destinations")
 		.withIndex("by_channel", (q) => q.eq("channelId", run.channelId))
 		.unique();
-	if (!destination || (run.kind === "readers" ? destination.readerRunId : destination.runId) !== run._id) return null;
-	if (!acknowledge && run.kind !== "readers" && (await pending_readers(ctx, run.channelId))) return null;
+	if (!destination || destination.runId !== run._id) return null;
 	return { run, destination };
 }
 
@@ -55,13 +40,8 @@ export async function transcripts_db_claim(ctx: MutationCtx, channelId: Id<"chan
 		.unique();
 	if (!channel || !destination || !state) return null;
 	let run = destination.runId ? await ctx.db.get("transcript_runs", destination.runId) : null;
-	const readersPending = await pending_readers(ctx, channel._id);
-	const settleFence =
-		readersPending && run?.phase === "fence" && run.fenceUncertain && destination.readerRunId === null;
-	if (state.status === "blocked" && !settleFence) return null;
-	if (state.nextAttemptAt > Date.now() && !settleFence) return state.nextAttemptAt;
-	// Reader wake-ups must settle an earlier uncertain fence, even after a later permission refusal.
-	if (readersPending && !settleFence) return null;
+	if (state.status === "blocked") return null;
+	if (state.nextAttemptAt > Date.now()) return state.nextAttemptAt;
 	if (run && run.phase !== "complete" && run.leaseUntil > Date.now()) return run.leaseUntil;
 	if (!run || run.phase === "complete") {
 		if (state.appliedSequence >= state.desiredSequence) return null;
@@ -112,23 +92,14 @@ export async function transcripts_db_claim(ctx: MutationCtx, channelId: Id<"chan
 			outputCount: 0,
 			error: null,
 			createdAt: Date.now(),
-			readerReceiptId: null,
-			readerOriginalReceiptId: null,
-			readerSourceSecret: null,
-			readerRollbackSecret: null,
-			readerAttempt: 0,
-			readerRefresh: false,
-			readerStep: 0,
-			readerSnapshot: null,
 		});
 		run = (await ctx.db.get("transcript_runs", runId))!;
 		await ctx.db.patch("transcript_destinations", destination._id, { runId });
-		if (job.operation.kind !== "readers")
-			await ctx.db.patch("transcript_jobs", job._id, {
-				status: "running",
-				attempts: job.attempts + 1,
-				workerGeneration: state.workerGeneration,
-			});
+		await ctx.db.patch("transcript_jobs", job._id, {
+			status: "running",
+			attempts: job.attempts + 1,
+			workerGeneration: state.workerGeneration,
+		});
 	}
 	const claim = crypto.randomUUID();
 	const leaseUntil = Date.now() + 60_000;
@@ -163,7 +134,7 @@ export const claimed = internalQuery({
 			.withIndex("by_channel", (q) => q.eq("channelId", run.channelId))
 			.unique();
 		if (!channel || !destination) return null;
-		// Incremental and reader runs work on the one job at their barrier. A rebuild folds many jobs.
+		// An incremental run works on the one job at its barrier. A rebuild folds many jobs.
 		const job =
 			run.kind !== "reconcile"
 				? await ctx.db
@@ -186,7 +157,7 @@ export const release = internalMutation({
 	},
 	returns: v.null(),
 	handler: async (ctx, args) => {
-		const current = await current_run(ctx, args.runId, args.claim, true);
+		const current = await current_run(ctx, args.runId, args.claim);
 		if (!current) return;
 		const state = (await ctx.db
 			.query("transcript_channels")
@@ -240,7 +211,7 @@ export const advance = internalMutation({
 	},
 	returns: v.null(),
 	handler: async (ctx, args) => {
-		const current = await current_run(ctx, args.runId, args.claim, args.phase === "copy");
+		const current = await current_run(ctx, args.runId, args.claim);
 		if (!current) return;
 		await ctx.db.patch("transcript_runs", current.run._id, {
 			phase: args.phase,
@@ -258,7 +229,7 @@ export const mark_fence_sent = internalMutation({
 	args: { runId: v.id("transcript_runs"), claim: v.string() },
 	returns: v.boolean(),
 	handler: async (ctx, args) => {
-		const current = await current_run(ctx, args.runId, args.claim, true);
+		const current = await current_run(ctx, args.runId, args.claim);
 		if (!current || current.run.phase !== "fence") return false;
 		await ctx.db.patch("transcript_runs", current.run._id, { fenceUncertain: true });
 		return true;
@@ -415,7 +386,6 @@ export const fold = internalMutation({
 		let foldedSequence = run.foldedSequence;
 		for (const job of jobs) {
 			const operation = job.operation;
-			if (operation.kind === "readers") break;
 			if (operation.kind === "block") {
 				const existing = await ctx.db
 					.query("transcript_staged_blocks")
@@ -441,8 +411,7 @@ export const fold = internalMutation({
 						end: 0,
 						placed: false,
 					});
-			} else if (operation.kind === "header")
-				header = chatbe_channel_header(operation.name, operation.topic, operation.isPrivate);
+			} else if (operation.kind === "header") header = chatbe_channel_header(operation.name, operation.topic);
 			foldedSequence = job.sequence;
 		}
 		if (foldedSequence < run.barrier) {
@@ -478,20 +447,6 @@ export const fold = internalMutation({
 	},
 });
 
-export const next_job = internalQuery({
-	args: { runId: v.id("transcript_runs") },
-	returns: v.union(doc(schema, "transcript_jobs"), v.null()),
-	handler: async (ctx, args) => {
-		const run = (await ctx.db.get("transcript_runs", args.runId))!;
-		return await ctx.db
-			.query("transcript_jobs")
-			.withIndex("by_channel_sequence", (q) =>
-				q.eq("channelId", run.channelId).gt("sequence", run.foldedSequence).lte("sequence", run.barrier),
-			)
-			.first();
-	},
-});
-
 // #endregion source snapshots
 
 // #region output staging
@@ -508,7 +463,6 @@ async function save_output(ctx: MutationCtx, run: Doc<"transcript_runs">, order:
 		expectedParentNodeId: "",
 		expectedNodeId: null,
 		expectedContentRevision: null,
-		expectedReaderRevision: null,
 		operationId: `${run._id}:write:${order}`,
 		nodeId: null,
 		contentRevision: null,
@@ -590,19 +544,13 @@ export const prepare_write = internalMutation({
 		expectedParentNodeId: v.string(),
 		expectedNodeId: v.union(v.string(), v.null()),
 		expectedContentRevision: v.union(v.string(), v.null()),
-		expectedReaderRevision: v.union(v.number(), v.null()),
-		detached: v.boolean(),
 	},
 	returns: v.null(),
 	handler: async (ctx, args) => {
 		const current = await current_run(ctx, args.runId, args.claim);
 		if (!current) return;
-		const { runId: _run, claim: _claim, writeId, detached, ...preconditions } = args;
+		const { runId: _run, claim: _claim, writeId, ...preconditions } = args;
 		await ctx.db.patch("transcript_writes", writeId, { ...preconditions, status: "prepared" });
-		await ctx.db.patch("transcript_destinations", current.destination._id, {
-			readerRevision: args.expectedReaderRevision,
-			detached,
-		});
 	},
 });
 
@@ -733,320 +681,15 @@ export const output_for_order = internalQuery({
 
 // #endregion output staging
 
-// #region private reader changes
+// #region control jobs
 
-export async function transcripts_db_claim_readers(ctx: MutationCtx, channelId: Id<"channels">) {
-	const channel = await ctx.db.get("channels", channelId);
-	const destination = await ctx.db
-		.query("transcript_destinations")
-		.withIndex("by_channel", (q) => q.eq("channelId", channelId))
-		.unique();
-	if (!channel || !destination) return null;
-	let run = destination.readerRunId ? await ctx.db.get("transcript_runs", destination.readerRunId) : null;
-	if (!run && destination.runId) {
-		const fileRun = await ctx.db.get("transcript_runs", destination.runId);
-		// Wait for a claimed writer fence. Its own release wakes this channel again.
-		// If its lease ended and the fence call was never sent, nothing will release the claim. So go on as if it
-		// was released. An uncertain fence still waits, because the file claim settles it first.
-		if (fileRun?.phase === "fence" && fileRun.claim !== "") {
-			if (fileRun.leaseUntil > Date.now()) return fileRun.leaseUntil;
-			if (fileRun.fenceUncertain) return null;
-		}
-	}
-	if (run && run.phase !== "complete" && run.leaseUntil > Date.now()) return run.leaseUntil;
-	let job =
-		run && run.phase !== "complete"
-			? await ctx.db
-					.query("transcript_jobs")
-					.withIndex("by_channel_sequence", (q) => q.eq("channelId", channel._id).eq("sequence", run!.barrier))
-					.unique()
-			: null;
-	// A blocked reader change waits for Retry or Reconnect.
-	if (job?.status === "blocked") return null;
-	if (job && job.nextAttemptAt > Date.now()) return job.nextAttemptAt;
-	if (!job) {
-		job = await ctx.db
-			.query("transcript_jobs")
-			.withIndex("by_channel_kind_status_sequence", (q) =>
-				q.eq("channelId", channel._id).eq("operation.kind", "readers").eq("status", "pending"),
-			)
-			.first();
-		if (!job) return null;
-		const runId = await ctx.db.insert("transcript_runs", {
-			channelId: channel._id,
-			recoveryRunId: null,
-			barrier: job.sequence,
-			kind: "readers",
-			fenceUncertain: false,
-			phase: "copy",
-			writerGeneration: destination.writerGeneration,
-			leaseUntil: 0,
-			claim: "",
-			startOrder: destination.tailOrder,
-			endOrder: destination.tailOrder,
-			cursor: null,
-			foldedSequence: 0,
-			header: "",
-			outputOrder: 0,
-			buffer: "",
-			outputCount: 0,
-			error: null,
-			createdAt: Date.now(),
-			readerReceiptId: null,
-			readerOriginalReceiptId: null,
-			readerSourceSecret: null,
-			readerRollbackSecret: null,
-			readerAttempt: 0,
-			readerRefresh: false,
-			readerStep: 0,
-			readerSnapshot: null,
-		});
-		run = (await ctx.db.get("transcript_runs", runId))!;
-		await ctx.db.patch("transcript_destinations", destination._id, {
-			readerRunId: runId,
-			readerError: null,
-			readerErrorCode: undefined,
-		});
-	}
-	const claim = crypto.randomUUID();
-	const leaseUntil = Date.now() + 60_000;
-	await ctx.db.patch("transcript_runs", run!._id, { claim, leaseUntil });
-	await ctx.db.patch("transcript_jobs", job._id, {
-		status: "running",
-		nextAttemptAt: leaseUntil,
-		attempts: job.attempts + 1,
-	});
-	return { runId: run!._id, claim, leaseUntil };
-}
-
-// Start a stopped reader change again now, for Retry and for a new Files connection.
-export async function transcripts_db_resume_readers(ctx: MutationCtx, readerRun: Doc<"transcript_runs">) {
-	const job = await ctx.db
-		.query("transcript_jobs")
-		.withIndex("by_channel_sequence", (q) => q.eq("channelId", readerRun.channelId).eq("sequence", readerRun.barrier))
-		.unique();
-	if (job && job.status !== "complete")
-		await ctx.db.patch("transcript_jobs", job._id, {
-			status: job.status === "blocked" ? "running" : job.status,
-			nextAttemptAt: Date.now(),
-			retry: undefined,
-		});
-}
-
-export const release_readers = internalMutation({
-	args: {
-		runId: v.id("transcript_runs"),
-		claim: v.string(),
-		error: v.union(v.string(), v.null()),
-		errorCode: v.union(chat_transcript_error_code, v.null()),
-		retryAfterMs: v.union(v.number(), v.null()),
-	},
-	returns: v.null(),
-	handler: async (ctx, args) => {
-		const current = await current_run(ctx, args.runId, args.claim);
-		if (!current) return;
-		const job = (await ctx.db
-			.query("transcript_jobs")
-			.withIndex("by_channel_sequence", (q) =>
-				q.eq("channelId", current.run.channelId).eq("sequence", current.run.barrier),
-			)
-			.unique())!;
-		const retry = transcripts_next_retry(job.retry, args.errorCode);
-		const nextAttemptAt = Date.now() + (retry ? transcripts_retry_delay(retry.failures, args.retryAfterMs) : 0);
-		await ctx.db.patch("transcript_runs", current.run._id, { leaseUntil: 0, error: args.error });
-		// A temporary failure keeps the job running and waits. Any other failure blocks it until a person acts.
-		await ctx.db.patch("transcript_jobs", job._id, {
-			status: args.error && !retry ? "blocked" : "running",
-			error: args.error,
-			retry,
-			nextAttemptAt,
-		});
-		await ctx.db.patch("transcript_destinations", current.destination._id, {
-			readerError: args.error,
-			readerErrorCode: args.errorCode ?? undefined,
-		});
-		const state = await ctx.db
-			.query("transcript_channels")
-			.withIndex("by_channel", (q) => q.eq("channelId", current.run.channelId))
-			.unique();
-		if (state) await transcripts_wake(ctx, { channelStateId: state._id }, nextAttemptAt);
-	},
-});
-
-export const reader_context = internalQuery({
-	args: { channelId: v.id("channels"), readerRevision: v.number() },
-	returns: v.object({
-		channel: doc(schema, "channels"),
-		change: v.union(doc(schema, "channel_access_changes"), v.null()),
-		readers: v.array(v.object({ userId: v.string(), membershipLifetime: v.number() })),
-	}),
-	handler: async (ctx, args) => {
-		const channel = (await ctx.db.get("channels", args.channelId))!;
-		const change = await ctx.db
-			.query("channel_access_changes")
-			.withIndex("by_channel_status", (q) => q.eq("channelId", channel._id).eq("status", "pending"))
-			.unique();
-		const members = await ctx.db
-			.query("channel_members")
-			.withIndex("by_channel_hostUserId", (q) => q.eq("channelId", channel._id))
-			.take(50);
-		const readers = [];
-		for (const member of members) {
-			const current = await ctx.db
-				.query("workspace_members")
-				.withIndex("by_installation_hostUserId", (q) =>
-					q.eq("installationId", channel.installationId).eq("hostUserId", member.hostUserId),
-				)
-				.unique();
-			if (current?.active && !current.cleanupPending && current.membershipLifetime === member.membershipLifetime)
-				readers.push({ userId: member.hostUserId, membershipLifetime: member.membershipLifetime });
-		}
-		return { channel, change: change?.readerRevision === args.readerRevision ? change : null, readers };
-	},
-});
-
-export const stage_readers = internalMutation({
-	args: {
-		runId: v.id("transcript_runs"),
-		claim: v.string(),
-		revision: v.number(),
-		readers: v.array(v.object({ userId: v.string(), membershipLifetime: v.number() })),
-		compensation: v.boolean(),
-		refresh: v.optional(v.boolean()),
-		sourceSecret: v.optional(v.string()),
-	},
-	returns: v.null(),
-	handler: async (ctx, args) => {
-		const current = await current_run(ctx, args.runId, args.claim);
-		if (!current) return;
-		await ctx.db.patch("transcript_runs", current.run._id, {
-			readerSnapshot: { revision: args.revision, readers: args.readers },
-			readerStep: current.run.readerStep + (args.compensation ? 1 : 0),
-			readerRefresh: args.refresh ?? false,
-			readerReceiptId: null,
-			...(args.sourceSecret ? { readerSourceSecret: args.sourceSecret } : {}),
-		});
-	},
-});
-
-export const set_reader_rollback_source = internalMutation({
-	args: { runId: v.id("transcript_runs"), claim: v.string(), sourceSecret: v.string() },
-	returns: v.null(),
-	handler: async (ctx, args) => {
-		const current = await current_run(ctx, args.runId, args.claim);
-		if (current && current.run.readerStep > 0 && !current.run.readerReceiptId)
-			await ctx.db.patch("transcript_runs", current.run._id, { readerRollbackSecret: args.sourceSecret });
-	},
-});
-
-export const restart_readers = internalMutation({
-	args: { runId: v.id("transcript_runs"), claim: v.string(), sourceSecret: v.string() },
-	returns: v.null(),
-	handler: async (ctx, args) => {
-		const current = await current_run(ctx, args.runId, args.claim);
-		if (!current || !current.run.readerRefresh || !current.run.readerReceiptId) return;
-		const job = await ctx.db
-			.query("transcript_jobs")
-			.withIndex("by_channel_sequence", (q) =>
-				q.eq("channelId", current.run.channelId).eq("sequence", current.run.barrier),
-			)
-			.unique();
-		if (job?.operation.kind !== "readers") return;
-		await ctx.db.patch("transcript_runs", current.run._id, {
-			readerAttempt: current.run.readerAttempt + 1,
-			readerRefresh: false,
-			readerStep: 0,
-			readerSourceSecret: args.sourceSecret,
-			readerRollbackSecret: null,
-			readerReceiptId: null,
-			readerOriginalReceiptId: null,
-			readerSnapshot: { revision: job.operation.readerRevision, readers: job.operation.readers },
-		});
-	},
-});
-
-export const reader_receipt = internalMutation({
-	args: {
-		runId: v.id("transcript_runs"),
-		claim: v.string(),
-		receiptId: v.string(),
-		readerRevision: v.union(v.number(), v.null()),
-		detached: v.boolean(),
-	},
-	returns: v.null(),
-	handler: async (ctx, args) => {
-		const current = await current_run(ctx, args.runId, args.claim);
-		if (!current) return;
-		await ctx.db.patch("transcript_runs", current.run._id, {
-			readerReceiptId: args.receiptId,
-			...(current.run.readerStep === 0 ? { readerOriginalReceiptId: args.receiptId } : {}),
-		});
-		await ctx.db.patch("transcript_destinations", current.destination._id, {
-			readerRevision: args.readerRevision,
-			detached: args.detached,
-		});
-	},
-});
-
+// Finish a job that changes no file, for example an archive flag.
 export const complete_control = internalMutation({
-	args: {
-		runId: v.id("transcript_runs"),
-		claim: v.string(),
-		readerRevision: v.optional(v.number()),
-		foldedSequence: v.optional(v.number()),
-	},
+	args: { runId: v.id("transcript_runs"), claim: v.string() },
 	returns: v.null(),
 	handler: async (ctx, args) => {
 		const current = await current_run(ctx, args.runId, args.claim);
 		if (!current) return;
-		if (args.foldedSequence !== undefined) {
-			await ctx.db.patch("transcript_runs", current.run._id, {
-				foldedSequence: args.foldedSequence,
-				readerReceiptId: null,
-				readerOriginalReceiptId: null,
-				readerSourceSecret: null,
-				readerSnapshot: null,
-				readerStep: 0,
-			});
-			return;
-		}
-		if (current.run.kind === "readers") {
-			const job = (await ctx.db
-				.query("transcript_jobs")
-				.withIndex("by_channel_sequence", (q) =>
-					q.eq("channelId", current.run.channelId).eq("sequence", current.run.barrier),
-				)
-				.unique())!;
-			const channel = (await ctx.db.get("channels", current.run.channelId))!;
-			if (
-				job.operation.kind === "readers" &&
-				job.operation.deleted &&
-				current.run.readerStep === 0 &&
-				channel.deletedAt !== null &&
-				channel.membershipRevision === job.operation.readerRevision
-			)
-				await transcripts_deletions_queue(ctx, channel, job.sequence, job.operation.readerRevision);
-			await ctx.db.patch("transcript_jobs", job._id, { status: "complete", error: null });
-			await ctx.db.patch("transcript_destinations", current.destination._id, { readerRunId: null, readerError: null });
-			await ctx.db.delete("transcript_runs", current.run._id);
-			if (current.destination.runId) {
-				const fileRun = await ctx.db.get("transcript_runs", current.destination.runId);
-				if (fileRun && fileRun.phase !== "complete")
-					await ctx.db.patch("transcript_runs", fileRun._id, { leaseUntil: 0 });
-			}
-			const state = await ctx.db
-				.query("transcript_channels")
-				.withIndex("by_channel", (q) => q.eq("channelId", current.run.channelId))
-				.unique();
-			if (state)
-				await ctx.db.patch("transcript_channels", state._id, {
-					...(state.status !== "blocked" ? { status: "pending" as const, nextAttemptAt: Date.now() } : {}),
-					...(args.readerRevision !== undefined ? { readerRevision: args.readerRevision } : {}),
-				});
-			// The file run or a deletion may wait for this reader change.
-			if (state) await transcripts_wake(ctx, { channelStateId: state._id }, Date.now());
-			return;
-		}
 		const state = (await ctx.db
 			.query("transcript_channels")
 			.withIndex("by_channel", (q) => q.eq("channelId", current.run.channelId))
@@ -1066,7 +709,6 @@ export const complete_control = internalMutation({
 			errorCode: undefined,
 			retry: undefined,
 			nextAttemptAt: Date.now(),
-			...(args.readerRevision !== undefined ? { readerRevision: args.readerRevision } : {}),
 		});
 		await ctx.db.patch("transcript_runs", current.run._id, { phase: "complete" });
 		await ctx.scheduler.runAfter(0, internal.transcripts_cleanup.channel, {
@@ -1077,7 +719,7 @@ export const complete_control = internalMutation({
 	},
 });
 
-// #endregion private reader changes
+// #endregion control jobs
 
 // #region publication
 
@@ -1091,7 +733,7 @@ export const save_receipt = internalMutation({
 	},
 	returns: v.null(),
 	handler: async (ctx, args) => {
-		const current = await current_run(ctx, args.runId, args.claim, true);
+		const current = await current_run(ctx, args.runId, args.claim);
 		if (!current) return;
 		const write = (await ctx.db.get("transcript_writes", args.writeId))!;
 		const source =
@@ -1146,7 +788,7 @@ export const advance_recovery_archive = internalMutation({
 	args: { runId: v.id("transcript_runs"), claim: v.string(), fileId: v.id("transcript_files"), archived: v.boolean() },
 	returns: v.null(),
 	handler: async (ctx, args) => {
-		const current = await current_run(ctx, args.runId, args.claim, true);
+		const current = await current_run(ctx, args.runId, args.claim);
 		if (!current || current.run.phase !== "recover") return;
 		const previous = (await ctx.db.get("transcript_runs", current.run.recoveryRunId!))!;
 		const file = (await ctx.db.get("transcript_files", args.fileId))!;

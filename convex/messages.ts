@@ -39,7 +39,7 @@ export async function messages_get_access(
 	return { _yay: { ...access._yay, message } };
 }
 
-export async function messages_queue_block(ctx: MutationCtx, message: Doc<"messages">) {
+export async function messages_queue_block(ctx: MutationCtx, channel: Doc<"channels">, message: Doc<"messages">) {
 	const root = message.rootMessageId === null ? message : await ctx.db.get("messages", message.rootMessageId);
 	if (!root) throw new Error("Reply root is missing");
 	const counts = await ctx.db
@@ -51,7 +51,7 @@ export async function messages_queue_block(ctx: MutationCtx, message: Doc<"messa
 		indent: message.rootMessageId === null ? "" : "  ",
 		reactionCounts: new Map(counts.map((entry) => [entry.token, entry.count])),
 	});
-	await channels_queue_transcript(ctx, message.channelId, {
+	await channels_queue_transcript(ctx, channel, {
 		kind: "block",
 		messageId: message._id,
 		rootSequence: root.sequence,
@@ -238,7 +238,7 @@ async function send_message(
 	const message = (await ctx.db.get("messages", messageId))!;
 	await update_author_activity(ctx, message);
 	await update_mentions(ctx, message);
-	await messages_queue_block(ctx, message);
+	await messages_queue_block(ctx, channel, message);
 	const result = { kind: "message" as const, messageId, revision: 1, sequence };
 	await channels_save_request(ctx, {
 		installationId: channel.installationId,
@@ -414,7 +414,7 @@ export const edit = mutation({
 			revision: updated.revision,
 		});
 		await update_mentions(ctx, updated);
-		await messages_queue_block(ctx, updated);
+		await messages_queue_block(ctx, access._yay.channel, updated);
 		const result = {
 			kind: "message" as const,
 			messageId: message._id,
@@ -482,7 +482,7 @@ export const remove = mutation({
 			}
 			await update_author_activity(ctx, updated);
 			await update_mentions(ctx, updated);
-			await messages_queue_block(ctx, updated);
+			await messages_queue_block(ctx, access._yay.channel, updated);
 		}
 		const result = { kind: "message" as const, messageId: message._id, revision, sequence: message.sequence };
 		await channels_save_request(ctx, {

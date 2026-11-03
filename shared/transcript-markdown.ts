@@ -4,13 +4,6 @@ import { chat_ANONYMOUS_MEMBER_LABEL, chat_REACTION_EMOJI } from "./chat-display
 
 const MISSING_NAME = chat_ANONYMOUS_MEMBER_LABEL;
 
-/**
- * File sharing starts with the channel's readers. A file manager can change it for later
- * updates too. Keep this file-header wording separate from the chat-page disclosure.
- */
-const PRIVATE_DISCLOSURE =
-	"This copy starts with access for the channel's members and the organization owner. File managers can change its sharing, including who can read later updates.";
-
 // Every published part must fit the same UTF-8 byte guard.
 export const chatbe_ROLLOVER_MAX_BYTES = 100_000;
 
@@ -85,8 +78,8 @@ export async function chatbe_sha256_hex(text: string) {
 
 /**
  * The slug used when the plain channel-name slug is already taken by another channel. Hash the
- * full key: UUID prefixes collide at large channel counts, while this fixed digest keeps public
- * file names and private folder names stable and bounded.
+ * full key: UUID prefixes collide at large channel counts, while this fixed digest keeps
+ * transcript file names stable and bounded.
  */
 export async function chatbe_collision_slug(channelName: string, channelKey: string) {
 	const base = slug_channel_name(channelName);
@@ -148,13 +141,11 @@ export function chatbe_format_message_block(args: {
 	return lines.join("\n").replace(/\r\n?/g, "\n");
 }
 
-export function chatbe_channel_header(channelName: string, topic: string | null, isPrivate: boolean) {
+export function chatbe_channel_header(channelName: string, topic: string | null) {
 	const lines = [
 		`# ${channelName}`,
 		"",
-		isPrivate
-			? `Private Chitchat channel. ${PRIVATE_DISCLOSURE} This file is a derived copy. Edit chat in the Chitchat page, not here.`
-			: "Public Chitchat channel. This file is a derived copy. Edit chat in the Chitchat page, not here.",
+		"Public Chitchat channel. This file is a derived copy. Edit chat in the Chitchat page, not here.",
 	];
 	if (topic !== null && topic !== "") {
 		lines.push("", topic);
@@ -179,8 +170,8 @@ export function chatbe_readme_markdown(channels: { name: string; slug: string }[
 		"These files are a derived copy of Chitchat channels in this workspace.",
 		"",
 		"- Edit chat in the Chitchat page. File edits do not change chat and may be replaced by later updates.",
-		"- Private channels appear under `private/`. New channel folders allow the channel's members and the organization owner to read them.",
-		"- File managers can change sharing. Later updates follow that sharing, even if channel membership changes.",
+		"- Private channels get no copy here, because every person who can open this folder can read these files.",
+		"- File managers can change sharing. Later updates follow that sharing.",
 		"- Author names are a snapshot written with each message. A rename shows up on later messages.",
 		"- New files and folders start locked. File managers can unlock them or apply their own lock to stop plugin writes.",
 		"- The `plugin-name` metadata label lets Chitchat update a file or reuse a folder. Removing it stops those operations. The `source` label is only a description.",

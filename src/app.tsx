@@ -311,42 +311,6 @@ function ThreadsView(props: {
 	);
 }
 
-function TranscriptDeletionsView(props: {
-	client: BonoboClient;
-	scopeKey: string;
-	session: ReturnType<typeof use_chat_session>;
-}) {
-	const page = use_chat_page(props.scopeKey);
-	const rows = use_chat_query(props.session, api.transcripts.list_deletions, {
-		paginationOpts: { numItems: 20, cursor: page.cursor },
-	});
-	return (
-		<section className="view" aria-label="Files sync">
-			<header className="view-head">
-				<h2 className="view-title">Deleted channel copies</h2>
-			</header>
-			<p className="view-note">Finish saving and moving the Files copies for deleted channels to Trash.</p>
-			{!rows ? (
-				<p className="channel-status" role="status">
-					Checking Files sync…
-				</p>
-			) : rows.page.length === 0 ? (
-				<p className="channel-status">No deleted channel copies need attention on this page.</p>
-			) : (
-				<ul className="view-rows">
-					{rows.page.map((row) => (
-						<li key={row.channelId} className="view-row">
-							<h3 className="view-row-title">#{row.name}</h3>
-							<TranscriptStatus client={props.client} channelId={row.channelId} />
-						</li>
-					))}
-				</ul>
-			)}
-			<ChatPageControls page={page} result={rows} label="Deleted channel copies" />
-		</section>
-	);
-}
-
 // #endregion overview views
 
 // #region sidebar
@@ -564,7 +528,7 @@ export function App(props: { client: BonoboClient }) {
 	);
 	const [selection, setSelection] = useState<
 		| { kind: "channel"; id: Id<"channels">; openedAtReadSequence: number }
-		| { kind: "unreads" | "activity" | "threads" | "transcripts" }
+		| { kind: "unreads" | "activity" | "threads" }
 		| null
 	>(null);
 	const [threadRootId, setThreadRootId] = useState<Id<"messages"> | null>(null);
@@ -854,7 +818,7 @@ export function App(props: { client: BonoboClient }) {
 						</button>
 					</div>
 					<ul className="view-list" aria-label="Views">
-						{(["unreads", "threads", "activity", "transcripts"] as const).map((kind) => (
+						{(["unreads", "threads", "activity"] as const).map((kind) => (
 							<li key={kind} className="view-item">
 								<button
 									type="button"
@@ -870,15 +834,13 @@ export function App(props: { client: BonoboClient }) {
 										setSelection({ kind });
 										setThreadRootId(null);
 										setDrawerOpen(false);
-										announce(`Opened ${kind === "transcripts" ? "Files sync" : kind}`);
+										announce(`Opened ${kind}`);
 									}}
 								>
 									<span className="channel-initial" aria-hidden="true">
-										{kind === "transcripts" ? "F" : kind[0].toUpperCase()}
+										{kind[0].toUpperCase()}
 									</span>
-									<span className="channel-name">
-										{kind === "transcripts" ? "Files sync" : kind[0].toUpperCase() + kind.slice(1)}
-									</span>
+									<span className="channel-name">{kind[0].toUpperCase() + kind.slice(1)}</span>
 									{kind === "unreads" && unreadCount > 0 ? (
 										<span className="mention-badge">
 											{unreadCount}
@@ -933,7 +895,8 @@ export function App(props: { client: BonoboClient }) {
 			</nav>
 			<main className="main" tabIndex={-1}>
 				<div className="main-notices" inert={threadCoversPage || undefined}>
-					{selectedId ? (
+					{/* Private channels get no Files transcript, so they show no Files status. */}
+					{selectedId && channel?.visibility === "public" ? (
 						<TranscriptStatus key={`transcript:${selectedId}`} client={props.client} channelId={selectedId} />
 					) : null}
 					{/* A syncing pause is not an error. It asks again by itself, so it has no Reconnect button. */}
@@ -962,8 +925,6 @@ export function App(props: { client: BonoboClient }) {
 					/>
 				) : selection?.kind === "threads" ? (
 					<ThreadsView scopeKey={scopeKey} session={session} memberNames={memberNames} onOpen={open_channel} />
-				) : selection?.kind === "transcripts" ? (
-					<TranscriptDeletionsView client={props.client} scopeKey={scopeKey} session={session} />
 				) : selection?.kind === "channel" ? (
 					<ChannelView
 						key={`channel:${selection.id}`}

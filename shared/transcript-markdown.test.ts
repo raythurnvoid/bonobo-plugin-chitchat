@@ -12,7 +12,7 @@ import {
 } from "./transcript-markdown";
 
 describe("chatbe_format_message_block", () => {
-	test("keeps the exact private header, UTC timestamp, marker and reply indent", () => {
+	test("keeps the exact header, UTC timestamp, marker and reply indent", () => {
 		const root = chatbe_format_message_block({
 			message: {
 				marker: "chan-1:msg1",
@@ -39,11 +39,11 @@ describe("chatbe_format_message_block", () => {
 			indent: "  ",
 			reactionCounts: new Map(),
 		});
-		expect([chatbe_channel_header("general", "Daily talk", true), root, reply].join("\n\n")).toBe(
+		expect([chatbe_channel_header("general", "Daily talk"), root, reply].join("\n\n")).toBe(
 			[
 				"# general",
 				"",
-				"Private Chitchat channel. This copy starts with access for the channel's members and the organization owner. File managers can change its sharing, including who can read later updates. This file is a derived copy. Edit chat in the Chitchat page, not here.",
+				"Public Chitchat channel. This file is a derived copy. Edit chat in the Chitchat page, not here.",
 				"",
 				"Daily talk",
 				"",
@@ -148,9 +148,8 @@ describe("chatbe_readme_markdown", () => {
 
 		expect(markdown.indexOf("- [general](./general.md)")).toBeLessThan(markdown.indexOf("- [zebra](./zebra.md)"));
 		expect(markdown).toContain("derived copy");
-		expect(markdown).toContain("Later updates follow that sharing, even if channel membership changes.");
+		expect(markdown).toContain("Private channels get no copy here");
 		expect(markdown).toContain("File managers can unlock them or apply their own lock");
 		expect(markdown).toContain("The `source` label is only a description.");
-		expect(markdown).not.toContain("resets each folder's sharing");
 	});
 });

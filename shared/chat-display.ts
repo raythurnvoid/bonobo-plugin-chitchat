@@ -26,7 +26,7 @@ export const chat_REACTION_LABELS: Record<chat_ReactionToken, string> = {
 };
 
 export const chat_PRIVATE_CHANNEL_DISCLOSURE =
-	"Only the people added here and the organization owner can read this channel. Its copies in Files have separate sharing settings. File managers can share those copies, including later updates, with other people.";
+	"Only the people added here and the organization owner can read this channel. Chitchat does not save private channels to Files.";
 
 export const chat_ANONYMOUS_MEMBER_LABEL = "Someone with no name yet";
 

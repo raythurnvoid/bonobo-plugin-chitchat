@@ -129,25 +129,6 @@ export default defineSchema({
 		.index("by_channel_hostUserId", ["channelId", "hostUserId"])
 		.index("by_installation_hostUserId_channel", ["installationId", "hostUserId", "channelId"])
 		.index("by_installation_hostUserId_membershipLifetime", ["installationId", "hostUserId", "membershipLifetime"]),
-	channel_access_changes: defineTable({
-		channelId: v.id("channels"),
-		installationId: v.id("installations"),
-		actorHostUserId: v.string(),
-		actorLifetime: v.number(),
-		clientRequestId: v.string(),
-		operation: v.string(),
-		fingerprint: v.string(),
-		expectedMembershipRevision: v.number(),
-		readerRevision: v.number(),
-		principals: v.array(v.object({ hostUserId: v.string(), membershipLifetime: v.number(), level: chat_member_level })),
-		deleted: v.boolean(),
-		left: v.boolean(),
-		status: v.union(v.literal("pending"), v.literal("complete"), v.literal("cancelled")),
-		createdAt: v.number(),
-		hostReceiptId: v.union(v.string(), v.null()),
-	})
-		.index("by_channel_status", ["channelId", "status"])
-		.index("by_installation_actorHostUserId_clientRequestId", ["installationId", "actorHostUserId", "clientRequestId"]),
 	messages: defineTable({
 		installationId: v.id("installations"),
 		channelId: v.id("channels"),
@@ -271,62 +252,21 @@ export default defineSchema({
 		errorCode: error_code,
 		retry,
 		nextAttemptAt: v.number(),
-		readerRevision: v.number(),
-		// File runs, reader jobs, and deletions of this channel share this wake-up.
+		// File runs of this channel share this wake-up.
 		wakeJobId: wake_job_id,
 	}).index("by_channel", ["channelId"]),
-	// Deletion waits for its accepted copies, then moves exact transcript files to Trash in bounded steps.
-	transcript_deletions: defineTable({
-		channelId: v.id("channels"),
-		installationId: v.id("installations"),
-		actorHostUserId: v.union(v.string(), v.null()),
-		actorLifetime: v.union(v.number(), v.null()),
-		barrier: v.number(),
-		archiveStartedAt: v.union(v.number(), v.null()),
-		completedAt: v.union(v.number(), v.null()),
-		cursor: v.number(),
-		claim: v.string(),
-		leaseUntil: v.number(),
-		nextAttemptAt: v.number(),
-		error: v.union(v.string(), v.null()),
-		errorCode: error_code,
-		retry,
-		prepared: v.union(
-			v.object({
-				fileId: v.id("transcript_files"),
-				order: v.number(),
-				path: v.string(),
-				nodeId: v.string(),
-				writerGeneration: v.number(),
-				operationId: v.string(),
-			}),
-			v.null(),
-		),
-	})
-		.index("by_channel", ["channelId"])
-		.index("by_installation_completedAt", ["installationId", "completedAt"])
-		.index("by_installation_actor_lifetime_completedAt", ["installationId", "actorHostUserId", "actorLifetime", "completedAt"]),
 	transcript_jobs: defineTable({
 		channelId: v.id("channels"),
 		sequence: v.number(),
 		operation: chat_transcript_operation,
-		status: v.union(
-			v.literal("pending"),
-			v.literal("running"),
-			v.literal("blocked"),
-			v.literal("complete"),
-			v.literal("superseded"),
-		),
+		status: v.union(v.literal("pending"), v.literal("running"), v.literal("complete"), v.literal("superseded")),
 		attempts: v.number(),
 		nextAttemptAt: v.number(),
 		workerGeneration: v.number(),
 		createdAt: v.number(),
 		error: v.union(v.string(), v.null()),
-		// Reader jobs count their temporary failures here.
-		retry,
 	})
 		.index("by_channel_sequence", ["channelId", "sequence"])
-		.index("by_channel_kind_status_sequence", ["channelId", "operation.kind", "status", "sequence"])
 		.index("by_status_nextAttemptAt", ["status", "nextAttemptAt"]),
 	transcript_indexes: defineTable({
 		installationId: v.id("installations"),
@@ -407,20 +347,15 @@ export default defineSchema({
 		folderNodeId: v.string(),
 		folderPath: v.string(),
 		writerGeneration: v.number(),
-		readerRevision: v.union(v.number(), v.null()),
-		detached: v.boolean(),
 		header: v.string(),
 		tailOrder: v.number(),
 		runId: v.union(v.id("transcript_runs"), v.null()),
-		readerRunId: v.union(v.id("transcript_runs"), v.null()),
-		readerError: v.union(v.string(), v.null()),
-		readerErrorCode: error_code,
 	}).index("by_channel", ["channelId"]),
 	transcript_runs: defineTable({
 		channelId: v.id("channels"),
 		recoveryRunId: v.union(v.id("transcript_runs"), v.null()),
 		barrier: v.number(),
-		kind: v.union(v.literal("incremental"), v.literal("reconcile"), v.literal("readers")),
+		kind: v.union(v.literal("incremental"), v.literal("reconcile")),
 		fenceUncertain: v.boolean(),
 		phase: v.union(
 			v.literal("recover"),
@@ -451,20 +386,6 @@ export default defineSchema({
 		outputCount: v.number(),
 		error: v.union(v.string(), v.null()),
 		createdAt: v.number(),
-		readerReceiptId: v.union(v.string(), v.null()),
-		readerOriginalReceiptId: v.union(v.string(), v.null()),
-		readerSourceSecret: v.union(v.string(), v.null()),
-		readerRollbackSecret: v.union(v.string(), v.null()),
-		readerAttempt: v.number(),
-		readerRefresh: v.boolean(),
-		readerStep: v.number(),
-		readerSnapshot: v.union(
-			v.object({
-				revision: v.number(),
-				readers: v.array(v.object({ userId: v.string(), membershipLifetime: v.number() })),
-			}),
-			v.null(),
-		),
 	}).index("by_channel", ["channelId"]),
 	transcript_files: defineTable({
 		channelId: v.id("channels"),
@@ -524,7 +445,6 @@ export default defineSchema({
 		expectedParentNodeId: v.string(),
 		expectedNodeId: v.union(v.string(), v.null()),
 		expectedContentRevision: v.union(v.string(), v.null()),
-		expectedReaderRevision: v.union(v.number(), v.null()),
 		operationId: v.string(),
 		nodeId: v.union(v.string(), v.null()),
 		contentRevision: v.union(v.string(), v.null()),

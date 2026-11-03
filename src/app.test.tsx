@@ -213,7 +213,7 @@ function query_answer(name: string, args: Record<string, unknown>): unknown {
 			membershipRevision: 1,
 			memberCount: 2,
 		};
-	else if (name === "channel_members:status" || name === "transcripts:status") result = null;
+	else if (name === "transcripts:status") result = null;
 	else throw new Error(`Unhandled native query ${name}`);
 	fake.cache.set(key, result);
 	return result;
@@ -329,36 +329,6 @@ describe("App", () => {
 		expect(document.querySelector("[data-chitchat-connection]")?.getAttribute("data-chitchat-connection")).toBe(
 			"syncing",
 		);
-	});
-	test("keeps Files recovery reachable after a channel is deleted", async () => {
-		fake.overrides.set("transcripts:list_deletions", {
-			page: [{ channelId: "deleted-channel", name: "Old team" }],
-			continueCursor: "",
-			isDone: true,
-		});
-		fake.overrides.set("transcripts:status", {
-			status: "blocked",
-			deletionPhase: "copy",
-			canConnect: true,
-			canReconcile: false,
-			indexStatus: "ready",
-			folderPath: "/chitchat/private/old-team",
-			folderNodeId: "folder",
-			readerMode: "attached",
-			error: "File is locked",
-		});
-		render(<App client={client()} />);
-		fireEvent.click(screen.getByRole("button", { name: "Files sync" }));
-		expect(screen.getByRole("heading", { name: "#Old team" })).toBeTruthy();
-		expect(screen.getByText("Channel deleted. Its Files copies need attention.")).toBeTruthy();
-		fireEvent.click(screen.getByRole("button", { name: "Retry sync" }));
-		await waitFor(() =>
-			expect(fake.mutation).toHaveBeenCalledWith("transcripts:retry", { channelId: "deleted-channel" }),
-		);
-		fake.overrides.set("transcripts:list_deletions", { page: [], continueCursor: "", isDone: true });
-		publish();
-		expect(screen.getByText("No deleted channel copies need attention on this page.")).toBeTruthy();
-		expect(screen.queryByRole("button", { name: "Retry sync" })).toBeNull();
 	});
 	test("keeps channel pages, menu choices, and focus through a verified refresh", async () => {
 		fake.channels.push(
@@ -762,7 +732,6 @@ describe("App", () => {
 			indexStatus: "ready",
 			error: null,
 			indexError: null,
-			readerMode: "unconfigured",
 		});
 		render(<App client={client()} />);
 		fireEvent.click(screen.getByRole("button", { name: "#general" }));
@@ -854,7 +823,6 @@ describe("App", () => {
 				indexStatus: "ready",
 				error: null,
 				indexError: null,
-				readerMode: "attached",
 			});
 			const host = client();
 			vi.mocked(host.fetchJson).mockResolvedValue({ status: 200, body: { items: [], cursor: null, isDone: true } });
@@ -1195,7 +1163,9 @@ describe("ChannelPeopleDialog", () => {
 		expect(document.body.textContent).not.toContain("private-room");
 	});
 	test("a manager changes a person's level with the displayed revision and count", async () => {
-		fake.mutation.mockResolvedValue({ _yay: { kind: "membership", pending: true } });
+		fake.mutation.mockResolvedValue({
+			_yay: { kind: "membership", channelId: "private-room", membershipRevision: 2, left: false, deleted: false },
+		});
 		render(<ChannelPeopleDialog channelId={"private-room" as Id<"channels">} selfUserId="alice" onClose={vi.fn()} />);
 		fireEvent.change(screen.getByRole("combobox", { name: "Access for Bob" }), { target: { value: "read" } });
 		await waitFor(() =>
@@ -1209,23 +1179,9 @@ describe("ChannelPeopleDialog", () => {
 				}),
 			),
 		);
-		fake.overrides.set("channel_members:status", {
-			status: "pending",
-			left: false,
-			deleted: false,
-			membershipRevision: 2,
-		});
-		publish();
-		const waiting = screen.getByText("Updating channel and transcript access…");
-		expect((screen.getByRole("checkbox", { name: "Carol" }) as HTMLInputElement).disabled).toBe(true);
-		const statusQuery = queries("channel_members:status")[0];
-		fake.session.ready = false;
-		fake.session.refreshing = true;
-		fake.session.canSend = false;
-		fake.overrides.set("channel_members:status", null);
-		publish();
-		expect(screen.getByText("Updating channel and transcript access…")).toBe(waiting);
-		expect(queries("channel_members:status")).toEqual([statusQuery]);
+		await waitFor(() =>
+			expect((screen.getByRole("checkbox", { name: "Carol" }) as HTMLInputElement).disabled).toBe(false),
+		);
 	});
 	test("keeps an uncertain membership request locked and retries it unchanged", async () => {
 		fake.mutation.mockRejectedValueOnce(new Error("Lost response"));
@@ -1236,22 +1192,6 @@ describe("ChannelPeopleDialog", () => {
 		fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 		await waitFor(() => expect(fake.mutation).toHaveBeenCalledTimes(2));
 		expect(fake.mutation.mock.calls[1][1]).toEqual(fake.mutation.mock.calls[0][1]);
-	});
-	test("shows a cancelled change and unlocks the current people list", async () => {
-		render(<ChannelPeopleDialog channelId={"private-room" as Id<"channels">} selfUserId="alice" onClose={vi.fn()} />);
-		fireEvent.click(screen.getByRole("button", { name: "Remove" }));
-		await waitFor(() => expect(fake.mutation).toHaveBeenCalledTimes(1));
-		fake.overrides.set("channel_members:status", {
-			status: "cancelled",
-			membershipRevision: 1,
-			left: false,
-			deleted: false,
-		});
-		publish();
-		expect(
-			screen.getByText("Access changed before this request finished. Check the people list and try again."),
-		).toBeTruthy();
-		expect((screen.getByRole("combobox", { name: "Access for Bob" }) as HTMLSelectElement).disabled).toBe(false);
 	});
 	test("readers can inspect people without seeing management controls", () => {
 		fake.overrides.set("channels:permissions", { canWrite: false, canManage: false });
@@ -1310,10 +1250,12 @@ describe("ChannelActionDialog", () => {
 		expect(fake.mutation).toHaveBeenCalledTimes(2);
 		expect(fake.mutation.mock.calls[1][1]).toEqual(fake.mutation.mock.calls[0][1]);
 	});
-	test("allows a read-only member to leave and waits for the reader receipt", async () => {
+	test("allows a read-only member to leave", async () => {
 		fake.session.canSend = false;
 		fake.overrides.set("channels:permissions", { canWrite: false, canManage: false });
-		fake.mutation.mockResolvedValue({ _yay: { kind: "membership", pending: true } });
+		fake.mutation.mockResolvedValue({
+			_yay: { kind: "membership", channelId: "private-room", membershipRevision: 2, left: false, deleted: false },
+		});
 		const onDone = vi.fn();
 		render(
 			<ChannelActionDialog
@@ -1330,15 +1272,7 @@ describe("ChannelActionDialog", () => {
 				expect.objectContaining({ expectedMembershipRevision: 7, expectedPrincipalCount: 4 }),
 			),
 		);
-		expect(onDone).not.toHaveBeenCalled();
-		fake.overrides.set("channel_members:status", {
-			status: "complete",
-			membershipRevision: 8,
-			left: true,
-			deleted: false,
-		});
-		publish();
-		expect(onDone).toHaveBeenCalledTimes(1);
+		await waitFor(() => expect(onDone).toHaveBeenCalledTimes(1));
 	});
 	test("explains last-person deletion and sends the reviewed principal count", async () => {
 		render(
@@ -1373,7 +1307,11 @@ describe("ChannelActionDialog", () => {
 		fireEvent.click(screen.getByRole("button", { name: "Delete channel" }));
 		fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
 		expect(onClose).not.toHaveBeenCalled();
-		await act(async () => pending.resolve({ _yay: { kind: "membership", pending: true } }));
+		await act(async () =>
+			pending.resolve({
+				_yay: { kind: "membership", channelId: "private-room", membershipRevision: 2, left: false, deleted: false },
+			}),
+		);
 		fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
 		expect(onClose).toHaveBeenCalledTimes(1);
 	});
@@ -1410,7 +1348,6 @@ describe("TranscriptStatus", () => {
 			canReconcile: true,
 			folderPath: "/fresh-transcripts/general",
 			folderNodeId: "folder-general",
-			readerMode: "manual",
 			error: "A file marker is missing",
 			errorCode: null,
 			channelName: "general",
@@ -1436,7 +1373,6 @@ describe("TranscriptStatus", () => {
 		expect(screen.getByRole("status").textContent).toBe("Chat is saved. Transcript sync needs attention.");
 		fireEvent.click(screen.getByText("Transcript details"));
 		expect(screen.getByText("A file marker is missing")).toBeTruthy();
-		expect(screen.getByText("Files sharing is managed in Bonobo Senate.")).toBeTruthy();
 		expect(screen.getByText("/fresh-transcripts/general")).toBeTruthy();
 	});
 	test("keeps open transcript details and their query during a verified session refresh", () => {
@@ -1494,7 +1430,7 @@ describe("TranscriptStatus", () => {
 		render_status();
 		fake.overrides.set(
 			"transcripts:status",
-			status({ folderNodeId: null, canReconcile: false, readerMode: "unconfigured", error: "Permission denied" }),
+			status({ folderNodeId: null, canReconcile: false, error: "Permission denied" }),
 		);
 		publish();
 		fireEvent.click(screen.getByText("Transcript details"));
@@ -1506,13 +1442,6 @@ describe("TranscriptStatus", () => {
 		expect(document.body.textContent).not.toContain("open this folder");
 		expect(fake.action).not.toHaveBeenCalled();
 		expect(fake.mutation).not.toHaveBeenCalled();
-	});
-	test("asks for Can manage on an existing folder so private readers can be updated", () => {
-		render_status();
-		fireEvent.click(screen.getByText("Transcript details"));
-		expect(screen.getByText(/Give the Chitchat service account Can manage, then reconnect/)).toBeTruthy();
-		expect(document.body.textContent).not.toContain("Planned folder");
-		expect(document.body.textContent).not.toContain("ask a workspace admin to connect");
 	});
 	test("an expired Files connection offers Reconnect but not Retry", () => {
 		render_status();

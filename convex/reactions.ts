@@ -76,7 +76,7 @@ export const set = mutation({
 				if (nextCount === 0) await ctx.db.delete("reaction_counts", count._id);
 				else await ctx.db.patch("reaction_counts", count._id, { count: nextCount });
 			} else await ctx.db.insert("reaction_counts", { messageId: message._id, token: args.token, count: nextCount });
-			await messages_queue_block(ctx, message);
+			await messages_queue_block(ctx, access._yay.channel, message);
 		}
 		const result = { kind: "reaction" as const, messageId: message._id, token: args.token, on: args.on };
 		await channels_save_request(ctx, {

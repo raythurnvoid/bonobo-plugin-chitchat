@@ -436,7 +436,6 @@ export const run = internalAction({
 								sequence: run.barrier + 1,
 								expectedNodeId: run.expectedNodeId,
 								expectedContentRevision: run.expectedContentRevision,
-								expectedReaderRevision: null,
 								contentHash: await chatbe_sha256_hex(run.content),
 							},
 						},
