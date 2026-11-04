@@ -97,11 +97,11 @@ A successful **Connect Files** also selects that connection for the shared READM
 
 New output starts with Chitchat labels and a plugin lock. Removing its label, moving or replacing a pinned folder, removing account access, or applying a human lock can block sync. Repeated setup never repairs those choices. Chitchat never changes sharing. The Files UI owns it.
 
-Removing workspace chat read permission does not revoke a separate Files grant while workspace and channel membership remain active. Removing the workspace membership invalidates attached transcript grants from that membership lifetime.
+Removing workspace chat read permission does not revoke a separate Files grant while workspace and channel membership remain active.
 
 ### Private channels
 
-Private channels get no transcript. A transcript is a regular workspace file. Every member who can open its folder can read it, so a private channel copy would leak the chat. Chitchat skips private channels in one place: `channels_queue_transcript` in `convex/channels.ts`. The transcript status, Connect Files, Retry, and Rebuild also refuse private channels.
+Private channels get no transcript. A transcript is a regular workspace file. Every member who can open its folder can read it, so a private channel copy would leak the chat. The write path skips them in `channels_queue_transcript` in `convex/channels.ts`. The transcript status, Connect Files, Retry, and Rebuild also refuse private channels.
 
 A channel cannot change between public and private. Private channels that got copies before this rule get no more writes. Chitchat does not delete or move those files. They stay in Files with their current sharing, and file managers decide what to do with them.
 

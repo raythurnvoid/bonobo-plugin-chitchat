@@ -17,6 +17,7 @@ import type * as files from "../files.js";
 import type * as http from "../http.js";
 import type * as members from "../members.js";
 import type * as messages from "../messages.js";
+import type * as migrations from "../migrations.js";
 import type * as press from "../press.js";
 import type * as reactions from "../reactions.js";
 import type * as read_states from "../read_states.js";
@@ -48,6 +49,7 @@ declare const fullApi: ApiFromModules<{
   http: typeof http;
   members: typeof members;
   messages: typeof messages;
+  migrations: typeof migrations;
   press: typeof press;
   reactions: typeof reactions;
   read_states: typeof read_states;
