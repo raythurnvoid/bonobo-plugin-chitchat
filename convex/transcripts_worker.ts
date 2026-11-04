@@ -185,8 +185,6 @@ export const run = internalAction({
 									sequence: previous.barrier,
 									expectedNodeId: write.expectedNodeId,
 									expectedContentRevision: write.expectedContentRevision,
-									// TODO(migration): delete in Chitchat phase B, before the host phase B. The old host requires it.
-									expectedReaderRevision: null,
 									contentHash: write.contentHash,
 								},
 							},
@@ -392,8 +390,6 @@ export const run = internalAction({
 								sequence: run.barrier,
 								expectedNodeId: write.expectedNodeId,
 								expectedContentRevision: write.expectedContentRevision,
-								// TODO(migration): delete in Chitchat phase B, before the host phase B. The old host requires it.
-								expectedReaderRevision: null,
 								contentHash: write.contentHash,
 							},
 						},

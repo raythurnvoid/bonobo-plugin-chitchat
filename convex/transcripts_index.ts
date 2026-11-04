@@ -436,8 +436,6 @@ export const run = internalAction({
 								sequence: run.barrier + 1,
 								expectedNodeId: run.expectedNodeId,
 								expectedContentRevision: run.expectedContentRevision,
-								// TODO(migration): delete in Chitchat phase B, before the host phase B. The old host requires it.
-								expectedReaderRevision: null,
 								contentHash: await chatbe_sha256_hex(run.content),
 							},
 						},
