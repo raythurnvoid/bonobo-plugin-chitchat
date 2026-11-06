@@ -14,7 +14,7 @@
 	"packageManager": "pnpm@12.14.0",
 	"dependencies": {
 		"@ariakit/react": "0.4.42",
-		"bonobo-plugin-sdk": "github:raythurnvoid/bonobo-plugin-sdk#2e8aff84b3fc3218f8defa8a92bec388ab4bb94b",
+		"bonobo-plugin-sdk": "github:raythurnvoid/bonobo-plugin-sdk#d1c728887c18e80debeea947d9b8aa2f615afdfd",
 		"convex": "1.47.0",
 		"convex-helpers": "0.1.128",
 		"jose": "6.1.3",
