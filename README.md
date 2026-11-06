@@ -81,9 +81,9 @@ the README writer inside Chitchat only. Bonobo Senate never parses this value. C
 saved operation ID, sequence, target and revision checks on every retry. Transcript writes and moves to Trash explicitly send `force: true`; this is part of the host receipt fingerprint. Drain old prepared requests before the host cutover. Never add force to an already accepted old request. Its 100,000-byte Markdown
 limit remains local even though the public API supports other editable text and larger bounds.
 
-A workspace admin must make the first connection. Read-only creation and forced transcript writes need the new `workspace.files.manage-read-only` consent and current Can edit access. Force preserves every Read-only flag.
+A channel manager must make the first connection. In Chitchat's **My file permissions**, choose **Whole workspace** with **Can edit** so Chitchat can create its root folder. Wait until the choice applies, then connect Files. The person also needs their normal Files access. Read-only creation and forced transcript writes need the `workspace.files.manage-read-only` capability and current Can edit access. Force preserves every Read-only flag.
 
-After the root exists, reduce the account's broad access where possible. Keep the workspace **Can write** permission needed for ordinary file writes, and **Can manage** on the exact generated root. Normal folder grants do not pass to other folders or files. Later setup calls keep existing grants unchanged and never restore a removed grant. The connecting person must also keep the Files permissions needed for each operation.
+After the root exists, personal **Can view** for **Whole workspace** plus **Can edit** on the existing dataset root lets Chitchat read attachments and update its copies. Restricted folders with old copies need separate **Can view** consent. For missing write access, choose **Can edit** for the existing root in **My file permissions**, wait until it applies, then choose **Reconnect Files**. This uses the current person's consent. **Retry sync** alone cannot replace the old connection's person. Service-account grants do not give Chitchat Files access; leave ordinary account grants unchanged.
 
 Transcript work has no cron. Each channel, the README index, and each Files connection keep at most one scheduled wake-up. The wake-up is a mutation: it claims the work and arms a watchdog before it starts the action, so work resumes after an action crash. Temporary failures retry after 30 s, 1, 2, 5, and 10 minutes, then every 15 minutes, with some jitter. A `Retry-After` from Bonobo Senate wins. After 5 minutes of temporary failures, the status says when the next try runs and offers **Retry now**. An expired connection, missing permission, a sponsor who left, a conflict, or a file that is too large does not retry by itself. The status says which one it is.
 
@@ -95,7 +95,7 @@ The README index runs independently from channel jobs. It stays within the same 
 
 A successful **Connect Files** also selects that connection for the shared README index. This repairs an expired index grant even when its first channel is no longer available. Failed setup keeps the previous choice. Background renewal does not choose another sponsor. A pending index write keeps its exact saved request while the new connection retries it.
 
-New output starts with Chitchat labels and a plugin lock. Removing its label, moving or replacing a pinned folder, removing account access, or applying a human lock can block sync. Repeated setup never repairs those choices. Chitchat never changes sharing. The Files UI owns it.
+New output starts with Chitchat labels and a plugin lock. Removing its label, moving or replacing a pinned folder, withdrawing personal file consent, or applying a human lock can block sync. Repeated setup never repairs those choices. Chitchat never changes sharing. The Files UI owns it.
 
 Removing workspace chat read permission does not revoke a separate Files grant while workspace and channel membership remain active.
 
@@ -158,6 +158,6 @@ Published versions cannot change. Before publishing changed source or assets, us
 
 After native chat has accepted messages, keep its database and transcript queue. Fix and release the current app. Do not restore the old generic-store plugin or import old Markdown copies as chat; that would hide messages saved since the rebuild.
 
-Temporary Files failures retry by themselves. Use **Retry sync** after you fix the cause of a stop, such as missing folder access. Use **Reconnect Files** when the connection expired or the person who connected left, including after a plugin update. Both still check current permissions and locks. They never restore removed account grants or overwrite manual sharing. **Rebuild copies** requires explicit confirmation before replacing manual text.
+Temporary Files failures retry by themselves. Use **Retry sync** after you fix a stop that keeps the same valid connection. For missing folder access, open Chitchat's **My file permissions**, choose **Can edit** for the existing folder, wait until it applies, then choose **Reconnect Files**. Also reconnect when the connection expired or the person who connected left, including after a plugin update. Both actions still check current permissions and locks. They never restore withdrawn consent or overwrite manual sharing. **Rebuild copies** requires explicit confirmation before replacing manual text.
 
 Verify access, pending jobs, and the served bundle after a repair. Uninstall is not a temporary pause: it retires the installation's authority. Never uninstall, reset the plugin registry, or wipe Bonobo Senate as a shortcut to recover this plugin.

@@ -30402,7 +30402,7 @@ function eL(e) {
 						? i.errorCode === "auth_expired"
 							? `Chat is saved. Saving ${q} to Files is paused because the Files connection expired.${i.canConnect ? " Reconnect Files to continue. New messages will be copied after you reconnect." : " Ask a channel manager to reconnect Files."}`
 							: i.errorCode === "permission"
-								? `Chat is saved. Saving ${q} to Files is paused. Chitchat can no longer write to ${i.folderPath ?? "its folder"}.${i.canConnect ? " Give the Chitchat service account Can manage on that folder, then choose Retry sync." : " Ask a channel manager to fix the folder access."}`
+								? `Chat is saved. Saving ${q} to Files is paused. Chitchat can no longer write to ${i.folderPath ?? "its folder"}.${i.canConnect ? " Check Chitchat's My file permissions. Wait for your choice to apply, then choose Reconnect Files." : " Ask a channel manager to fix the folder access."}`
 								: i.errorCode === "sponsor_gone"
 									? `Chat is saved. The person who connected Files no longer has access.${i.canConnect ? " Reconnect Files to use your own connection." : " Ask a channel manager to reconnect Files."}`
 									: `Chat is saved. Transcript sync needs attention.${i.canConnect ? "" : " Ask a channel manager to check it."}`
@@ -30467,8 +30467,8 @@ function eL(e) {
 									i.status === "blocked" && i.folderPath && (i.errorCode === null || i.errorCode === "permission")
 										? (0, S.jsx)("p", {
 												children: i.folderNodeId
-													? "If folder access is missing, open this folder in Bonobo Senate Files. Give the Chitchat service account Can manage, then reconnect."
-													: "If permissions blocked setup, ask a workspace admin to connect. Both the person connecting and the Chitchat service account need Can manage on the parent folder or workspace to create the locked folder.",
+													? "In Chitchat's My file permissions, choose Can edit for this folder. Wait until it applies, then choose Reconnect Files. You also need your normal Files access."
+													: "A channel manager must connect Files. In Chitchat's My file permissions, choose Whole workspace with Can edit. Wait until it applies, then choose Reconnect Files. You also need your normal Files access.",
 											})
 										: null,
 									i.canReconcile

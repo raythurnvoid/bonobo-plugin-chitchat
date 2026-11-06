@@ -1435,11 +1435,32 @@ describe("TranscriptStatus", () => {
 		publish();
 		fireEvent.click(screen.getByText("Transcript details"));
 		expect(screen.getByText(/Planned folder in Bonobo Senate Files/)).toBeTruthy();
-		expect(screen.getByText(/If permissions blocked setup, ask a workspace admin to connect/)).toBeTruthy();
-		expect(
-			screen.getByText(/Both the person connecting and the Chitchat service account need Can manage/),
-		).toBeTruthy();
+		const details = screen.getByText("Transcript details").closest("details")!;
+		expect(details.textContent, "first setup names whole-workspace personal consent").toContain(
+			"A channel manager must connect Files. In Chitchat's My file permissions, choose Whole workspace with Can edit. Wait until it applies, then choose Reconnect Files. You also need your normal Files access.",
+		);
 		expect(document.body.textContent).not.toContain("open this folder");
+		expect(fake.action).not.toHaveBeenCalled();
+		expect(fake.mutation).not.toHaveBeenCalled();
+	});
+	test("permission status points to personal consent and Reconnect Files", () => {
+		render_status();
+		fake.overrides.set("transcripts:status", status({ errorCode: "permission", error: "Permission denied" }));
+		publish();
+		expect(screen.getByRole("status").textContent, "permission status names personal consent and reconnect").toContain(
+			"Check Chitchat's My file permissions. Wait for your choice to apply, then choose Reconnect Files.",
+		);
+		expect(screen.getByRole("button", { name: "Reconnect Files" })).toBeTruthy();
+		expect(document.body.textContent).not.toContain("service account Can manage");
+	});
+	test("existing folder details explain personal Can edit and normal Files access", () => {
+		render_status();
+		fireEvent.click(screen.getByText("Transcript details"));
+		const details = screen.getByText("Transcript details").closest("details")!;
+		expect(details.textContent, "existing folder help names applied personal consent").toContain(
+			"In Chitchat's My file permissions, choose Can edit for this folder. Wait until it applies, then choose Reconnect Files. You also need your normal Files access.",
+		);
+		expect(details.textContent).not.toContain("Whole workspace");
 		expect(fake.action).not.toHaveBeenCalled();
 		expect(fake.mutation).not.toHaveBeenCalled();
 	});
